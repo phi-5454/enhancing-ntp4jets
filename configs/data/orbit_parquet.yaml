@@ -1,11 +1,13 @@
 _target_: gabbro.data.orbit_parquet.OrbitParquetDataModule
 
-# Prefer one or more directories containing train/val parquet files. They are
-# shuffled deterministically and split into disjoint file lists.
+# Prefer one or more ORBIT-style text manifests or directories containing
+# train/val parquet files. Text manifests contain one parquet path per line.
+# They are expanded, shuffled deterministically, and split into disjoint file lists.
 parquet_files_train_val: []
 parquet_files_test: []
 
 # Explicit pre-split lists remain available for smoke tests and fixed splits.
+# Each field accepts parquet files, directories, or text manifests.
 parquet_files_train: null
 parquet_files_val: null
 

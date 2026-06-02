@@ -12,6 +12,8 @@
   datasets.
 - Add production configs for the intended train/val and test directory layout.
   Smoke configs intentionally reuse one sample file for train, val, and test.
+- ORBIT-style text manifests are supported for all parquet path fields. Direct
+  parquet files and directories remain supported.
 - Decide whether jet modes should default to `L1T_Jet*` or `L1T_JetPuppi*`.
   The current smoke test uses `jet_puppi_ak8` because it matches the L1T-style
   event-tokenization path discussed so far.
@@ -58,9 +60,21 @@
   integration notes.
 - Root `.env` loading is available through `pyrootutils`; `.env.example`
   documents `LOG_DIR`, W&B credentials/defaults, and the optional Comet token.
+- Explicit run env files are supported with `GABBRO_ENV_FILE=/path/to/file.env`.
+  This is loaded before Hydra composes the config, so it can provide `LOG_DIR`,
+  `MPLCONFIGDIR`, and logger credentials.
 - ORBIT-style schema-neutral reconstruction and token-usage plots are ported via
   `gabbro.plotting.orbit` and `OrbitPlottingCallback`.
   The plotting helpers use enhancing's existing style and color palette.
+- Single-run physical-coordinate paper plots are wired into validation/test:
+  kinematic distributions and residuals, energy, MET, jet pT resolution, and
+  particle-run FastJet jet mass/tau32 plots. Attention plots remain intentionally
+  unwired.
+- Validation plotting/evaluation stores only
+  `model.max_validation_plot_batches` batches by default, currently one batch to
+  match ORBIT's lightweight validation sample. Test plotting can retain all
+  processed batches by default, or be bounded with `model.max_test_plot_batches`.
+  The ORBIT plotting callback now skips Lightning sanity validation.
 - `scripts/collect_orbit_multirun.py` post-processes Hydra multirun directories.
   It writes a manifest, summary CSV, reconstruction overlays, and codebook-size
   scans from per-run histogram and metric artifacts.

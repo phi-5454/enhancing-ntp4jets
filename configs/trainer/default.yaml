@@ -10,6 +10,14 @@ devices: 1
 num_nodes: 1
 strategy: auto
 enable_progress_bar: False
+fast_dev_run: False
+num_sanity_val_steps: 2
+
+# Use integer limits for iterable parquet datasets. Fractional limits require
+# dataloaders with a known length.
+limit_train_batches: null
+limit_val_batches: null
+limit_test_batches: null
 
 # mixed precision for extra speed-up
 # precision: 16

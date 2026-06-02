@@ -5,3 +5,6 @@ orbit_plotting_callback:
   image_filetype: png
   save_histograms: true
   no_trainer_info_in_filename: false
+  enable_physics_plots: true
+  include_all_ratios: false
+  jet_radius: 0.8

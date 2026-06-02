@@ -7,10 +7,15 @@ from pathlib import Path
 
 import lightning as L
 import numpy as np
+import awkward as ak
+import fastjet
+import vector
 
 from gabbro.plotting.orbit import (
     close_figure,
     collect_reconstruction_histograms,
+    collect_physical_reconstruction_histograms,
+    physical_reconstruction_plots,
     plot_codebook_histogram,
     plot_feature_histograms,
     plot_residual_histograms,
@@ -18,6 +23,12 @@ from gabbro.plotting.orbit import (
 from gabbro.utils.pylogger import get_pylogger
 
 logger = get_pylogger("OrbitPlottingCallback")
+vector.register_awkward()
+
+
+def _delta_r(particles, jets):
+    jets = ak.unflatten(ak.flatten(jets), counts=1)
+    return particles.deltaR(jets)
 
 
 class OrbitPlottingCallback(L.Callback):
@@ -29,14 +40,22 @@ class OrbitPlottingCallback(L.Callback):
         image_filetype: str = "png",
         save_histograms: bool = True,
         no_trainer_info_in_filename: bool = False,
+        enable_physics_plots: bool = True,
+        include_all_ratios: bool = False,
+        jet_radius: float = 0.8,
     ):
         super().__init__()
         self.image_path = image_path
         self.image_filetype = image_filetype
         self.save_histograms = save_histograms
         self.no_trainer_info_in_filename = no_trainer_info_in_filename
+        self.enable_physics_plots = enable_physics_plots
+        self.include_all_ratios = include_all_ratios
+        self.jet_radius = jet_radius
 
     def on_validation_epoch_end(self, trainer, pl_module):
+        if trainer.sanity_checking:
+            return
         pl_module.concat_validation_loop_predictions()
         self.plot(trainer, pl_module, stage="val")
 
@@ -95,6 +114,166 @@ class OrbitPlottingCallback(L.Callback):
         if vqlayer is None:
             return None
         return getattr(vqlayer, "num_codes", None)
+
+    def _data_level(self, trainer) -> str:
+        sequence_type = getattr(trainer.datamodule.hparams, "sequence_type", "particle")
+        return "particle" if sequence_type == "particle" else "jet"
+
+    def _to_physical_features(self, x: np.ndarray) -> np.ndarray:
+        """Convert `[eta/3, cos(phi), sin(phi), log(pT)-1.8]` to `[eta, phi, pT]`."""
+        eta = x[..., 0] * 3.0
+        phi = np.arctan2(x[..., 2], x[..., 1])
+        pt = np.exp(x[..., 3] + 1.8) - 1e-8
+        pt = np.clip(pt, a_min=0.0, a_max=None)
+        return np.stack([eta, phi, pt], axis=-1)
+
+    def _collect_missing_transverse_energy(
+        self,
+        x_physical: np.ndarray,
+        x_reco_physical: np.ndarray,
+        mask: np.ndarray,
+    ):
+        def missing_et(events):
+            pts = np.where(mask, events[..., 2], 0.0)
+            phis = events[..., 1]
+            px = np.sum(pts * np.cos(phis), axis=1)
+            py = np.sum(pts * np.sin(phis), axis=1)
+            return np.hypot(px, py)
+
+        return missing_et(x_physical), missing_et(x_reco_physical)
+
+    def _collect_direct_jet_metrics(
+        self,
+        x_physical: np.ndarray,
+        x_reco_physical: np.ndarray,
+        mask: np.ndarray,
+    ):
+        true_jet_pts = []
+        reco_jet_pts = []
+        for i in range(x_physical.shape[0]):
+            event_mask = mask[i]
+            true_pts = x_physical[i, event_mask, 2]
+            reco_pts = x_reco_physical[i, event_mask, 2]
+            n_match = min(len(true_pts), len(reco_pts))
+            if n_match:
+                true_jet_pts.extend(true_pts[:n_match])
+                reco_jet_pts.extend(reco_pts[:n_match])
+        return true_jet_pts, reco_jet_pts, [], [], [], []
+
+    def _reconstruct_event_jets(self, pt: np.ndarray, eta: np.ndarray, phi: np.ndarray):
+        pt = np.asarray(pt, dtype=np.float64)
+        eta = np.asarray(eta, dtype=np.float64)
+        phi = np.asarray(phi, dtype=np.float64)
+        if len(pt) < 3 or np.sum(pt) <= 0:
+            return {
+                "pt": np.array([]),
+                "jet_mass": 0.0,
+                "tau32": 0.0,
+                "jet_n_constituents": len(pt),
+            }
+
+        particles = ak.zip(
+            {"pt": [pt], "eta": [eta], "phi": [phi], "mass": [np.zeros_like(pt)]},
+            with_name="Momentum4D",
+        )
+        particles_sum = ak.sum(particles, axis=1)
+        jetdef = fastjet.JetDefinition(fastjet.kt_algorithm, self.jet_radius)
+        cluster = fastjet.ClusterSequence(particles, jetdef)
+        inclusive_jets = cluster.inclusive_jets(min_pt=0.0)
+        d0 = ak.sum(particles.pt * self.jet_radius, axis=1)
+
+        exclusive_jets_1 = cluster.exclusive_jets(n_jets=1)
+        exclusive_jets_2 = cluster.exclusive_jets(n_jets=2)
+        exclusive_jets_3 = cluster.exclusive_jets(n_jets=3)
+
+        dr_1i = _delta_r(particles, exclusive_jets_1[:, :1])
+        tau1 = ak.sum(particles.pt * dr_1i, axis=1) / d0
+
+        dr_1i_t2 = _delta_r(particles, exclusive_jets_2[:, :1])
+        dr_2i_t2 = _delta_r(particles, exclusive_jets_2[:, 1:2])
+        min_dr_t2 = ak.min(
+            ak.concatenate(
+                [dr_1i_t2[..., np.newaxis], dr_2i_t2[..., np.newaxis]],
+                axis=-1,
+            ),
+            axis=-1,
+        )
+        tau2 = ak.sum(particles.pt * min_dr_t2, axis=1) / d0
+
+        dr_1i_t3 = _delta_r(particles, exclusive_jets_3[:, :1])
+        dr_2i_t3 = _delta_r(particles, exclusive_jets_3[:, 1:2])
+        dr_3i_t3 = _delta_r(particles, exclusive_jets_3[:, 2:3])
+        min_dr_t3 = ak.min(
+            ak.concatenate(
+                [
+                    dr_1i_t3[..., np.newaxis],
+                    dr_2i_t3[..., np.newaxis],
+                    dr_3i_t3[..., np.newaxis],
+                ],
+                axis=-1,
+            ),
+            axis=-1,
+        )
+        tau3 = ak.sum(particles.pt * min_dr_t3, axis=1) / d0
+        tau32 = np.nan_to_num(float((tau3 / (tau2 + 1e-8))[0]))
+
+        return {
+            "pt": (
+                np.asarray(inclusive_jets.pt[0])
+                if len(inclusive_jets[0]) > 0
+                else np.array([])
+            ),
+            "jet_mass": float(particles_sum.mass[0]),
+            "tau32": tau32,
+            "jet_n_constituents": len(pt),
+        }
+
+    def _collect_particle_jet_metrics(
+        self,
+        x_physical: np.ndarray,
+        x_reco_physical: np.ndarray,
+        mask: np.ndarray,
+    ):
+        true_jet_pts = []
+        reco_jet_pts = []
+        true_jet_masses = []
+        reco_jet_masses = []
+        true_tau32s = []
+        reco_tau32s = []
+
+        for i in range(x_physical.shape[0]):
+            event_mask = mask[i]
+            true_jets = self._reconstruct_event_jets(
+                x_physical[i, event_mask, 2],
+                x_physical[i, event_mask, 0],
+                x_physical[i, event_mask, 1],
+            )
+            reco_jets = self._reconstruct_event_jets(
+                x_reco_physical[i, event_mask, 2],
+                x_reco_physical[i, event_mask, 0],
+                x_reco_physical[i, event_mask, 1],
+            )
+            n_match = min(len(true_jets["pt"]), len(reco_jets["pt"]))
+            if n_match:
+                true_jet_pts.extend(true_jets["pt"][:n_match])
+                reco_jet_pts.extend(reco_jets["pt"][:n_match])
+            if (
+                true_jets["jet_n_constituents"] >= 3
+                and reco_jets["jet_n_constituents"] >= 3
+            ):
+                true_jet_masses.append(true_jets["jet_mass"])
+                reco_jet_masses.append(reco_jets["jet_mass"])
+                true_tau32s.append(true_jets["tau32"])
+                reco_tau32s.append(reco_jets["tau32"])
+
+        return (
+            true_jet_pts,
+            reco_jet_pts,
+            true_jet_masses,
+            reco_jet_masses,
+            true_tau32s,
+            reco_tau32s,
+        )
 
     def plot(self, trainer, pl_module, stage: str) -> None:
         if stage == "val" and not hasattr(pl_module, "val_x_original_concat"):
@@ -166,6 +345,68 @@ class OrbitPlottingCallback(L.Callback):
                 num_codes=num_codes,
             ),
         }
+        if self.enable_physics_plots:
+            data_level = self._data_level(trainer)
+            x_physical = self._to_physical_features(x_original)
+            x_reco_physical = self._to_physical_features(x_reco)
+            x_physical_flat = x_physical[mask]
+            x_reco_physical_flat = x_reco_physical[mask]
+            finite = np.all(np.isfinite(x_physical_flat), axis=1) & np.all(
+                np.isfinite(x_reco_physical_flat),
+                axis=1,
+            )
+            x_physical_flat = x_physical_flat[finite]
+            x_reco_physical_flat = x_reco_physical_flat[finite]
+            if x_physical_flat.size:
+                physics_feature_names = ["Eta", "Phi", "pT"]
+                physics_mse = np.mean((x_reco_physical_flat - x_physical_flat) ** 2, axis=0)
+                if data_level == "particle":
+                    jet_metrics = self._collect_particle_jet_metrics(
+                        x_physical,
+                        x_reco_physical,
+                        mask,
+                    )
+                    missing_ets = self._collect_missing_transverse_energy(
+                        x_physical,
+                        x_reco_physical,
+                        mask,
+                    )
+                else:
+                    jet_metrics = self._collect_direct_jet_metrics(
+                        x_physical,
+                        x_reco_physical,
+                        mask,
+                    )
+                    missing_ets = ((), ())
+                physics_histograms = collect_physical_reconstruction_histograms(
+                    physics_feature_names,
+                    x_physical_flat,
+                    x_reco_physical_flat,
+                    *jet_metrics,
+                    true_missing_ets=missing_ets[0],
+                    reco_missing_ets=missing_ets[1],
+                    data_level=data_level,
+                )
+                histograms.update({f"physical_{key}": value for key, value in physics_histograms.items()})
+                metrics.update(
+                    {
+                        f"metrics/physical_mse_{name}": float(value)
+                        for name, value in zip(physics_feature_names, physics_mse)
+                    }
+                )
+                metrics["metrics/physical_mse_total"] = float(np.mean(physics_mse))
+                figures.update(
+                    {
+                        f"{stage}/orbit_{name}": figure
+                        for name, figure in physical_reconstruction_plots(
+                            physics_feature_names,
+                            physics_mse,
+                            physics_histograms,
+                            data_level=data_level,
+                            include_all_ratios=self.include_all_ratios,
+                        ).items()
+                    }
+                )
 
         for name, fig in figures.items():
             filename = self._figure_name(trainer, stage, name.split("/")[-1])

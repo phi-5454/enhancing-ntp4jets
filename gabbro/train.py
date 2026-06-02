@@ -6,13 +6,49 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import pyrootutils
+
+
+def _load_env_file(path: str) -> None:
+    """Load a simple KEY=VALUE env file, overriding existing values."""
+    env_path = Path(os.path.expandvars(os.path.expanduser(path)))
+    if not env_path.is_file():
+        raise FileNotFoundError(f"GABBRO_ENV_FILE does not exist: {env_path}")
+
+    for raw_line in env_path.read_text().splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
+        if "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if not key:
+            continue
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        os.environ[key] = os.path.expandvars(value)
+
+
+def _load_explicit_env_file() -> None:
+    env_file = os.environ.get("GABBRO_ENV_FILE")
+    if env_file:
+        _load_env_file(env_file)
+
+
+pyrootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
+_load_explicit_env_file()
+
 try:
     import comet_ml  # noqa: F401  # import before torch when Comet logging is installed
 except ImportError:
     comet_ml = None
 import hydra
 import lightning as L
-import pyrootutils
 import torch
 from hydra import compose
 from hydra.core.config_store import ConfigStore
@@ -20,8 +56,6 @@ from hydra.core.hydra_config import HydraConfig
 from lightning.pytorch.loggers import Logger
 from omegaconf import DictConfig, OmegaConf
 from torch.distributed import get_rank, get_world_size
-
-pyrootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 # ------------------------------------------------------------------------------------ #
 # the setup_root above is equivalent to:
 # - adding project root dir to PYTHONPATH
@@ -31,6 +65,7 @@ pyrootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 #       (which is used as a base for paths in "configs/paths/default.yaml")
 #       (this way all filepaths are the same no matter where you run the code)
 # - loading environment variables from ".env" in root dir
+# - optionally loading a user-selected env file through GABBRO_ENV_FILE
 #
 # you can remove it if you:
 # 1. either install project as a package or move entry files to project root dir

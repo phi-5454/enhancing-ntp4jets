@@ -354,6 +354,8 @@ class VQVAELightning(L.LightningModule):
         scheduler: torch.optim.lr_scheduler = None,
         model_kwargs={},
         model_type="Transformer",
+        max_validation_plot_batches: int | None = 1,
+        max_test_plot_batches: int | None = None,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -380,6 +382,16 @@ class VQVAELightning(L.LightningModule):
         self.val_x_original = []
         self.val_x_reco = []
         self.val_mask = []
+
+    @staticmethod
+    def _should_store_loop_batch(batch_idx: int, max_batches: int | None) -> bool:
+        return max_batches is None or batch_idx < max_batches
+
+    def _clear_concat_outputs(self, prefix: str) -> None:
+        for name in ["x_original", "x_reco", "mask", "labels", "code_idx"]:
+            attr = f"{prefix}_{name}_concat"
+            if hasattr(self, attr):
+                delattr(self, attr)
 
     def forward(
         self,
@@ -478,16 +490,20 @@ class VQVAELightning(L.LightningModule):
         self.val_mask = []
         self.val_labels = []
         self.val_code_idx = []
+        self._clear_concat_outputs("val")
 
     def validation_step(self, batch: Tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> None:
         loss, x_original, x_reco, mask, labels, code_idx = self.model_step(batch, return_x=True)
 
-        # save the original and reconstructed data
-        self.val_x_original.append(x_original.detach().cpu().numpy())
-        self.val_x_reco.append(x_reco.detach().cpu().numpy())
-        self.val_mask.append(mask.detach().cpu().numpy())
-        self.val_labels.append(labels.detach().cpu().numpy())
-        self.val_code_idx.append(code_idx.detach().cpu().numpy())
+        # Keep only a small validation sample for expensive plotting/physics evaluation.
+        if self._should_store_loop_batch(
+            batch_idx, self.hparams.get("max_validation_plot_batches")
+        ):
+            self.val_x_original.append(x_original.detach().cpu().numpy())
+            self.val_x_reco.append(x_reco.detach().cpu().numpy())
+            self.val_mask.append(mask.detach().cpu().numpy())
+            self.val_labels.append(labels.detach().cpu().numpy())
+            self.val_code_idx.append(code_idx.detach().cpu().numpy())
 
         self.log("val_loss", loss.item(), on_step=True, on_epoch=True, prog_bar=True)
 
@@ -500,16 +516,17 @@ class VQVAELightning(L.LightningModule):
         self.test_mask = []
         self.test_labels = []
         self.test_code_idx = []
+        self._clear_concat_outputs("test")
 
     def test_step(self, batch: Tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> None:
         loss, x_original, x_reco, mask, labels, code_idx = self.model_step(batch, return_x=True)
 
-        # save the original and reconstructed data
-        self.test_x_original.append(x_original.detach().cpu().numpy())
-        self.test_x_reco.append(x_reco.detach().cpu().numpy())
-        self.test_mask.append(mask.detach().cpu().numpy())
-        self.test_labels.append(labels.detach().cpu().numpy())
-        self.test_code_idx.append(code_idx.detach().cpu().numpy())
+        if self._should_store_loop_batch(batch_idx, self.hparams.get("max_test_plot_batches")):
+            self.test_x_original.append(x_original.detach().cpu().numpy())
+            self.test_x_reco.append(x_reco.detach().cpu().numpy())
+            self.test_mask.append(mask.detach().cpu().numpy())
+            self.test_labels.append(labels.detach().cpu().numpy())
+            self.test_code_idx.append(code_idx.detach().cpu().numpy())
 
         self.log("test_loss", loss.item(), on_step=True, on_epoch=True, prog_bar=True)
 
@@ -870,6 +887,9 @@ class VQVAELightning(L.LightningModule):
         return x_reco_ak
 
     def concat_validation_loop_predictions(self) -> None:
+        if not self.val_x_original:
+            logger.info("No stored validation batches available for plotting/evaluation.")
+            return
         self.val_x_original_concat = np.concatenate(self.val_x_original)
         self.val_x_reco_concat = np.concatenate(self.val_x_reco)
         self.val_mask_concat = np.concatenate(self.val_mask)
@@ -886,6 +906,9 @@ class VQVAELightning(L.LightningModule):
         self.concat_test_loop_predictions()
 
     def concat_test_loop_predictions(self) -> None:
+        if not self.test_x_original:
+            logger.info("No stored test batches available for plotting/evaluation.")
+            return
         self.test_x_original_concat = np.concatenate(self.test_x_original)
         self.test_x_reco_concat = np.concatenate(self.test_x_reco)
         self.test_mask_concat = np.concatenate(self.test_mask)

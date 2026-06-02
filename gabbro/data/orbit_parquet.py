@@ -49,12 +49,49 @@ SEQUENCE_SCHEMAS = {
 }
 
 
+MANIFEST_SUFFIXES = {".txt", ".list", ".lst"}
+
+
+def _read_path_manifest(path: Path, seen: set[Path] | None = None) -> list[str]:
+    """Read ORBIT-style text manifests containing one parquet path per line."""
+    path = path.resolve()
+    seen = set() if seen is None else seen
+    if path in seen:
+        raise ValueError(f"Recursive parquet path manifest detected: {path}")
+    seen.add(path)
+
+    files = []
+    with path.open() as manifest:
+        for line in manifest:
+            value = line.strip()
+            if not value or value.lstrip().startswith("#"):
+                continue
+            value = os.path.expandvars(os.path.expanduser(value))
+            value_path = Path(value)
+            if not value_path.is_absolute():
+                value_path = path.parent / value_path
+            files.extend(_expand_path_entry(value_path, seen=seen))
+    return files
+
+
+def _expand_path_entry(path, seen: set[Path] | None = None) -> list[str]:
+    path = Path(os.path.expandvars(os.path.expanduser(str(path))))
+    if path.suffix.lower() in MANIFEST_SUFFIXES:
+        if not path.is_file():
+            raise FileNotFoundError(f"Parquet path manifest does not exist: {path}")
+        return _read_path_manifest(path, seen=seen)
+    return [str(path)]
+
+
 def _as_paths(paths) -> list[str]:
     if paths is None:
         return []
     if isinstance(paths, (str, Path)):
         paths = [paths]
-    return [os.path.expanduser(str(path)) for path in paths]
+    expanded = []
+    for path in paths:
+        expanded.extend(_expand_path_entry(path))
+    return expanded
 
 
 def _dataset_files(paths) -> list[str]:
@@ -83,7 +120,7 @@ def deterministic_file_split(
         raise ValueError("train_fraction must be strictly between 0 and 1")
 
     rng = np.random.default_rng(split_seed)
-    files = list(np.asarray(files)[rng.permutation(len(files))])
+    files = [str(path) for path in np.asarray(files)[rng.permutation(len(files))]]
     split_index = min(max(int(len(files) * train_fraction), 1), len(files) - 1)
     return files[:split_index], files[split_index:]
 
