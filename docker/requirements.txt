@@ -12,7 +12,8 @@ pandas==2.2.3
 pyarrow==19
 scikit-learn==1.6
 seaborn==0.13
-tables==3.10.2
+# Keep the L1T-compatible pin: 3.10.2 breaks the container dependency set.
+tables==3.10.1
 zuko==1.3
 
 # -------- hep stuff -------

@@ -13,6 +13,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 from vqtorch.nn import VectorQuant
 
+from gabbro.models.quantizers import SplitQuantizer, build_quantizer
 from gabbro.models.transformer import MLP, NormformerStack, Transformer
 from gabbro.utils.arrays import (
     ak_pad,
@@ -38,6 +39,7 @@ class VQVAEMLP(torch.nn.Module):
         encoder_layers=None,
         decoder_layers=None,
         vq_kwargs={},
+        split_quantizer_cfg=None,
         **kwargs,
     ):
         """Initializes the VQ-VAE model.
@@ -67,6 +69,7 @@ class VQVAEMLP(torch.nn.Module):
 
         super().__init__()
         self.vq_kwargs = vq_kwargs
+        self.split_quantizer_cfg = split_quantizer_cfg
         self.embed_dim = latent_dim
         self.input_features_dict = input_features_dict
         if input_features_dict is not None:
@@ -95,7 +98,11 @@ class VQVAEMLP(torch.nn.Module):
             self.encoder = torch.nn.Sequential(*enc_layers)
 
         # --- Vector-quantization layer --- #
-        self.vqlayer = VectorQuant(feature_size=self.embed_dim, **vq_kwargs)
+        self.vqlayer = build_quantizer(
+            feature_size=self.embed_dim,
+            vq_kwargs=vq_kwargs,
+            split_quantizer_cfg=split_quantizer_cfg,
+        )
 
         # --- Decoder --- #
         if decoder_layers is None:
@@ -125,12 +132,18 @@ class VQVAEMLP(torch.nn.Module):
         # encode
         z_embed = self.encoder(x)
         # quantize
-        z_q2, vq_out = self.vqlayer(z_embed)
+        z_q2, vq_out = self.quantize(z_embed, mask=mask)
         if x_conditional is not None:
             z_q2 = torch.cat([z_q2, x_conditional], dim=-1) * mask.unsqueeze(-1)
         # decode
         x_reco = self.decoder(z_q2)
         return x_reco, vq_out
+
+    def quantize(self, z_embed, mask=None):
+        """Quantize latent embeddings with single VectorQuant or split Phi/Psi quantization."""
+        if isinstance(self.vqlayer, SplitQuantizer):
+            return self.vqlayer(z_embed, mask=mask)
+        return self.vqlayer(z_embed)
 
 
 class VQVAETransformer(torch.nn.Module):
@@ -145,6 +158,7 @@ class VQVAETransformer(torch.nn.Module):
         num_heads: int = 8,
         num_blocks: int = 2,
         vq_kwargs: dict = {},
+        split_quantizer_cfg: dict = None,
         causal_decoder: bool = False,
         max_sequence_len: int = 128,
         input_features_dict: Dict[str, Any] = None,
@@ -161,6 +175,7 @@ class VQVAETransformer(torch.nn.Module):
         self.lr_history = []
 
         self.vq_kwargs = vq_kwargs
+        self.split_quantizer_cfg = split_quantizer_cfg
         self.input_features_dict = input_features_dict
         if input_features_dict is not None:
             self.input_dim = len(self.input_features_dict)
@@ -235,7 +250,11 @@ class VQVAETransformer(torch.nn.Module):
                 activation=latent_proj_cfg.get("activation", "GELU"),
             )
 
-        self.vqlayer = VectorQuant(feature_size=self.latent_dim, **vq_kwargs)
+        self.vqlayer = build_quantizer(
+            feature_size=self.latent_dim,
+            vq_kwargs=vq_kwargs,
+            split_quantizer_cfg=split_quantizer_cfg,
+        )
 
         if latent_proj_cfg is None:
             self.latent_projection_out = nn.Linear(
@@ -289,9 +308,12 @@ class VQVAETransformer(torch.nn.Module):
         z_embed = self.latent_projection_in(x) * mask.unsqueeze(-1)
         return z_embed, x_conditional
 
-    def quantize(self, z_embed):
+    def quantize(self, z_embed, mask=None):
         """Vector quantize the latent embeddings."""
-        z, vq_out = self.vqlayer(z_embed)
+        if isinstance(self.vqlayer, SplitQuantizer):
+            z, vq_out = self.vqlayer(z_embed, mask=mask)
+        else:
+            z, vq_out = self.vqlayer(z_embed)
         return z, vq_out
 
     def decode(self, z, mask, x_conditional=None):
@@ -318,7 +340,7 @@ class VQVAETransformer(torch.nn.Module):
     def forward(self, x, mask, x_conditional=None):
         """Forward pass through encode, quantize, and decode."""
         z_embed, x_conditional_repeated = self.encode(x, mask, x_conditional)
-        z, vq_out = self.quantize(z_embed)
+        z, vq_out = self.quantize(z_embed, mask=mask)
         x_reco = self.decode(z, mask, x_conditional_repeated)
         return x_reco, vq_out
 
@@ -523,8 +545,8 @@ class VQVAELightning(L.LightningModule):
         Returns
         -------
         ak.Array
-            Awkward array with the token-ids and the jet features if used. Thus,
-            the field names are "part_token_id" and "jet_features".
+            Awkward array with token IDs and the jet features if used. Split
+            quantizers also include one "part_token_<branch>" field per branch.
         """
 
         # preprocess the ak_arrary
@@ -548,6 +570,7 @@ class VQVAELightning(L.LightningModule):
             dataloader = DataLoader(dataset, batch_size=batch_size)
 
         codes = []
+        branch_codes = {}
         z_qs = []
 
         with torch.no_grad():
@@ -568,18 +591,39 @@ class VQVAELightning(L.LightningModule):
                 code = vq_out["q"]
                 z_q = vq_out["z_q"]
                 codes.append(code)
+                for branch, branch_code in vq_out.get("branch_q", {}).items():
+                    branch_codes.setdefault(branch, []).append(branch_code)
                 z_qs.append(z_q)
 
         codes = torch.cat(codes, dim=0).detach().cpu().numpy()
+        if codes.ndim == 2:
+            codes = codes[..., np.newaxis]
+        branch_codes = {
+            branch: torch.cat(branch_values, dim=0).detach().cpu().numpy()
+            for branch, branch_values in branch_codes.items()
+        }
+        branch_codes = {
+            branch: values[..., np.newaxis] if values.ndim == 2 else values
+            for branch, values in branch_codes.items()
+        }
         z_qs = torch.cat(z_qs, dim=0).squeeze(-2).detach().cpu().numpy()
         mask = mask.detach().cpu().numpy()
 
-        if isinstance(self.model.vqlayer, VectorQuant):
+        if isinstance(self.model.vqlayer, (VectorQuant, SplitQuantizer)):
             feature_names = ["part_token_id"]
         else:
-            raise ValueError("Unknown VectorQuant type.")
+            raise ValueError("Unknown quantizer type.")
 
-        ak_arr_tokens = np_to_ak(codes, names=feature_names, mask=mask)
+        ak_arr_tokens = np_to_ak(codes, names=feature_names, mask=mask, dtype="int64")
+        ak_arr_branch_tokens = {
+            f"part_token_{branch}": np_to_ak(
+                branch_code,
+                names=[f"part_token_{branch}"],
+                mask=mask,
+                dtype="int64",
+            )
+            for branch, branch_code in branch_codes.items()
+        }
         ak_arr_zqs = np_to_ak(z_qs, names=[f"z_q_{i}" for i in range(z_qs.shape[-1])], mask=mask)
 
         if self.model.conditional_dim == 0:
@@ -590,11 +634,117 @@ class VQVAELightning(L.LightningModule):
         ak_arr = ak.Array(
             {
                 "part_token_id": ak_arr_tokens,
+                **ak_arr_branch_tokens,
                 "z_q": ak_arr_zqs,
             }
             | dict_with_jet_features
         )
         return ak_arr
+
+    @staticmethod
+    def _extract_token_field(tokens_ak, field_name):
+        fields = getattr(tokens_ak, "fields", [])
+        if field_name not in fields:
+            return None
+        token_array = tokens_ak[field_name]
+        inner_fields = getattr(token_array, "fields", [])
+        if len(inner_fields) == 0:
+            return token_array
+        if len(inner_fields) == 1 and field_name in inner_fields:
+            return token_array[field_name]
+        raise ValueError(
+            f"Expected token field {field_name!r} to contain a single nested field "
+            f"with the same name, got {inner_fields}."
+        )
+
+    @staticmethod
+    def _pad_token_array(token_array, pad_length):
+        padded_tokens, mask = ak_pad(token_array, maxlen=pad_length, return_mask=True)
+        tokens = torch.from_numpy(padded_tokens.to_numpy()).long()
+        mask = torch.from_numpy(mask.to_numpy()).float()
+        return tokens, mask
+
+    def _prepare_split_token_tensors(self, tokens_ak, pad_length):
+        active_branches = [
+            branch
+            for branch in self.model.vqlayer.branch_order
+            if branch in self.model.vqlayer.quantizers
+        ]
+        branch_arrays = {
+            branch: self._extract_token_field(tokens_ak, f"part_token_{branch}")
+            for branch in active_branches
+        }
+
+        if all(token_array is not None for token_array in branch_arrays.values()):
+            branch_tensors = {}
+            mask = None
+            for branch, token_array in branch_arrays.items():
+                branch_tensor, branch_mask = self._pad_token_array(token_array, pad_length)
+                branch_tensors[branch] = branch_tensor
+                mask = branch_mask if mask is None else mask
+            return branch_tensors, mask
+
+        combined_tokens = self._extract_token_field(tokens_ak, "part_token_id")
+        if combined_tokens is None and len(getattr(tokens_ak, "fields", [])) == 0:
+            combined_tokens = tokens_ak
+        if combined_tokens is None:
+            raise ValueError(
+                "Split reconstruction needs explicit part_token_<branch> fields or "
+                "a combined part_token_id field."
+            )
+
+        combined_tensor, mask = self._pad_token_array(combined_tokens, pad_length)
+        return self.model.vqlayer.split_combined_codes(combined_tensor), mask
+
+    def _reconstruct_split_ak_tokens(
+        self,
+        tokens_ak,
+        pp_dict,
+        jets_ak=None,
+        pp_dict_jet=None,
+        batch_size=256,
+        pad_length=128,
+        hide_pbar=False,
+    ):
+        branch_tensors, mask = self._prepare_split_token_tensors(tokens_ak, pad_length)
+
+        if self.model.conditional_dim > 0:
+            conditional_data = ak_select_and_preprocess(jets_ak, pp_dict=pp_dict_jet)
+            conditional_data = ak_to_np_stack(conditional_data, names=pp_dict_jet.keys())
+            x_conditional = torch.from_numpy(conditional_data).float()
+            x_conditional = x_conditional.unsqueeze(1).repeat(1, mask.shape[1], 1)
+
+        active_branches = [
+            branch
+            for branch in self.model.vqlayer.branch_order
+            if branch in self.model.vqlayer.quantizers
+        ]
+        tensors = [branch_tensors[branch] for branch in active_branches] + [mask]
+        if self.model.conditional_dim > 0:
+            tensors.append(x_conditional)
+        dataloader = DataLoader(TensorDataset(*tensors), batch_size=batch_size)
+
+        x_reco = []
+        with torch.no_grad():
+            pbar = tqdm(dataloader) if not hide_pbar else dataloader
+            for batch in pbar:
+                branch_batch_values = batch[: len(active_branches)]
+                mask_batch = batch[len(active_branches)].to(self.device)
+                branch_batch = {
+                    branch: values.to(self.device)
+                    for branch, values in zip(active_branches, branch_batch_values)
+                }
+                z_q = self.model.vqlayer.decode_tokens(branch_batch, mask=mask_batch)
+
+                if self.model.conditional_dim > 0:
+                    x_conditional_batch = batch[-1].to(self.device)
+                    z_q = torch.cat([z_q, x_conditional_batch], dim=-1) * mask_batch.unsqueeze(-1)
+
+                x_reco.append(self.model.decode(z_q, mask=mask_batch))
+
+        x_reco = torch.cat(x_reco, dim=0).detach().cpu().numpy()
+        x_reco_ak = np_to_ak(x_reco, names=pp_dict.keys(), mask=mask.detach().cpu().numpy())
+        return ak_select_and_preprocess(x_reco_ak, pp_dict, inverse=True)
 
     def reconstruct_ak_tokens(
         self,
@@ -632,6 +782,17 @@ class VQVAELightning(L.LightningModule):
         """
 
         self.model.eval()
+
+        if isinstance(self.model.vqlayer, SplitQuantizer):
+            return self._reconstruct_split_ak_tokens(
+                tokens_ak=tokens_ak,
+                pp_dict=pp_dict,
+                jets_ak=jets_ak,
+                pp_dict_jet=pp_dict_jet,
+                batch_size=batch_size,
+                pad_length=pad_length,
+                hide_pbar=hide_pbar,
+            )
 
         tokens, mask = ak_pad(tokens_ak, maxlen=pad_length, return_mask=True)
         if len(tokens.fields) == 0:

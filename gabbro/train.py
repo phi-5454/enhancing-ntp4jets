@@ -21,19 +21,6 @@ from lightning.pytorch.loggers import Logger
 from omegaconf import DictConfig, OmegaConf
 from torch.distributed import get_rank, get_world_size
 
-import gabbro.models.lightning_models as gabbro_lightning_models
-import gabbro.utils.git_utils as git_utils
-from gabbro.utils.bigram import get_bigram
-from gabbro.utils.pylogger import get_pylogger
-from gabbro.utils.utils import (
-    get_gpu_properties,
-    instantiate_callbacks,
-    instantiate_loggers,
-    log_hyperparameters,
-    remove_empty_hydra_run_dir,
-    task_wrapper,
-)
-
 pyrootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 # ------------------------------------------------------------------------------------ #
 # the setup_root above is equivalent to:
@@ -51,6 +38,19 @@ pyrootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 #
 # more info: https://github.com/ashleve/pyrootutils
 # ------------------------------------------------------------------------------------ #
+
+import gabbro.models.lightning_models as gabbro_lightning_models
+import gabbro.utils.git_utils as git_utils
+from gabbro.utils.bigram import get_bigram
+from gabbro.utils.pylogger import get_pylogger
+from gabbro.utils.utils import (
+    get_gpu_properties,
+    instantiate_callbacks,
+    instantiate_loggers,
+    log_hyperparameters,
+    remove_empty_hydra_run_dir,
+    task_wrapper,
+)
 
 
 log = get_pylogger(__name__)
@@ -448,11 +448,13 @@ def main(cfg: DictConfig) -> Optional[float]:
             log.info(f"Setting continue_from_checkpoint={last_ckpt}")
             cfg.continue_from_checkpoint = str(last_ckpt)
 
-    experiment_name = Path(cfg.trainer.default_root_dir).name.split("_")[-2]
+    experiment_name = cfg.get("task_name") or Path(cfg.trainer.default_root_dir).name
     if cfg.logger.get("comet") is not None:
-        cfg.logger.comet.experiment_name = experiment_name
+        if not cfg.logger.comet.get("experiment_name"):
+            cfg.logger.comet.experiment_name = experiment_name
     if cfg.logger.get("wandb") is not None:
-        cfg.logger.wandb.name = experiment_name
+        if not cfg.logger.wandb.get("name"):
+            cfg.logger.wandb.name = experiment_name
 
     # load full config from file if specified
     if cfg.get("ckpt_path_for_evaluation") is not None:

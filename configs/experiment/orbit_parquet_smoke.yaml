@@ -4,7 +4,7 @@ defaults:
   - override /feature_dict: feature_dict_orbit_absolute.yaml
   - override /data: orbit_parquet.yaml
   - override /model: model_vqvae_transformer.yaml
-  - override /callbacks: default_callbacks.yaml
+  - override /callbacks: orbit_plotting_callbacks.yaml
   - override /logger: csv.yaml
   - override /trainer: cpu.yaml
 

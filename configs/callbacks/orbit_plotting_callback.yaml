@@ -1,0 +1,7 @@
+# Generate schema-neutral ORBIT reconstruction and token-usage plots.
+orbit_plotting_callback:
+  _target_: gabbro.callbacks.orbit_plotting_callback.OrbitPlottingCallback
+  image_path: null
+  image_filetype: png
+  save_histograms: true
+  no_trainer_info_in_filename: false

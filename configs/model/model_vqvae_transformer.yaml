@@ -18,6 +18,7 @@ model_kwargs:
     sync_nu: 2
     replace_freq: 20
     dim: -1
+  split_quantizer_cfg: null
 
 optimizer:
   _target_: torch.optim.AdamW
