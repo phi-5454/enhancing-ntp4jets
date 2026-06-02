@@ -1,0 +1,7 @@
+defaults:
+  - orbit_parquet.yaml
+  - _self_
+
+# L1T-style event tokenization: each sequence element is one absolute-coordinate
+# PUPPI AK8 jet. The emitted batch contract matches the particle loader exactly.
+sequence_type: jet_puppi_ak8

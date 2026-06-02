@@ -6,7 +6,10 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-import comet_ml  # noqa: F401  # we need to import comet_ml before torch for correct logging
+try:
+    import comet_ml  # noqa: F401  # import before torch when Comet logging is installed
+except ImportError:
+    comet_ml = None
 import hydra
 import lightning as L
 import pyrootutils
@@ -446,8 +449,10 @@ def main(cfg: DictConfig) -> Optional[float]:
             cfg.continue_from_checkpoint = str(last_ckpt)
 
     experiment_name = Path(cfg.trainer.default_root_dir).name.split("_")[-2]
-    cfg.logger.comet.experiment_name = experiment_name
-    cfg.logger.wandb.name = experiment_name
+    if cfg.logger.get("comet") is not None:
+        cfg.logger.comet.experiment_name = experiment_name
+    if cfg.logger.get("wandb") is not None:
+        cfg.logger.wandb.name = experiment_name
 
     # load full config from file if specified
     if cfg.get("ckpt_path_for_evaluation") is not None:

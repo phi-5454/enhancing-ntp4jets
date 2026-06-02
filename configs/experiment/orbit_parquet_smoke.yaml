@@ -1,0 +1,53 @@
+# @package _global_
+
+defaults:
+  - override /feature_dict: feature_dict_orbit_absolute.yaml
+  - override /data: orbit_parquet.yaml
+  - override /model: model_vqvae_transformer.yaml
+  - override /callbacks: default_callbacks.yaml
+  - override /logger: csv.yaml
+  - override /trainer: cpu.yaml
+
+project_name: "orbit-smoke"
+tags: ["orbit", "smoke"]
+
+train: true
+test: false
+
+data:
+  batch_size: 4
+  max_sequence_length: null
+  num_workers: 0
+
+trainer:
+  max_epochs: 1
+  limit_train_batches: 1
+  limit_val_batches: 1
+  enable_checkpointing: false
+
+model:
+  model_type: VQVAETransformer
+  scheduler_lightning_kwargs:
+    interval: epoch
+    frequency: 1
+  model_kwargs:
+    input_dim: 4
+    hidden_dim: 16
+    latent_dim: 3
+    num_blocks: 1
+    num_heads: 1
+    alpha: 1
+    old_transformer_implementation: false
+    vq_kwargs:
+      num_codes: 16
+      beta: 0.9
+      kmeans_init: false
+      norm: null
+      cb_norm: null
+      affine_lr: 0
+      sync_nu: 0
+      replace_freq: 20
+
+extras:
+  enforce_tags: false
+  print_config: false

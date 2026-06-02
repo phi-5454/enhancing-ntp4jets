@@ -415,9 +415,13 @@ class VQVAELightning(L.LightningModule):
 
     def on_train_start(self) -> None:
         logger.info("`on_train_start` called.")
-        self.preprocessing_dict = (
-            self.trainer.datamodule.hparams.dataset_kwargs_common.feature_dict
-        )
+        datamodule_hparams = self.trainer.datamodule.hparams
+        if "dataset_kwargs_common" in datamodule_hparams:
+            self.preprocessing_dict = datamodule_hparams.dataset_kwargs_common.feature_dict
+        else:
+            self.preprocessing_dict = {
+                feature: {} for feature in datamodule_hparams.selected_features
+            }
 
     def on_train_epoch_start(self):
         logger.info(f"`on_train_epoch_start` called. Epoch {self.trainer.current_epoch} starting.")

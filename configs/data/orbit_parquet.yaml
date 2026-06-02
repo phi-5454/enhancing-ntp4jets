@@ -1,0 +1,27 @@
+_target_: gabbro.data.orbit_parquet.OrbitParquetDataModule
+
+# Prefer one or more directories containing train/val parquet files. They are
+# shuffled deterministically and split into disjoint file lists.
+parquet_files_train_val: []
+parquet_files_test: []
+
+# Explicit pre-split lists remain available for smoke tests and fixed splits.
+parquet_files_train: null
+parquet_files_val: null
+
+# Supported values: particle, jet_ak4, jet_ak8, jet_puppi_ak4, jet_puppi_ak8.
+# All modes emit scaled eta, cos(phi), sin(phi), and transformed pT.
+sequence_type: particle
+
+max_sequence_length: null
+batch_size: 32
+num_workers: 0
+train_fraction: 0.8
+split_seed: 42
+shuffle_train: true
+shuffle_seed: 42
+mask_column: null
+mask_min_value: null
+
+# ORBIT parquet samples do not contain JetClass category labels.
+jet_type_label: 0

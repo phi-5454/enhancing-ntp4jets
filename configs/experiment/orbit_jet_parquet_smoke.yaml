@@ -1,0 +1,9 @@
+# @package _global_
+
+defaults:
+  - orbit_parquet_smoke.yaml
+  - override /data: orbit_jet_parquet.yaml
+  - override /feature_dict: feature_dict_orbit_jet_puppi_ak8_absolute.yaml
+  - _self_
+
+tags: ["orbit", "jet-puppi-ak8", "smoke"]

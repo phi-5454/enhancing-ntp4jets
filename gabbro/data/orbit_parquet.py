@@ -1,0 +1,387 @@
+"""Iterable parquet loaders for ORBIT particle and jet sequences."""
+
+import os
+import sys
+import traceback
+from pathlib import Path
+from typing import Optional
+
+import awkward as ak
+import lightning as L
+import numpy as np
+import pyarrow.dataset as ds
+import pyarrow.parquet as pq
+import torch
+from torch.utils.data import DataLoader, IterableDataset, get_worker_info
+
+
+SEQUENCE_SCHEMAS = {
+    "particle": {
+        "prefix": "L1T_PUPPIPart",
+        "mask_column": "L1T_PUPPIPart_PuppiW",
+        "mask_min_value": 0.05,
+        "max_sequence_length": 128,
+    },
+    "jet_ak4": {
+        "prefix": "L1T_JetAK4",
+        "mask_column": None,
+        "mask_min_value": 0.0,
+        "max_sequence_length": 16,
+    },
+    "jet_ak8": {
+        "prefix": "L1T_JetAK8",
+        "mask_column": None,
+        "mask_min_value": 0.0,
+        "max_sequence_length": 8,
+    },
+    "jet_puppi_ak4": {
+        "prefix": "L1T_JetPuppiAK4",
+        "mask_column": None,
+        "mask_min_value": 0.0,
+        "max_sequence_length": 16,
+    },
+    "jet_puppi_ak8": {
+        "prefix": "L1T_JetPuppiAK8",
+        "mask_column": None,
+        "mask_min_value": 0.0,
+        "max_sequence_length": 8,
+    },
+}
+
+
+def _as_paths(paths) -> list[str]:
+    if paths is None:
+        return []
+    if isinstance(paths, (str, Path)):
+        paths = [paths]
+    return [os.path.expanduser(str(path)) for path in paths]
+
+
+def _dataset_files(paths) -> list[str]:
+    paths = _as_paths(paths)
+    if not paths:
+        return []
+    files = []
+    for path in paths:
+        files.extend(ds.dataset(path, format="parquet").files)
+    return sorted(set(files))
+
+
+def deterministic_file_split(
+    parquet_files,
+    train_fraction: float = 0.8,
+    split_seed: int = 42,
+) -> tuple[list[str], list[str]]:
+    """Shuffle parquet files deterministically and return disjoint train and val lists."""
+    files = _dataset_files(parquet_files)
+    if len(files) < 2:
+        raise ValueError(
+            "Automatic train/val splitting requires at least two parquet files. "
+            "For a smoke test, provide parquet_files_train and parquet_files_val explicitly."
+        )
+    if not 0 < train_fraction < 1:
+        raise ValueError("train_fraction must be strictly between 0 and 1")
+
+    rng = np.random.default_rng(split_seed)
+    files = list(np.asarray(files)[rng.permutation(len(files))])
+    split_index = min(max(int(len(files) * train_fraction), 1), len(files) - 1)
+    return files[:split_index], files[split_index:]
+
+
+def _log_worker_exception(message: str) -> None:
+    worker_info = get_worker_info()
+    worker = "main" if worker_info is None else f"{worker_info.id}/{worker_info.num_workers}"
+    print(
+        f"[ORBIT_PARQUET_WORKER_ERROR] pid={os.getpid()} worker={worker} {message}",
+        file=sys.stderr,
+        flush=True,
+    )
+    traceback.print_exc(file=sys.stderr)
+    sys.stderr.flush()
+
+
+class OrbitPreprocessor:
+    """Apply absolute-coordinate preprocessing without centering on a jet axis."""
+
+    def __init__(self, feature_prefix: str, epsilon: float = 1e-8):
+        self.eta_column = f"{feature_prefix}_Eta"
+        self.phi_column = f"{feature_prefix}_Phi"
+        self.pt_column = f"{feature_prefix}_PT"
+        self.output_features = [
+            self.eta_column,
+            f"{self.phi_column}_cos",
+            f"{self.phi_column}_sin",
+            self.pt_column,
+        ]
+        self.epsilon = epsilon
+
+    @property
+    def input_features(self) -> list[str]:
+        return [self.eta_column, self.phi_column, self.pt_column]
+
+    def forward(self, array: ak.Array) -> ak.Array:
+        array = ak.with_field(array, array[self.eta_column] / 3, self.eta_column)
+        array = ak.with_field(array, np.cos(array[self.phi_column]), f"{self.phi_column}_cos")
+        array = ak.with_field(array, np.sin(array[self.phi_column]), f"{self.phi_column}_sin")
+        return ak.with_field(
+            array,
+            np.log(array[self.pt_column] + self.epsilon) - 1.8,
+            self.pt_column,
+        )
+
+
+class OrbitParquetDataset(IterableDataset):
+    """Stream pre-batched, padded ORBIT events from parquet row groups."""
+
+    def __init__(
+        self,
+        parquet_files,
+        sequence_type: str = "particle",
+        max_sequence_length: Optional[int] = None,
+        batch_size: int = 32,
+        shuffle_row_groups: bool = False,
+        shuffle_seed: int = 42,
+        mask_column: Optional[str] = None,
+        mask_min_value: Optional[float] = None,
+        jet_type_label: int = 0,
+    ):
+        super().__init__()
+        if sequence_type not in SEQUENCE_SCHEMAS:
+            raise ValueError(
+                f"Unknown sequence_type {sequence_type!r}. "
+                f"Expected one of {sorted(SEQUENCE_SCHEMAS)}"
+            )
+        parquet_files = _dataset_files(parquet_files)
+        if not parquet_files:
+            raise ValueError("parquet_files must contain at least one parquet file or directory")
+
+        schema = SEQUENCE_SCHEMAS[sequence_type]
+        self.preprocessor = OrbitPreprocessor(schema["prefix"])
+        self.features = list(self.preprocessor.input_features)
+        self.mask_column = schema["mask_column"] if mask_column is None else mask_column
+        self.mask_min_value = (
+            schema["mask_min_value"] if mask_min_value is None else mask_min_value
+        )
+        if self.mask_column is not None:
+            self.features.append(self.mask_column)
+
+        self.row_groups = []
+        for file_path in parquet_files:
+            parquet_file = pq.ParquetFile(file_path)
+            self.row_groups.extend(
+                (file_path, row_group_idx)
+                for row_group_idx in range(parquet_file.num_row_groups)
+            )
+
+        self.sequence_type = sequence_type
+        self.output_features = self.preprocessor.output_features
+        self.max_sequence_length = (
+            schema["max_sequence_length"]
+            if max_sequence_length is None
+            else max_sequence_length
+        )
+        self.batch_size = batch_size
+        self.shuffle_row_groups = shuffle_row_groups
+        self.shuffle_seed = shuffle_seed
+        self.jet_type_label = jet_type_label
+        self._iteration = 0
+
+    def __iter__(self):
+        try:
+            worker_info = get_worker_info()
+            row_groups = list(self.row_groups)
+            if self.shuffle_row_groups:
+                rng = np.random.default_rng(self.shuffle_seed + self._iteration)
+                rng.shuffle(row_groups)
+                self._iteration += 1
+            if worker_info is not None:
+                row_groups = row_groups[worker_info.id :: worker_info.num_workers]
+        except Exception:
+            _log_worker_exception("failed during dataset iteration setup")
+            raise
+
+        for file_path, row_group_idx in row_groups:
+            batch_idx = None
+            try:
+                parquet_file = pq.ParquetFile(file_path)
+                batches = parquet_file.iter_batches(
+                    row_groups=[row_group_idx],
+                    columns=self.features,
+                    batch_size=self.batch_size,
+                    use_threads=True,
+                )
+                for batch_idx, batch in enumerate(batches):
+                    yield from self._convert_batch(ak.from_arrow(batch))
+            except Exception:
+                _log_worker_exception(
+                    "failed while reading parquet "
+                    f"file={file_path!r} row_group={row_group_idx} "
+                    f"sequence_type={self.sequence_type!r} columns={self.features!r} "
+                    f"batch_size={self.batch_size} "
+                    f"max_sequence_length={self.max_sequence_length} "
+                    f"last_batch_idx={batch_idx}"
+                )
+                raise
+
+    def _convert_batch(self, batch: ak.Array):
+        batch = self.preprocessor.forward(batch)
+        if self.mask_column is not None:
+            sequence_mask = batch[self.mask_column] > self.mask_min_value
+        else:
+            sequence_mask = ak.ones_like(batch[self.output_features[0]], dtype=bool)
+
+        stacked = ak.concatenate(
+            [batch[field][sequence_mask][:, :, np.newaxis] for field in self.output_features],
+            axis=-1,
+        )
+        event_lengths = ak.num(stacked, axis=1)
+        non_empty_events = event_lengths > 0
+        if not ak.any(non_empty_events):
+            return
+
+        stacked = stacked[non_empty_events]
+        event_lengths = event_lengths[non_empty_events]
+        padded = ak.pad_none(stacked, self.max_sequence_length, axis=1, clip=True)
+        filled = ak.fill_none(padded, [0.0] * len(self.output_features), axis=1)
+        part_features = torch.from_numpy(ak.to_numpy(filled).astype(np.float32, copy=False))
+
+        lengths = torch.from_numpy(
+            np.minimum(ak.to_numpy(event_lengths), self.max_sequence_length).astype(
+                np.int64, copy=False
+            )
+        )
+        part_mask = torch.arange(self.max_sequence_length).unsqueeze(0) < lengths.unsqueeze(1)
+        jet_type_labels = torch.full(
+            (part_features.shape[0],),
+            self.jet_type_label,
+            dtype=torch.long,
+        )
+
+        yield {
+            "part_features": part_features,
+            "part_mask": part_mask,
+            "jet_type_labels": jet_type_labels,
+        }
+
+
+class OrbitParquetDataModule(L.LightningDataModule):
+    """Separate Lightning data module for ORBIT particle or jet parquet sequences."""
+
+    def __init__(
+        self,
+        parquet_files_train_val=None,
+        parquet_files_test=None,
+        parquet_files_train=None,
+        parquet_files_val=None,
+        sequence_type: str = "particle",
+        max_sequence_length: Optional[int] = None,
+        batch_size: int = 32,
+        num_workers: int = 0,
+        train_fraction: float = 0.8,
+        split_seed: int = 42,
+        shuffle_train: bool = True,
+        shuffle_seed: int = 42,
+        mask_column: Optional[str] = None,
+        mask_min_value: Optional[float] = None,
+        jet_type_label: int = 0,
+        **kwargs,
+    ):
+        super().__init__()
+        if sequence_type not in SEQUENCE_SCHEMAS:
+            raise ValueError(
+                f"Unknown sequence_type {sequence_type!r}. "
+                f"Expected one of {sorted(SEQUENCE_SCHEMAS)}"
+            )
+        if parquet_files_train_val:
+            if parquet_files_train or parquet_files_val:
+                raise ValueError(
+                    "Use either parquet_files_train_val or explicit "
+                    "parquet_files_train/parquet_files_val, not both."
+                )
+            parquet_files_train, parquet_files_val = deterministic_file_split(
+                parquet_files_train_val,
+                train_fraction=train_fraction,
+                split_seed=split_seed,
+            )
+        if not parquet_files_train or not parquet_files_val:
+            raise ValueError(
+                "Provide parquet_files_train_val or explicit parquet_files_train "
+                "and parquet_files_val."
+            )
+        if not parquet_files_test:
+            raise ValueError("Provide parquet_files_test from a separate test directory.")
+
+        if isinstance(batch_size, int):
+            self.batch_size_train = batch_size
+            self.batch_size_val = batch_size
+            self.batch_size_test = batch_size
+        else:
+            required_splits = {"train", "val", "test"}
+            if not required_splits.issubset(batch_size):
+                raise ValueError(
+                    "If batch_size is a mapping, it must include train, val, and test"
+                )
+            self.batch_size_train = batch_size["train"]
+            self.batch_size_val = batch_size["val"]
+            self.batch_size_test = batch_size["test"]
+
+        self.parquet_files_train = parquet_files_train
+        self.parquet_files_val = parquet_files_val
+        self.parquet_files_test = parquet_files_test
+        self.selected_features = OrbitPreprocessor(
+            SEQUENCE_SCHEMAS[sequence_type]["prefix"]
+        ).output_features
+        self.save_hyperparameters(ignore=["parquet_files_train", "parquet_files_val"])
+        self.hparams["selected_features"] = self.selected_features
+
+    def _dataset(self, parquet_files, batch_size: int, shuffle_row_groups: bool):
+        return OrbitParquetDataset(
+            parquet_files=parquet_files,
+            sequence_type=self.hparams.sequence_type,
+            max_sequence_length=self.hparams.max_sequence_length,
+            batch_size=batch_size,
+            shuffle_row_groups=shuffle_row_groups,
+            shuffle_seed=self.hparams.shuffle_seed,
+            mask_column=self.hparams.mask_column,
+            mask_min_value=self.hparams.mask_min_value,
+            jet_type_label=self.hparams.jet_type_label,
+        )
+
+    def _loader(self, dataset, persistent_workers: bool = True):
+        kwargs = {
+            "batch_size": None,
+            "num_workers": self.hparams.num_workers,
+            "pin_memory": torch.cuda.is_available(),
+            "persistent_workers": persistent_workers and self.hparams.num_workers > 0,
+        }
+        if self.hparams.num_workers > 0:
+            kwargs["prefetch_factor"] = 4
+        return DataLoader(dataset, **kwargs)
+
+    def train_dataloader(self):
+        return self._loader(
+            self._dataset(
+                self.parquet_files_train,
+                batch_size=self.batch_size_train,
+                shuffle_row_groups=self.hparams.shuffle_train,
+            )
+        )
+
+    def val_dataloader(self):
+        return self._loader(
+            self._dataset(
+                self.parquet_files_val,
+                batch_size=self.batch_size_val,
+                shuffle_row_groups=False,
+            )
+        )
+
+    def test_dataloader(self):
+        return self._loader(
+            self._dataset(
+                self.parquet_files_test,
+                batch_size=self.batch_size_test,
+                shuffle_row_groups=False,
+            ),
+            persistent_workers=False,
+        )
