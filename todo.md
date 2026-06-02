@@ -43,9 +43,6 @@
 
 ## Logging And Plotting
 
-- Decide whether attention diagnostics should remain out of scope permanently.
-  The current validation/test plotting intentionally excludes attention maps and
-  delta-eta/phi attention plots.
 - Add branch-aware codebook plots for split quantizers.
   The current combined-token plot is sparse-safe, but it does not yet show
   per-branch FSQ/VQ usage in the same detail as the split-token metadata.
