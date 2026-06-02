@@ -12,8 +12,6 @@
   datasets.
 - Add production configs for the intended train/val and test directory layout.
   Smoke configs intentionally reuse one sample file for train, val, and test.
-- ORBIT-style text manifests are supported for all parquet path fields. Direct
-  parquet files and directories remain supported.
 - Decide whether jet modes should default to `L1T_Jet*` or `L1T_JetPuppi*`.
   The current smoke test uses `jet_puppi_ak8` because it matches the L1T-style
   event-tokenization path discussed so far.
@@ -31,11 +29,6 @@
 - Tune the split quantizer configs for the actual particle and jet runs.
   The model now supports plain VQ and Phi/Psi split quantization with FSQ/VQ
   branches, but the checked-in split config is still a smoke-ready starting point.
-- Split quantizer tokenization now stores explicit branch token fields
-  `part_token_<branch>` alongside the combined `part_token_id`.
-- Split-token reconstruction is implemented for explicit branch tokens and for
-  combined `part_token_id` fallback, including FSQ unpacking and branch VQ
-  codebook lookup.
 
 ## Token Evaluation
 
@@ -50,40 +43,18 @@
 
 ## Logging And Plotting
 
-- W&B logging is available through `logger=wandb.yaml`, with predictable run names
-  from `task_name` and support for explicit `logger.wandb.name=...` overrides.
-  Keep the existing CSV and Comet logger paths usable.
-- Hydra multiruns now resolve `paths.output_dir` through the active runtime
-  directory, so each sweep job keeps its artifacts under `multiruns/<timestamp>/<job>`.
-- The README documents UV setup, parquet layout, single-VQ and split-quantizer
-  runs, Hydra multiruns, supported loggers, output locations, and source-repo
-  integration notes.
-- Root `.env` loading is available through `pyrootutils`; `.env.example`
-  documents `LOG_DIR`, W&B credentials/defaults, and the optional Comet token.
-- Explicit run env files are supported with `GABBRO_ENV_FILE=/path/to/file.env`.
-  This is loaded before Hydra composes the config, so it can provide `LOG_DIR`,
-  `MPLCONFIGDIR`, and logger credentials.
-- ORBIT-style schema-neutral reconstruction and token-usage plots are ported via
-  `gabbro.plotting.orbit` and `OrbitPlottingCallback`.
-  The plotting helpers use enhancing's existing style and color palette.
-- Single-run physical-coordinate paper plots are wired into validation/test:
-  kinematic distributions and residuals, energy, MET, jet pT resolution, and
-  particle-run FastJet jet mass/tau32 plots. Attention plots remain intentionally
-  unwired.
-- Validation plotting/evaluation stores only
-  `model.max_validation_plot_batches` batches by default, currently one batch to
-  match ORBIT's lightweight validation sample. Test plotting can retain all
-  processed batches by default, or be bounded with `model.max_test_plot_batches`.
-  The ORBIT plotting callback now skips Lightning sanity validation.
-- `scripts/collect_orbit_multirun.py` post-processes Hydra multirun directories.
-  It writes a manifest, summary CSV, reconstruction overlays, and codebook-size
-  scans from per-run histogram and metric artifacts.
-- Wire attention diagnostics into a callback once the model exposes attention
-  tensors during validation/test.
-  The `delta eta/phi` and attention-map figure helpers are available, but the
-  current VQ-VAE validation outputs only contain features, masks, and code IDs.
-- Check future plotting additions against the absolute-coordinate feature names:
-  `Eta`, `Phi_cos`, `Phi_sin`, and `PT`.
+- Decide whether attention diagnostics should remain out of scope permanently.
+  The current validation/test plotting intentionally excludes attention maps and
+  delta-eta/phi attention plots.
+- Add branch-aware codebook plots for split quantizers.
+  The current combined-token plot is sparse-safe, but it does not yet show
+  per-branch FSQ/VQ usage in the same detail as the split-token metadata.
+- Decide whether physical-coordinate paper plots should be generated every
+  validation epoch or only for explicit validation/test plotting runs.
+  FastJet-backed particle plots are useful but materially slower than loss-only
+  validation.
+- Extend multirun post-processing to consume the new physical-coordinate paper
+  histograms, including MET, jet pT resolution, jet mass, and tau32 overlays.
 
 ## Sparse Parquet Filtering
 
@@ -105,10 +76,6 @@
 
 ## Repository Cleanup
 
-- Decide whether the UV setup should become the primary local development path or
-  remain an alternative to Docker.
-- Docker requirements use the L1T-compatible `tables==3.10.1` pin because
-  `tables==3.10.2` breaks the container dependency set.
 - Review untracked files and existing modified files before committing.
 - Remove or document any legacy JetClass-only assumptions that remain in configs,
   plotting, or evaluation scripts.
