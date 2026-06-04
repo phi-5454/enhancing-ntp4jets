@@ -26,25 +26,25 @@ SEQUENCE_SCHEMAS = {
         "prefix": "L1T_JetAK4",
         "mask_column": None,
         "mask_min_value": 0.0,
-        "max_sequence_length": 16,
+        "max_sequence_length": 14,
     },
     "jet_ak8": {
         "prefix": "L1T_JetAK8",
         "mask_column": None,
         "mask_min_value": 0.0,
-        "max_sequence_length": 8,
+        "max_sequence_length": 7,
     },
     "jet_puppi_ak4": {
         "prefix": "L1T_JetPuppiAK4",
         "mask_column": None,
         "mask_min_value": 0.0,
-        "max_sequence_length": 16,
+        "max_sequence_length": 14,
     },
     "jet_puppi_ak8": {
         "prefix": "L1T_JetPuppiAK8",
         "mask_column": None,
         "mask_min_value": 0.0,
-        "max_sequence_length": 8,
+        "max_sequence_length": 7,
     },
 }
 

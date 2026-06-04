@@ -229,10 +229,10 @@ trainer.num_sanity_val_steps=0
 | `sequence_type` | Input prefix      | Default length |
 | --------------- | ----------------- | -------------: |
 | `particle`      | `L1T_PUPPIPart`   |            128 |
-| `jet_ak4`       | `L1T_JetAK4`      |             16 |
-| `jet_ak8`       | `L1T_JetAK8`      |              8 |
-| `jet_puppi_ak4` | `L1T_JetPuppiAK4` |             16 |
-| `jet_puppi_ak8` | `L1T_JetPuppiAK8` |              8 |
+| `jet_ak4`       | `L1T_JetAK4`      |             14 |
+| `jet_ak8`       | `L1T_JetAK8`      |              7 |
+| `jet_puppi_ak4` | `L1T_JetPuppiAK4` |             14 |
+| `jet_puppi_ak8` | `L1T_JetPuppiAK8` |              7 |
 
 All modes emit the same model input contract:
 
