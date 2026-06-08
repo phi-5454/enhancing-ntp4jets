@@ -15,8 +15,7 @@
 - Decide whether jet modes should default to `L1T_Jet*` or `L1T_JetPuppi*`.
   The current smoke test uses `jet_puppi_ak8` because it matches the L1T-style
   event-tokenization path discussed so far.
-- Verify sequence lengths against the final physics use case.
-  Current defaults are 128 particles, 16 AK4 jets, and 8 AK8 jets.
+- Verify sequence lengths against the final physics use case. 128 particles might still need checking, jets should be done
 
 ## Model And Config Integration
 
