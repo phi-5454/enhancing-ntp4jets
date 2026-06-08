@@ -70,8 +70,11 @@
 - Add an integration test with at least two train/val files and one separate test
   file once small fixtures are available in the repo.
 
+## Model And Config Correctness
+
+- Discuss masking location with Younes.
+
 ## Repository Cleanup
 
-- Review untracked files and existing modified files before committing.
 - Remove or document any legacy JetClass-only assumptions that remain in configs,
   plotting, or evaluation scripts.

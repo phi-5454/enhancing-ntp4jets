@@ -445,7 +445,7 @@ class VQVAELightning(L.LightningModule):
         """Perform a single training step on a batch of data from the training set."""
         loss = self.model_step(batch)
 
-        self.train_loss_history.append(float(loss))
+        self.train_loss_history.append(loss.detach().item())
         self.log("train_loss", loss.item(), on_step=True, on_epoch=True, prog_bar=True)
 
         return loss
@@ -844,7 +844,6 @@ class VQVAELightning(L.LightningModule):
         if hasattr(self.model.vqlayer, "affine_transform"):
             codebook = self.model.vqlayer.affine_transform(codebook)
 
-        last_batch = None
         with torch.no_grad():
             pbar = tqdm(dataloader) if not hide_pbar else dataloader
             for i, batch in enumerate(pbar):
@@ -871,9 +870,6 @@ class VQVAELightning(L.LightningModule):
                 # if conditioning is used, concatenate the conditional data to the tokens
                 if self.model.conditional_dim > 0:
                     z_q = torch.cat([z_q, x_conditional_batch], dim=-1) * mask_batch.unsqueeze(-1)
-
-                if last_batch is not None:
-                    break
 
                 if hasattr(self.model, "latent_projection_out"):
                     x_reco_batch = self.model.decode(z_q, mask=mask_batch)

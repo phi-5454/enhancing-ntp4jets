@@ -1,24 +1,25 @@
 _target_: gabbro.models.vqvae.VQVAELightning
 
-model_type: "Transformer"
+model_type: "VQVAETransformer"
 max_validation_plot_batches: 1
 max_test_plot_batches: null
 
 model_kwargs:
   hidden_dim: 128
-  latent_dim: 16
-  num_blocks: 3
+  latent_dim: 8
+  num_blocks: 4
   num_heads: 8
-  alpha: 5
+  alpha: 10
+  causal_decoder: true
   vq_kwargs:
-    num_codes: 2048
+    num_codes: 8192
     beta: 0.9
-    kmeans_init: true
+    kmeans_init: false
     norm: null
     cb_norm: null
-    affine_lr: 0.0
-    sync_nu: 2
-    replace_freq: 20
+    affine_lr: 2.0
+    sync_nu: 1
+    replace_freq: 500
     dim: -1
   split_quantizer_cfg: null
 
@@ -26,7 +27,7 @@ optimizer:
   _target_: torch.optim.AdamW
   _partial_: true
   lr: 0.001
-  # weight_decay: 0.05
+  weight_decay: 0.01
 
 scheduler:
   _target_: torch.optim.lr_scheduler.ConstantLR

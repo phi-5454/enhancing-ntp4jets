@@ -109,7 +109,7 @@ def get_nodename_bigram():
     Returns:
         str: Unique run identifier.
     """
-    nodename = os.uname().nodename
+    nodename = os.uname().nodename if hasattr(os, "uname") else os.environ.get("COMPUTERNAME", "local")
     job_id = os.environ.get("JOB_ID", None)
 
     # cleanup
