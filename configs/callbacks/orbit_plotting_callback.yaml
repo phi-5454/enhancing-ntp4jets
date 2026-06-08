@@ -6,5 +6,5 @@ orbit_plotting_callback:
   save_histograms: true
   no_trainer_info_in_filename: false
   enable_physics_plots: true
-  include_all_ratios: false
+  include_all_ratios: true
   jet_radius: 0.8

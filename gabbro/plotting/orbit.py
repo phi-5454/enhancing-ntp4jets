@@ -380,6 +380,10 @@ def collect_physical_reconstruction_histograms(
     reco_tau32s=(),
     true_missing_ets=(),
     reco_missing_ets=(),
+    true_jet_etas=(),
+    reco_jet_etas=(),
+    true_jet_phis=(),
+    reco_jet_phis=(),
     data_level: str = "particle",
 ) -> dict[str, np.ndarray]:
     """Collect ORBIT paper-style histograms in physical coordinates.
@@ -397,6 +401,22 @@ def collect_physical_reconstruction_histograms(
         counts, bins = np.histogram(fractional_diff, bins=50, range=(-0.5, 0.5))
         histograms["jet_pt_resolution_counts"] = counts
         histograms["jet_pt_resolution_bins"] = bins
+
+    if len(true_jet_etas) > 0:
+        true_jet_etas = np.asarray(true_jet_etas)
+        reco_jet_etas = np.asarray(reco_jet_etas)
+        diff = reco_jet_etas - true_jet_etas
+        counts, bins = np.histogram(diff, bins=50)
+        histograms["jet_eta_resolution_counts"] = counts
+        histograms["jet_eta_resolution_bins"] = bins
+
+    if len(true_jet_phis) > 0:
+        true_jet_phis = np.asarray(true_jet_phis)
+        reco_jet_phis = np.asarray(reco_jet_phis)
+        diff = reco_jet_phis - true_jet_phis
+        counts, bins = np.histogram(diff, bins=50)
+        histograms["jet_phi_resolution_counts"] = counts
+        histograms["jet_phi_resolution_bins"] = bins
 
     for i, feature_name in enumerate(feature_names):
         original, reconstructed = _finite_pair(x_np[:, i], x_hat_np[:, i])
@@ -764,20 +784,50 @@ def physical_reconstruction_plots(
     """Build ORBIT paper and exploratory single-run reconstruction figures."""
     figures = paper_reconstruction_plots(histograms, data_level)
 
-    if "jet_pt_resolution_counts" in histograms:
+    has_pt_res = "jet_pt_resolution_counts" in histograms
+    has_eta_res = "jet_eta_resolution_counts" in histograms
+    has_phi_res = "jet_phi_resolution_counts" in histograms
+    if has_pt_res and (has_eta_res or has_phi_res):
+        fig, axes = plt.subplots(1, 3, figsize=SUBSTRUCTURE_SIMPLE_FIGSIZE)
+        _set_suptitle(fig, "Jet Kinematic Resolution", fontsize=16)
+        _hist_step(axes[0], histograms["jet_pt_resolution_bins"],
+                   histograms["jet_pt_resolution_counts"], color=RESIDUAL_COLOR)
+        axes[0].axvline(0, color=REFERENCE_LINE_COLOR, linestyle=REFERENCE_LINE_STYLE,
+                        alpha=REFERENCE_LINE_ALPHA)
+        axes[0].set_xlabel(r"$(p_T^\mathrm{reco} - p_T^\mathrm{true}) / p_T^\mathrm{true}$")
+        axes[0].set_ylabel("Number of Jets")
+        _set_title(axes[0], r"Fractional $p_T$ Resolution")
+
+        if has_eta_res:
+            _hist_step(axes[1], histograms["jet_eta_resolution_bins"],
+                       histograms["jet_eta_resolution_counts"], color=RESIDUAL_COLOR)
+            axes[1].axvline(0, color=REFERENCE_LINE_COLOR, linestyle=REFERENCE_LINE_STYLE,
+                            alpha=REFERENCE_LINE_ALPHA)
+            axes[1].set_xlabel(r"$\eta^\mathrm{reco} - \eta^\mathrm{true}$")
+            axes[1].set_ylabel("Number of Jets")
+            _set_title(axes[1], r"$\eta$ Residual")
+        else:
+            axes[1].axis("off")
+
+        if has_phi_res:
+            _hist_step(axes[2], histograms["jet_phi_resolution_bins"],
+                       histograms["jet_phi_resolution_counts"], color=RESIDUAL_COLOR)
+            axes[2].axvline(0, color=REFERENCE_LINE_COLOR, linestyle=REFERENCE_LINE_STYLE,
+                            alpha=REFERENCE_LINE_ALPHA)
+            axes[2].set_xlabel(r"$\phi^\mathrm{reco} - \phi^\mathrm{true}$")
+            axes[2].set_ylabel("Number of Jets")
+            _set_title(axes[2], r"$\phi$ Residual")
+        else:
+            axes[2].axis("off")
+
+        plt.tight_layout()
+        figures["jet_kinematic_resolution"] = fig
+    elif has_pt_res:
         fig, ax = plt.subplots(figsize=RESOLUTION_FIGSIZE)
-        _hist_step(
-            ax,
-            histograms["jet_pt_resolution_bins"],
-            histograms["jet_pt_resolution_counts"],
-            color=RESIDUAL_COLOR,
-        )
-        ax.axvline(
-            0,
-            color=REFERENCE_LINE_COLOR,
-            linestyle=REFERENCE_LINE_STYLE,
-            alpha=REFERENCE_LINE_ALPHA,
-        )
+        _hist_step(ax, histograms["jet_pt_resolution_bins"],
+                   histograms["jet_pt_resolution_counts"], color=RESIDUAL_COLOR)
+        ax.axvline(0, color=REFERENCE_LINE_COLOR, linestyle=REFERENCE_LINE_STYLE,
+                   alpha=REFERENCE_LINE_ALPHA)
         ax.set_xlabel(
             r"Fractional $p_T$ Resolution: "
             r"$(p_T^\mathrm{reco} - p_T^\mathrm{true}) / p_T^\mathrm{true}$"

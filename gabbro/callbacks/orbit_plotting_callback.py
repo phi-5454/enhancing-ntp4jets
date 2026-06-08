@@ -41,7 +41,7 @@ class OrbitPlottingCallback(L.Callback):
         save_histograms: bool = True,
         no_trainer_info_in_filename: bool = False,
         enable_physics_plots: bool = True,
-        include_all_ratios: bool = False,
+        include_all_ratios: bool = True,
         jet_radius: float = 0.8,
     ):
         super().__init__()
@@ -148,17 +148,22 @@ class OrbitPlottingCallback(L.Callback):
         x_reco_physical: np.ndarray,
         mask: np.ndarray,
     ):
-        true_jet_pts = []
-        reco_jet_pts = []
+        true_jet_pts, reco_jet_pts = [], []
+        true_jet_etas, reco_jet_etas = [], []
+        true_jet_phis, reco_jet_phis = [], []
         for i in range(x_physical.shape[0]):
             event_mask = mask[i]
-            true_pts = x_physical[i, event_mask, 2]
-            reco_pts = x_reco_physical[i, event_mask, 2]
-            n_match = min(len(true_pts), len(reco_pts))
+            true_vals = x_physical[i, event_mask]
+            reco_vals = x_reco_physical[i, event_mask]
+            n_match = min(len(true_vals), len(reco_vals))
             if n_match:
-                true_jet_pts.extend(true_pts[:n_match])
-                reco_jet_pts.extend(reco_pts[:n_match])
-        return true_jet_pts, reco_jet_pts, [], [], [], []
+                true_jet_pts.extend(true_vals[:n_match, 2])
+                reco_jet_pts.extend(reco_vals[:n_match, 2])
+                true_jet_etas.extend(true_vals[:n_match, 0])
+                reco_jet_etas.extend(reco_vals[:n_match, 0])
+                true_jet_phis.extend(true_vals[:n_match, 1])
+                reco_jet_phis.extend(reco_vals[:n_match, 1])
+        return true_jet_pts, reco_jet_pts, true_jet_etas, reco_jet_etas, true_jet_phis, reco_jet_phis
 
     def _reconstruct_event_jets(self, pt: np.ndarray, eta: np.ndarray, phi: np.ndarray):
         pt = np.asarray(pt, dtype=np.float64)
@@ -361,32 +366,46 @@ class OrbitPlottingCallback(L.Callback):
                 physics_feature_names = ["Eta", "Phi", "pT"]
                 physics_mse = np.mean((x_reco_physical_flat - x_physical_flat) ** 2, axis=0)
                 if data_level == "particle":
-                    jet_metrics = self._collect_particle_jet_metrics(
-                        x_physical,
-                        x_reco_physical,
-                        mask,
-                    )
+                    (
+                        true_jet_pts, reco_jet_pts,
+                        true_jet_masses, reco_jet_masses,
+                        true_tau32s, reco_tau32s,
+                    ) = self._collect_particle_jet_metrics(x_physical, x_reco_physical, mask)
                     missing_ets = self._collect_missing_transverse_energy(
-                        x_physical,
-                        x_reco_physical,
-                        mask,
+                        x_physical, x_reco_physical, mask,
+                    )
+                    physics_histograms = collect_physical_reconstruction_histograms(
+                        physics_feature_names,
+                        x_physical_flat,
+                        x_reco_physical_flat,
+                        true_jet_pts=true_jet_pts,
+                        reco_jet_pts=reco_jet_pts,
+                        true_jet_masses=true_jet_masses,
+                        reco_jet_masses=reco_jet_masses,
+                        true_tau32s=true_tau32s,
+                        reco_tau32s=reco_tau32s,
+                        true_missing_ets=missing_ets[0],
+                        reco_missing_ets=missing_ets[1],
+                        data_level=data_level,
                     )
                 else:
-                    jet_metrics = self._collect_direct_jet_metrics(
-                        x_physical,
-                        x_reco_physical,
-                        mask,
+                    (
+                        true_jet_pts, reco_jet_pts,
+                        true_jet_etas, reco_jet_etas,
+                        true_jet_phis, reco_jet_phis,
+                    ) = self._collect_direct_jet_metrics(x_physical, x_reco_physical, mask)
+                    physics_histograms = collect_physical_reconstruction_histograms(
+                        physics_feature_names,
+                        x_physical_flat,
+                        x_reco_physical_flat,
+                        true_jet_pts=true_jet_pts,
+                        reco_jet_pts=reco_jet_pts,
+                        true_jet_etas=true_jet_etas,
+                        reco_jet_etas=reco_jet_etas,
+                        true_jet_phis=true_jet_phis,
+                        reco_jet_phis=reco_jet_phis,
+                        data_level=data_level,
                     )
-                    missing_ets = ((), ())
-                physics_histograms = collect_physical_reconstruction_histograms(
-                    physics_feature_names,
-                    x_physical_flat,
-                    x_reco_physical_flat,
-                    *jet_metrics,
-                    true_missing_ets=missing_ets[0],
-                    reco_missing_ets=missing_ets[1],
-                    data_level=data_level,
-                )
                 histograms.update({f"physical_{key}": value for key, value in physics_histograms.items()})
                 metrics.update(
                     {
