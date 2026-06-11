@@ -31,10 +31,6 @@
 
 ## Token Evaluation
 
-- Connect token export from the train/eval pipeline to
-  `scripts/evaluate_token_quality.py`.
-  The evaluator currently consumes an `.npz` containing `token_ids`, `mask`, and
-  `labels`; it does not yet generate that file from model outputs.
 - Decide where token-quality evaluation should run.
   Options are a standalone script, a Hydra job, or a callback after validation/test.
 - Add a real token-quality smoke test once labelled multi-class parquet inputs are
