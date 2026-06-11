@@ -3,17 +3,17 @@
 ## Data Loading
 
 - ~~Decide the class-label convention for ORBIT/L1T parquet inputs.~~
-  Resolved: EOS directory name is the label source. `OrbitParquetDataModule` now
+  EOS directory name is the label source. `OrbitParquetDataModule` now
   accepts `parquet_files_train_val_per_class: {class_name: paths}` and assigns
   integer labels from sorted class names. See `gabbro/data/orbit_parquet.py`.
 - ~~Add class-aware train/val splitting once the label convention is fixed.~~
-  Resolved: `parquet_files_train_val_per_class` splits each class independently
+  `parquet_files_train_val_per_class` splits each class independently
   before chaining, so class balance is preserved in both train and val.
 - ~~Add production configs for the intended train/val and test directory layout.~~
-  Resolved: `configs/experiment/orbit_jet_puppi_ak8_production.yaml` added.
+  `configs/experiment/orbit_jet_puppi_ak8_production.yaml` added.
   Reads manifests via `$ORBIT_MANIFEST_DIR`. Test set left empty until decided.
 - ~~Decide whether jet modes should default to `L1T_Jet*` or `L1T_JetPuppi*`.~~
-  Resolved: `jet_puppi_ak8` confirmed for first production run.
+  `jet_puppi_ak8` will be tried for first production run.
 - Verify sequence lengths against the final physics use case. 128 particles might still need checking, jets should be done
 
 ## Model And Config Integration
