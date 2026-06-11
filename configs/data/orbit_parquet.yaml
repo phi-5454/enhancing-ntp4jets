@@ -1,8 +1,14 @@
 _target_: gabbro.data.orbit_parquet.OrbitParquetDataModule
 
-# Prefer one or more ORBIT-style text manifests or directories containing
-# train/val parquet files. Text manifests contain one parquet path per line.
-# They are expanded, shuffled deterministically, and split into disjoint file lists.
+# Multi-class mode: mapping of {class_name: paths_or_manifest}.
+# Class names are sorted alphabetically to assign deterministic integer labels.
+# Each class is split independently into train/val (class-aware split).
+# Mutually exclusive with parquet_files_train_val and parquet_files_train/val.
+parquet_files_train_val_per_class: null
+
+# Single-class mode: one or more ORBIT-style text manifests or directories.
+# Text manifests contain one parquet path per line; expanded, shuffled
+# deterministically, and split into disjoint file lists.
 parquet_files_train_val: []
 parquet_files_test: []
 

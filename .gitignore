@@ -1,6 +1,8 @@
 CLAUDE.md
 .claude/
 test_data/
+logs/*
+!logs/.gitkeep
 
 # Mac-specific
 .DS_Store

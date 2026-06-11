@@ -12,7 +12,7 @@ model_kwargs:
   alpha: 10
   causal_decoder: true
   vq_kwargs:
-    num_codes: 8192
+    num_codes: 512
     beta: 0.9
     kmeans_init: false
     norm: null

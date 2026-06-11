@@ -12,7 +12,7 @@ import numpy as np
 import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 import torch
-from torch.utils.data import DataLoader, IterableDataset, get_worker_info
+from torch.utils.data import ChainDataset, DataLoader, IterableDataset, get_worker_info
 
 
 SEQUENCE_SCHEMAS = {
@@ -302,11 +302,28 @@ class OrbitParquetDataset(IterableDataset):
 
 
 class OrbitParquetDataModule(L.LightningDataModule):
-    """Separate Lightning data module for ORBIT particle or jet parquet sequences."""
+    """Separate Lightning data module for ORBIT particle or jet parquet sequences.
+
+    Two modes for train/val data:
+
+    Single-class mode (original):
+        Pass ``parquet_files_train_val`` (auto-split) or explicit
+        ``parquet_files_train`` / ``parquet_files_val``.  All samples receive
+        ``jet_type_label`` as their class index.
+
+    Multi-class mode:
+        Pass ``parquet_files_train_val_per_class`` — a mapping of
+        ``{class_name: paths_or_manifest}``.  Class names are sorted
+        alphabetically to assign deterministic integer labels (0, 1, …).
+        Each class is split independently (class-aware train/val split), then
+        the resulting datasets are chained.  The ``class_to_label`` mapping is
+        recorded in ``hparams`` for reproducibility.
+    """
 
     def __init__(
         self,
         parquet_files_train_val=None,
+        parquet_files_train_val_per_class: Optional[dict] = None,
         parquet_files_test=None,
         parquet_files_train=None,
         parquet_files_val=None,
@@ -329,24 +346,6 @@ class OrbitParquetDataModule(L.LightningDataModule):
                 f"Unknown sequence_type {sequence_type!r}. "
                 f"Expected one of {sorted(SEQUENCE_SCHEMAS)}"
             )
-        if parquet_files_train_val:
-            if parquet_files_train or parquet_files_val:
-                raise ValueError(
-                    "Use either parquet_files_train_val or explicit "
-                    "parquet_files_train/parquet_files_val, not both."
-                )
-            parquet_files_train, parquet_files_val = deterministic_file_split(
-                parquet_files_train_val,
-                train_fraction=train_fraction,
-                split_seed=split_seed,
-            )
-        if not parquet_files_train or not parquet_files_val:
-            raise ValueError(
-                "Provide parquet_files_train_val or explicit parquet_files_train "
-                "and parquet_files_val."
-            )
-        if not parquet_files_test:
-            raise ValueError("Provide parquet_files_test from a separate test directory.")
 
         if isinstance(batch_size, int):
             self.batch_size_train = batch_size
@@ -362,16 +361,65 @@ class OrbitParquetDataModule(L.LightningDataModule):
             self.batch_size_val = batch_size["val"]
             self.batch_size_test = batch_size["test"]
 
-        self.parquet_files_train = parquet_files_train
-        self.parquet_files_val = parquet_files_val
+        if parquet_files_train_val_per_class:
+            if parquet_files_train_val or parquet_files_train or parquet_files_val:
+                raise ValueError(
+                    "Use either parquet_files_train_val_per_class or the single-class "
+                    "params (parquet_files_train_val / parquet_files_train+val), not both."
+                )
+            class_names = sorted(parquet_files_train_val_per_class.keys(), key=str.lower)
+            self._class_to_label: dict[str, int] = {name: i for i, name in enumerate(class_names)}
+            self._train_files_per_class: dict[str, list[str]] = {}
+            self._val_files_per_class: dict[str, list[str]] = {}
+            for name in class_names:
+                train_f, val_f = deterministic_file_split(
+                    parquet_files_train_val_per_class[name],
+                    train_fraction=train_fraction,
+                    split_seed=split_seed,
+                )
+                self._train_files_per_class[name] = train_f
+                self._val_files_per_class[name] = val_f
+            self.parquet_files_train = None
+            self.parquet_files_val = None
+            self._multi_class = True
+        else:
+            if parquet_files_train_val:
+                if parquet_files_train or parquet_files_val:
+                    raise ValueError(
+                        "Use either parquet_files_train_val or explicit "
+                        "parquet_files_train/parquet_files_val, not both."
+                    )
+                parquet_files_train, parquet_files_val = deterministic_file_split(
+                    parquet_files_train_val,
+                    train_fraction=train_fraction,
+                    split_seed=split_seed,
+                )
+            if not parquet_files_train or not parquet_files_val:
+                raise ValueError(
+                    "Provide parquet_files_train_val, parquet_files_train_val_per_class, "
+                    "or explicit parquet_files_train and parquet_files_val."
+                )
+            self.parquet_files_train = parquet_files_train
+            self.parquet_files_val = parquet_files_val
+            self._class_to_label = {}
+            self._multi_class = False
+
         self.parquet_files_test = parquet_files_test
         self.selected_features = OrbitPreprocessor(
             SEQUENCE_SCHEMAS[sequence_type]["prefix"]
         ).output_features
         self.save_hyperparameters(ignore=["parquet_files_train", "parquet_files_val"])
         self.hparams["selected_features"] = self.selected_features
+        if self._multi_class:
+            self.hparams["class_to_label"] = self._class_to_label
 
-    def _dataset(self, parquet_files, batch_size: int, shuffle_row_groups: bool):
+    def _dataset(
+        self,
+        parquet_files,
+        batch_size: int,
+        shuffle_row_groups: bool,
+        jet_type_label: Optional[int] = None,
+    ):
         return OrbitParquetDataset(
             parquet_files=parquet_files,
             sequence_type=self.hparams.sequence_type,
@@ -381,7 +429,7 @@ class OrbitParquetDataModule(L.LightningDataModule):
             shuffle_seed=self.hparams.shuffle_seed,
             mask_column=self.hparams.mask_column,
             mask_min_value=self.hparams.mask_min_value,
-            jet_type_label=self.hparams.jet_type_label,
+            jet_type_label=jet_type_label if jet_type_label is not None else self.hparams.jet_type_label,
         )
 
     def _loader(self, dataset, persistent_workers: bool = True):
@@ -396,6 +444,17 @@ class OrbitParquetDataModule(L.LightningDataModule):
         return DataLoader(dataset, **kwargs)
 
     def train_dataloader(self):
+        if self._multi_class:
+            datasets = [
+                self._dataset(
+                    self._train_files_per_class[name],
+                    batch_size=self.batch_size_train,
+                    shuffle_row_groups=self.hparams.shuffle_train,
+                    jet_type_label=label,
+                )
+                for name, label in self._class_to_label.items()
+            ]
+            return self._loader(ChainDataset(datasets))
         return self._loader(
             self._dataset(
                 self.parquet_files_train,
@@ -405,6 +464,17 @@ class OrbitParquetDataModule(L.LightningDataModule):
         )
 
     def val_dataloader(self):
+        if self._multi_class:
+            datasets = [
+                self._dataset(
+                    self._val_files_per_class[name],
+                    batch_size=self.batch_size_val,
+                    shuffle_row_groups=False,
+                    jet_type_label=label,
+                )
+                for name, label in self._class_to_label.items()
+            ]
+            return self._loader(ChainDataset(datasets))
         return self._loader(
             self._dataset(
                 self.parquet_files_val,
@@ -414,6 +484,8 @@ class OrbitParquetDataModule(L.LightningDataModule):
         )
 
     def test_dataloader(self):
+        if not self.parquet_files_test:
+            raise ValueError("Provide parquet_files_test from a separate test directory.")
         return self._loader(
             self._dataset(
                 self.parquet_files_test,
