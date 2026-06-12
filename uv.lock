@@ -596,7 +596,7 @@ requires-dist = [
     { name = "tqdm" },
     { name = "uproot", specifier = ">=5.1.2" },
     { name = "vector" },
-    { name = "vqtorch", git = "https://github.com/minyoungg/vqtorch.git?rev=02e60a19bd742c17b0bf3e1925f23796d54cbeac" },
+    { name = "vqtorch", directory = "vqtorch" },
     { name = "wandb", specifier = ">=0.27.0" },
 ]
 
@@ -2343,11 +2343,18 @@ wheels = [
 [[package]]
 name = "vqtorch"
 version = "0.1.0"
-source = { git = "https://github.com/minyoungg/vqtorch.git?rev=02e60a19bd742c17b0bf3e1925f23796d54cbeac#02e60a19bd742c17b0bf3e1925f23796d54cbeac" }
+source = { directory = "vqtorch" }
 dependencies = [
     { name = "string-color" },
     { name = "torch" },
     { name = "torchpq" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "string-color", specifier = "==1.2.3" },
+    { name = "torch", specifier = ">=1.13.0" },
+    { name = "torchpq", specifier = "==0.3.0.1" },
 ]
 
 [[package]]
