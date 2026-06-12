@@ -297,16 +297,12 @@ class SplitQuantizer(nn.Module):
         mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         branch_latents = self.phi(z, mask)
-        if mask is not None:
-            token_mask = mask.unsqueeze(-1)
         quantized_branches = {}
         branch_codes = {}
         branch_losses = {}
 
         for branch, quantizer in self.quantizers.items():
             z_q, codes, loss = quantizer(branch_latents[branch])
-            if mask is not None:
-                z_q = z_q * token_mask.to(z_q.dtype)
             quantized_branches[branch] = z_q
             branch_codes[branch] = codes
             branch_losses[branch] = loss

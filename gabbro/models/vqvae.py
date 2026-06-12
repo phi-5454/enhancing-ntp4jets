@@ -143,9 +143,7 @@ class VQVAEMLP(torch.nn.Module):
         """Quantize latent embeddings with single VectorQuant or split Phi/Psi quantization."""
         if isinstance(self.vqlayer, SplitQuantizer):
             return self.vqlayer(z_embed, mask=mask)
-        z_q, vq_out = self.vqlayer(z_embed)
-        z_q = z_q * mask.unsqueeze(-1).to(z_q.dtype) if mask is not None else z_q
-        return z_q, vq_out
+        return self.vqlayer(z_embed)
 
 
 class VQVAETransformer(torch.nn.Module):
@@ -307,7 +305,7 @@ class VQVAETransformer(torch.nn.Module):
             x = self.encoder(x, mask=mask)
         else:
             x = self.encoder_normformer(x, mask)
-        z_embed = self.latent_projection_in(x)
+        z_embed = self.latent_projection_in(x) * mask.unsqueeze(-1)
         return z_embed, x_conditional
 
     def quantize(self, z_embed, mask=None):
@@ -316,7 +314,6 @@ class VQVAETransformer(torch.nn.Module):
             z, vq_out = self.vqlayer(z_embed, mask=mask)
         else:
             z, vq_out = self.vqlayer(z_embed)
-            z = z * mask.unsqueeze(-1).to(z.dtype) if mask is not None else z
         return z, vq_out
 
     def decode(self, z, mask, x_conditional=None):
