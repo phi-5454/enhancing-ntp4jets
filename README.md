@@ -102,6 +102,53 @@ data.parquet_files_val='[/path/val.parquet]' \
 data.parquet_files_test='[/path/test.parquet]'
 ```
 
+### Multi-class mode
+
+When data lives in separate per-class directories (e.g. on EOS), use
+`parquet_files_train_val_per_class` instead of `parquet_files_train_val`. Pass
+a mapping of class name to manifest (or directory). Class names are sorted
+case-insensitively and assigned deterministic integer labels (0, 1, …). Each
+class is split independently into train/val using the same `data.split_seed`
+and `data.train_fraction`. The resulting `class_to_label` mapping is saved in
+the run's `hparams` for reproducibility.
+
+`parquet_files_train_val_per_class` is mutually exclusive with
+`parquet_files_train_val` and explicit `parquet_files_train`/`parquet_files_val`.
+
+**Step 1 — generate manifests.** The EOS dataset contains many process classes
+as subdirectories. Run `make_eos_manifests.py` once to write one `.txt` manifest
+per subdirectory:
+
+```bash
+python scripts/make_eos_manifests.py \
+  --eos-root /eos/project/f/foundational-model-dataset/samples/production_final \
+  --out-dir /path/to/manifests/
+```
+
+**Step 2 — select the classes you want.** The manifest directory will contain a
+`.txt` file for every class in the EOS tree, but you only load the ones you
+explicitly list in `parquet_files_train_val_per_class`. The rest are ignored.
+The production experiment config `orbit_jet_puppi_ak8_production` already
+selects four classes via `$ORBIT_MANIFEST_DIR`:
+
+```yaml
+# configs/experiment/orbit_jet_puppi_ak8_production.yaml (excerpt)
+data:
+  parquet_files_train_val_per_class:
+    ggHbb:         ${oc.env:ORBIT_MANIFEST_DIR}/ggHbb.txt
+    QCD_HT50toInf: ${oc.env:ORBIT_MANIFEST_DIR}/QCD_HT50toInf.txt
+    VBFHbb:        ${oc.env:ORBIT_MANIFEST_DIR}/VBFHbb.txt
+    minbias:       ${oc.env:ORBIT_MANIFEST_DIR}/minbias.txt
+```
+
+To use a different class selection, create a new experiment config with the
+desired subset. Then set the manifest directory and launch:
+
+```bash
+export ORBIT_MANIFEST_DIR=/path/to/manifests/
+uv run --locked python gabbro/train.py experiment=orbit_jet_puppi_ak8_production
+```
+
 ### Run a smoke test
 
 The checked-in smoke script runs both particle and PUPPI AK8 jet modes against a
