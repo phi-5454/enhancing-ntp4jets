@@ -143,10 +143,25 @@ def _serializable_record(record: dict[str, Any]) -> dict[str, Any]:
     return serialized
 
 
-def _collect_record(run_dir: Path, stage: str) -> tuple[dict[str, Any], dict[str, np.ndarray] | None]:
+def _artifact_prefix(stage: str, group: str) -> str:
+    return f"{stage}_orbit" if group == "all" else f"{stage}_{group}_orbit"
+
+
+def _collect_record(
+    run_dir: Path,
+    stage: str,
+    group: str,
+) -> tuple[dict[str, Any], dict[str, np.ndarray] | None]:
     cfg = OmegaConf.load(run_dir / ".hydra" / "config.yaml")
-    histogram_path = _latest_file(run_dir / "saved_histograms", f"{stage}_orbit_hists_step_*.npz")
-    metrics_path = _latest_file(run_dir / "saved_metrics", f"{stage}_orbit_metrics_step_*.json")
+    artifact_prefix = _artifact_prefix(stage, group)
+    histogram_path = _latest_file(
+        run_dir / "saved_histograms",
+        f"{artifact_prefix}_hists_step_*.npz",
+    )
+    metrics_path = _latest_file(
+        run_dir / "saved_metrics",
+        f"{artifact_prefix}_metrics_step_*.json",
+    )
     metrics = _load_latest_csv_metrics(run_dir)
     metrics.update(_load_json(metrics_path))
     metadata = _quantizer_metadata(cfg)
@@ -157,6 +172,8 @@ def _collect_record(run_dir: Path, stage: str) -> tuple[dict[str, Any], dict[str
         "run_dir": run_dir,
         "histogram_path": histogram_path,
         "metrics_path": metrics_path,
+        "stage": stage,
+        "group": group,
         "seed": int(cfg.get("seed", 0)),
         **metadata,
         **metrics,
@@ -225,6 +242,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--multirun-dir", type=Path, required=True)
     parser.add_argument("--stage", choices=("val", "test"), default="val")
+    parser.add_argument("--group", default="all")
     parser.add_argument("--output-dir", type=Path)
     args = parser.parse_args()
 
@@ -235,7 +253,7 @@ def main() -> None:
     records = []
     loaded_histograms = []
     for config_path in config_paths:
-        record, histograms = _collect_record(config_path.parent.parent, args.stage)
+        record, histograms = _collect_record(config_path.parent.parent, args.stage, args.group)
         records.append(record)
         loaded_histograms.append(histograms)
 
@@ -249,7 +267,7 @@ def main() -> None:
         if histograms is not None
     ]
 
-    output_dir = args.output_dir or args.multirun_dir / "comparisons"
+    output_dir = args.output_dir or args.multirun_dir / "comparisons" / args.stage / args.group
     _write_outputs(records, output_dir)
     _save_figures(records, histogram_runs, output_dir)
     print(f"Collected {len(records)} runs into {output_dir}")

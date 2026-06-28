@@ -4,7 +4,17 @@ _target_: gabbro.data.orbit_parquet.OrbitParquetDataModule
 # Class names are sorted alphabetically to assign deterministic integer labels.
 # Each class is split independently into train/val (class-aware split).
 # Mutually exclusive with parquet_files_train_val and parquet_files_train/val.
+# Values may also be mappings with:
+#   paths: manifest, parquet file, or directory
+#   sequence_type: optional per-class input collection override
+#   min_pt: optional input-object pT cut before padding
+#   eval_sequence_type: optional val/test event-filter collection
+#   eval_min_pt: optional val/test event-filter pT threshold
+#   weight: optional train-time class sampling weight
+#   max_files: optional per-class file cap for quick checks
+#   max_train_events/max_val_events/max_test_events: optional event caps
 parquet_files_train_val_per_class: null
+parquet_files_test_per_class: null
 
 # Single-class mode: one or more ORBIT-style text manifests or directories.
 # Text manifests contain one parquet path per line; expanded, shuffled
@@ -30,6 +40,18 @@ shuffle_train: true
 shuffle_seed: 42
 mask_column: null
 mask_min_value: null
+min_pt: null
 
 # ORBIT parquet samples do not contain JetClass category labels.
 jet_type_label: 0
+
+# Optional shorthand overrides for simple {class_name: manifest} mappings.
+class_sequence_types: null
+class_min_pts: null
+class_eval_sequence_types: null
+class_eval_min_pts: null
+class_sampling_weights: null
+max_files_per_class: null
+max_train_events_per_class: null
+max_val_events_per_class: null
+max_test_events_per_class: null

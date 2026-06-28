@@ -163,7 +163,7 @@ class VQVAETransformer(torch.nn.Module):
         max_sequence_len: int = 128,
         input_features_dict: Dict[str, Any] = None,
         input_dim: int = None,
-        old_transformer_implementation: bool = True,
+        old_transformer_implementation: bool = False,
         in_out_proj_cfg: Dict[str, Any] = None,
         latent_proj_cfg: Dict[str, Any] = None,
         transformer_cfg: dict = None,
@@ -920,7 +920,7 @@ class VQVAELightning(L.LightningModule):
                 "optimizer": optimizer,
                 "lr_scheduler": {
                     "scheduler": scheduler,
-                    **self.hparams.scheduler_lightning_kwargs,
+                    **self.hparams.get("scheduler_lightning_kwargs", {}),
                 },
             }
 

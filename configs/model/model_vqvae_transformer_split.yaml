@@ -68,3 +68,7 @@ optimizer:
 scheduler:
   _target_: torch.optim.lr_scheduler.ConstantLR
   _partial_: true
+
+scheduler_lightning_kwargs:
+  interval: epoch
+  frequency: 1

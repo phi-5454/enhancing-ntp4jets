@@ -4,8 +4,8 @@ This repository combines three related codebases:
 
 - the Hydra and Lightning training pipeline from [`enhancing-ntp4jets`](https://github.com/uhh-pd-ml/enhancing-ntp4jets/tree/main);
 - the event-level jet tokenization use case from the [L1T tokenizer repo](https://github.com/philiw/vq-tokenizer-l1t);
-- the [Phaedra prototype repo](https://github.com/phi-5454/ORBIT) parquet loader, split-quantizer architecture, and selected plotting
-  conventions.
+- the parquet loader, split-quantizer architecture, and selected plotting
+  conventions used by the current ORBIT tokenization workflow.
 
 The current focus is VQ-VAE tokenization of absolute-coordinate particle or jet
 sequences stored in parquet files. The original JetClass and downstream
@@ -112,8 +112,47 @@ class is split independently into train/val using the same `data.split_seed`
 and `data.train_fraction`. The resulting `class_to_label` mapping is saved in
 the run's `hparams` for reproducibility.
 
+Each class value may also be a structured spec:
+
+```yaml
+data:
+  parquet_files_train_val_per_class:
+    ggHbb:
+      paths: /path/to/ggHbb_train_val.txt
+      eval_sequence_type: jet_ak8
+      eval_min_pt: 250
+      weight: 1.0
+      max_train_events: 100000
+      max_val_events: 100000
+    minbias:
+      paths: /path/to/minbias_train_val.txt
+      eval_sequence_type: jet_ak4
+      weight: 1.0
+      max_train_events: 100000
+      max_val_events: 100000
+  parquet_files_test_per_class:
+    ggHbb:
+      paths: /path/to/ggHbb_test.txt
+      eval_sequence_type: jet_ak8
+      eval_min_pt: 250
+      max_test_events: 10000
+    minbias:
+      paths: /path/to/minbias_test.txt
+      eval_sequence_type: jet_ak4
+      max_test_events: 10000
+```
+
+Global `data.sequence_type` selects the model input collection; for the
+particle pipeline, leave it as `particle`. `eval_sequence_type` and
+`eval_min_pt` select whole validation/test events using a class-specific jet
+collection before particle padding. `weight` controls train-time class sampling
+when multiple class datasets are interleaved. Event caps are applied after
+object cuts and validation/test event filters.
+
 `parquet_files_train_val_per_class` is mutually exclusive with
 `parquet_files_train_val` and explicit `parquet_files_train`/`parquet_files_val`.
+Use `parquet_files_test_per_class` for class-labelled test plots and metrics;
+do not combine it with `parquet_files_test`.
 
 **Step 1 — generate manifests.** The EOS dataset contains many process classes
 as subdirectories. Run `make_eos_manifests.py` once to write one `.txt` manifest
@@ -148,6 +187,20 @@ desired subset. Then set the manifest directory and launch:
 export ORBIT_MANIFEST_DIR=/path/to/manifests/
 uv run --locked python gabbro/train.py experiment=orbit_jet_puppi_ak8_production
 ```
+
+A two-class ggHbb/minbias variant is also available for jobs that should only
+require those two manifests:
+
+```bash
+export ORBIT_MANIFEST_DIR=/path/to/manifests/
+uv run --locked python gabbro/train.py experiment=orbit_jet_puppi_ak8_ggHbb_minbias
+```
+
+For the local ggHbb/minbias split used by the Condor scan, the manifest
+directory should contain `ggHbb_train_val.txt`, `ggHbb_test.txt`,
+`minbias_train_val.txt`, and `minbias_test.txt`. That experiment config trains on particles, validates/tests
+ggHbb events with an AK8 jet above 250 GeV, and validates/tests minbias events
+with at least one AK4 jet.
 
 ### Run a smoke test
 
@@ -256,6 +309,17 @@ bounded. `null` means keep all processed batches for that stage.
 The ORBIT plotting callback skips Lightning's validation sanity check. The
 sanity loop can still compute validation loss unless you disable it with
 `trainer.num_sanity_val_steps=0`.
+
+For multi-class ORBIT runs, validation and test plots are saved/logged for both
+the combined sample and each class label. In W&B the image keys are grouped as
+`val/all/...`, `val/<class>/...`, `test/all/...`, and `test/<class>/...`.
+Combined histogram and metric artifacts keep the legacy names
+`<stage>_orbit_*`; per-class artifacts are named
+`<stage>_<class>_orbit_*`.
+Particle-mode physics plots also include reclustered jet-count comparisons
+(`N_reco - N_orig`). For mixed evaluation filters, per-class plots use the
+class radius inferred from `eval_sequence_type`, and combined plots use that
+class-specific radius event by event.
 
 For an even smaller end-to-end check, use Lightning's fast dev mode:
 
@@ -415,8 +479,10 @@ uv run --locked python scripts/collect_orbit_multirun.py \
 ```
 
 Use `--stage test` to select test artifacts instead of validation artifacts. By
-default, the script creates `comparisons/` inside the multirun directory. It
-contains:
+default, the script creates `comparisons/<stage>/all/` inside the multirun
+directory. Use `--group <class>` to collect class-specific artifacts, for
+example `--stage test --group ggHbb` or `--stage test --group minbias`.
+The output directory contains:
 
 ```text
 manifest.json
@@ -437,6 +503,52 @@ to Lightning CSV metrics for older runs.
 
 W&B sweeps and an Optuna sweeper are possible future additions, but there is no
 checked-in integration for them yet.
+
+### HTCondor jobs
+
+The repository includes starter HTCondor submit files for this repo's Hydra
+entrypoint. Condor workers are launched through `conda run`, so `uv` is not
+required on the cluster worker nodes:
+
+```text
+condor/orbit_jet_production_smoke.sub  # one tiny GPU smoke job
+condor/orbit_vq_codebook_scan.sub      # one GPU job per VQ codebook size
+scripts/condor_run_training.sh         # shared Condor executable
+```
+
+Before submitting, edit the site-specific variables at the top of the `.sub`
+file:
+
+```text
+PROJECT_DIR
+OUTPUT_DIR
+CONDA_ENV
+ORBIT_MANIFEST_DIR
+GABBRO_ENV_FILE
+```
+
+`PROJECT_DIR` should point to this checkout on the shared filesystem.
+`CONDA_ENV` should point to the conda environment visible on the worker node;
+prefer the canonical path shown by `python -c 'import sys; print(sys.prefix)'`.
+`ORBIT_MANIFEST_DIR` should contain the per-class manifests from
+`scripts/make_eos_manifests.py`. `GABBRO_ENV_FILE` may provide W&B credentials
+and other environment variables as described above. Create the Condor log
+directory once before submission:
+
+```bash
+mkdir -p /path/to/output/condor_logs
+condor_submit condor/orbit_jet_production_smoke.sub
+```
+
+The wrapper sets `LOG_DIR` to `OUTPUT_DIR/SUITE_ID`, keeps W&B and Matplotlib
+state inside the run directory, then launches:
+
+```bash
+conda run --no-capture-output -p "$CONDA_ENV" python gabbro/train.py ...
+```
+
+Additional Hydra overrides can be appended to the `arguments` line in the
+submit file.
 
 ## What Changed
 
