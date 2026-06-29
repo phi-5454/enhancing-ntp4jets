@@ -21,6 +21,7 @@ model_kwargs:
     sync_nu: 1
     replace_freq: 500
     dim: -1
+    rotation_tr: False
   split_quantizer_cfg: null
 
 optimizer:

@@ -39,12 +39,11 @@ class VectorQuant(_VQBaseLayer):
 			affine_lr:	float = 0.0,
 			affine_groups: int = 1,
 			replace_freq: int = 0,
-			rotation_tr: bool = False,
 			inplace_optimizer: torch.optim.Optimizer = None,
 			**kwargs,
 			):
         
-		self.rotation_tr = rotation_tr
+		self.rotation_tr = kwargs.pop("rotation_tr", False)
 
 		super().__init__(feature_size, num_codes, **kwargs)
 		self.loss_fn, self.dist_fn = get_dist_fns('euclidean')

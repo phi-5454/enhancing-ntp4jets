@@ -21,6 +21,7 @@ model_kwargs:
     sync_nu: 2
     replace_freq: 20
     dim: -1
+    rotation_tr: False
 
   # mode: "vq" uses the single VectorQuant layer.
   # mode: "split" uses Phi -> branch quantizers -> Psi.
@@ -59,6 +60,7 @@ model_kwargs:
       sync_nu: 0.0
       replace_freq: 0
       dim: -1
+      rotation_tr: False
 
 optimizer:
   _target_: torch.optim.AdamW
