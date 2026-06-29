@@ -87,12 +87,12 @@ class VectorQuant(_VQBaseLayer):
 
 		z_q_rt = rotation_trick(z, z_q)
 
-		#if self.nu > 0:
-		#	z_q_rt = (
-		#		z_q_rt
-		#		+ (self.nu * z_q)
-		#		+ (-self.nu * z_q).detach()
-		#)
+		if self.nu > 0:
+			z_q_rt = (
+				z_q_rt
+				+ (self.nu * z_q)
+				+ (-self.nu * z_q).detach()
+		)
 		
 		return z_q_rt
 
