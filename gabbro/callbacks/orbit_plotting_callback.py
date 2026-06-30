@@ -74,6 +74,19 @@ class OrbitPlottingCallback(L.Callback):
             return list(datamodule_hparams.dataset_kwargs_common.feature_dict.keys())
         return [f"feature_{i}" for i in range(pl_module.val_x_original_concat.shape[-1])]
 
+    @staticmethod
+    def _transformed_feature_alias(feature_name: str, feature_index: int) -> str:
+        aliases = {
+            "L1T_PUPPIPart_Eta": "eta_scaled",
+            "L1T_PUPPIPart_Phi_cos": "cos_phi",
+            "L1T_PUPPIPart_Phi_sin": "sin_phi",
+            "L1T_PUPPIPart_PT": "log_pt_shifted",
+        }
+        return aliases.get(
+            feature_name,
+            feature_name.replace("/", "_").replace(" ", "_") or f"feature_{feature_index}",
+        )
+
     def _plot_dir(self, trainer) -> Path:
         plot_dir = (
             Path(self.image_path)
@@ -520,9 +533,17 @@ class OrbitPlottingCallback(L.Callback):
             f"metrics/mse_{feature_name.replace('/', '_').replace(' ', '_')}": float(mse)
             for feature_name, mse in zip(feature_names, mse_per_feature)
         }
+        for feature_index, (feature_name, mse) in enumerate(zip(feature_names, mse_per_feature)):
+            alias = self._transformed_feature_alias(feature_name, feature_index)
+            metrics[f"metrics/transformed_mse_{alias}"] = float(mse)
+            metrics[f"metrics/transformed_rmse_{alias}"] = float(np.sqrt(max(mse, 0.0)))
         metrics.update(
             {
                 "metrics/mse_total": float(np.mean(mse_per_feature)),
+                "metrics/transformed_mse_total": float(np.mean(mse_per_feature)),
+                "metrics/transformed_rmse_mean": float(
+                    np.mean(np.sqrt(np.clip(mse_per_feature, a_min=0.0, a_max=None)))
+                ),
                 "metrics/active_codes_total": int(active_codes),
                 "metrics/utilization_total": (
                     float(active_codes / num_codes) if num_codes else None

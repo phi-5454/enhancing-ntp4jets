@@ -424,22 +424,52 @@ class VQVAELightning(L.LightningModule):
         reco_delta = (x_particle_reco - x_particle) * valid_mask
         n_valid_particles = torch.sum(mask_particle).clamp_min(1)
         n_valid_values = (n_valid_particles * x_particle.shape[-1]).clamp_min(1)
-        reco_loss = torch.sum(reco_delta**2) / n_valid_particles
+        reco_l2 = torch.sum(reco_delta**2) / n_valid_particles
+        reco_l1 = torch.sum(torch.abs(reco_delta)) / n_valid_particles
         reco_l2_per_value = torch.sum(reco_delta**2) / n_valid_values
         reco_l1_per_value = torch.sum(torch.abs(reco_delta)) / n_valid_values
 
         alpha = self.hparams["model_kwargs"]["alpha"]
-        quantizer_loss = vq_out["loss"].mean()
+        reconstruction_loss = self.hparams["model_kwargs"].get("reconstruction_loss", "l2")
+        if reconstruction_loss == "l2":
+            reco_loss = reco_l2
+        elif reconstruction_loss == "l1":
+            reco_loss = reco_l1
+        else:
+            raise ValueError(
+                f"Unknown reconstruction_loss={reconstruction_loss!r}. "
+                "Expected 'l1' or 'l2'."
+            )
+        is_split_quantizer = "branch_loss" in vq_out
+        if is_split_quantizer:
+            quantizer_loss = vq_out["loss"].mean()
+        else:
+            quantizer_loss_per_token = (
+                (1.0 - self.model.vqlayer.beta)
+                * (vq_out["z"] - vq_out["z_q"].detach()).pow(2).mean(dim=-1)
+                + self.model.vqlayer.beta
+                * (vq_out["z"].detach() - vq_out["z_q"]).pow(2).mean(dim=-1)
+            )
+            quantizer_loss = (
+                quantizer_loss_per_token * mask_particle
+            ).sum() / mask_particle.sum().clamp_min(1)
+        quantizer_loss_weighted = quantizer_loss if is_split_quantizer else alpha * quantizer_loss
         code_idx = vq_out["q"]
-        loss = reco_loss + alpha * quantizer_loss
+        loss = reco_loss + quantizer_loss_weighted
         metrics = {
             "loss_total": loss.detach(),
-            "loss_reco_l2": reco_loss.detach(),
+            "loss_reco": reco_loss.detach(),
+            "loss_reco_l2": reco_l2.detach(),
+            "loss_reco_l1": reco_l1.detach(),
             "loss_reco_l2_per_value": reco_l2_per_value.detach(),
             "loss_reco_l1_per_value": reco_l1_per_value.detach(),
             "loss_quantizer": quantizer_loss.detach(),
-            "loss_quantizer_weighted": (alpha * quantizer_loss).detach(),
+            "loss_quantizer_weighted": quantizer_loss_weighted.detach(),
         }
+        for branch, branch_loss in vq_out.get("branch_loss", {}).items():
+            metrics[f"loss_quantizer_{branch}"] = branch_loss.detach()
+        for branch, branch_loss in vq_out.get("branch_loss_weighted", {}).items():
+            metrics[f"loss_quantizer_{branch}_weighted"] = branch_loss.detach()
 
         if return_x:
             return loss, metrics, x_particle, x_particle_reco, mask_particle, labels, code_idx

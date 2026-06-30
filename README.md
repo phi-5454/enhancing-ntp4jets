@@ -260,6 +260,68 @@ LOG_DIR="$PWD/outputs" uv run --locked python gabbro/train.py \
   trainer.enable_checkpointing=true
 ```
 
+Split-quantizer branch losses can be weighted with
+`model.model_kwargs.split_quantizer_cfg.branch_loss_weights`. Missing branches
+default to `1.0`. For split quantizers, these branch weights are the only
+quantizer-loss scale factors; the global `model.model_kwargs.alpha` is reserved
+for the single-quantizer path and is not applied again.
+
+```text
+single quantizer:
+  total_loss = reconstruction_loss + model.model_kwargs.alpha * quantizer_loss
+
+split quantizer:
+  quantizer_loss = sum(branch_loss[branch] * branch_loss_weights[branch])
+  total_loss = reconstruction_loss + quantizer_loss
+```
+
+All loss terms are mask-aware. Reconstruction losses are averaged over valid
+particles only. Single-VQ quantizer loss is recomputed from `vq_out["z"]` and
+`vq_out["z_q"]` and averaged over `part_mask`. Split-quantizer branch losses are
+computed per token, zero padded before branch quantization and before `Psi`, and
+then reduced as:
+
+```text
+branch_loss = sum(per_token_branch_loss * part_mask) / sum(part_mask)
+```
+
+This also covers the "single FSQ branch" scan configs, which are split
+quantizers with `branch_order: ["mu"]`; only the active `mu` branch contributes.
+The FSQ scan configs currently use `5.0` for all configured branch weights, so
+the mu-only FSQ runs use `5.0 * loss_quantizer_mu`, while the inactive `alpha`
+branch does not contribute. The split VQ-mu/FSQ-alpha scan configs use
+`mu: 5.0` and `alpha: 0.25`.
+
+FSQ loss-space caveat: the implementation must not compare the continuous
+latent directly to an integer packed code such as `[0, num_codes)`. That would
+make the auxiliary loss scale with token IDs and produce a pathological loss
+landscape, especially for large scalar levels. The FSQ branch loss is computed
+in scalar-quantizer space instead:
+
+```text
+default:
+  f(z) = tanh(z)
+  z_hat = round(tanh(z) * half_width) / half_width
+  loss = ||f(z) - z_hat||^2
+
+with fsq_loss_use_half_width=true:
+  f(z) = tanh(z) * half_width
+  z_hat = round(tanh(z) * half_width)
+  loss = ||f(z) - z_hat||^2
+```
+
+The default is the normalized, subtler bounded-space loss. The half-width form
+can be enabled through
+`model.model_kwargs.split_quantizer_cfg.fsq_loss_use_half_width=true` when a
+larger directional signal in scalar-bin space is desired. This auxiliary loss is
+not intrinsic to FSQ and should be treated as an experiment knob, not as part of
+token ID reconstruction.
+
+Validation and test logs include both raw and weighted branch terms, for example
+`val_metrics/loss_quantizer_mu`, `val_metrics/loss_quantizer_mu_weighted`,
+`val_metrics/loss_quantizer_alpha`, and
+`val_metrics/loss_quantizer_alpha_weighted`.
+
 To use the L1T-style event representation, replace
 `experiment=orbit_parquet_smoke` with `experiment=orbit_jet_parquet_smoke`.
 Each sequence element is then one absolute-coordinate PUPPI AK8 jet.
@@ -267,6 +329,20 @@ Each sequence element is then one absolute-coordinate PUPPI AK8 jet.
 The current ORBIT experiment configs are smoke-ready integration starting
 points. Before a long production run, review model size, sequence length, batch
 size, checkpoint policy, and train/validation limits.
+
+### Optimizer and LR Schedule
+
+The VQ and split-quantizer tokenizer configs use AdamW with weight decay `0.01`
+and the Transformer one-cycle schedule:
+
+```text
+epochs 0-4:   linearly increase 0.0005 -> 0.001
+epochs 4-24:  linearly decrease 0.001 -> 0.0005
+epochs 24-30: linearly decrease 0.0005 -> 0.0003
+```
+
+The schedule is implemented with
+`gabbro.schedulers.lr_scheduler.OneCycleCooldown` and stepped once per epoch.
 
 ### Progress bars and short runs
 
@@ -514,7 +590,10 @@ required on the cluster worker nodes:
 condor/orbit_jet_production_smoke.sub  # one tiny GPU smoke job
 condor/orbit_wandb_logging_smoke.sub   # 10-batch ggHbb/minbias W&B logging smoke
 condor/orbit_vq_codebook_scan.sub      # one GPU job per VQ codebook size
+condor/orbit_vq_rotation_scan.sub  # rotation-trick VQ diagnostic scan without k-means init
 condor/orbit_fsq_codebook_scan.sub     # one GPU job per FSQ split-quantizer setting
+condor/orbit_fsq_l1_codebook_scan.sub  # FSQ split-quantizer scan with L1 reconstruction loss
+condor/orbit_split_vq_mu_fsq_alpha_l1_scan.sub # STE VQ-mu/FSQ-alpha scan with L1 reconstruction loss
 scripts/condor_run_training.sh         # shared Condor executable
 ```
 
