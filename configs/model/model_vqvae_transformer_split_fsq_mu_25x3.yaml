@@ -1,8 +1,0 @@
-defaults:
-  - model_vqvae_transformer_split
-  - _self_
-
-model_kwargs:
-  split_quantizer_cfg:
-    branch_order: ["mu"]
-    fsq_mu_levels: [25, 25, 25]

@@ -12,20 +12,6 @@ model_kwargs:
   alpha: 10
   causal_decoder: true
   old_transformer_implementation: false
-  transformer_cfg:
-    attn_cfg:
-      num_heads: ${model.model_kwargs.num_heads}
-      dropout_rate: 0.0
-      norm_before: true
-      norm_after: false
-    mlp_cfg:
-      expansion_factor: 4
-      dropout_rate: 0.0
-      norm_before: true
-      activation: GELU
-    residual_cfg:
-      gate_type: local
-      init_value: 1.0
   vq_kwargs:
     num_codes: 512
     beta: 0.9
@@ -36,7 +22,6 @@ model_kwargs:
     sync_nu: 1
     replace_freq: 500
     dim: -1
-    rotation_tr: False
   split_quantizer_cfg: null
 
 optimizer:

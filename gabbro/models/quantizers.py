@@ -15,17 +15,19 @@ from gabbro.models.transformer import NormformerStack
 class FSQ(nn.Module):
     """Finite scalar quantization with straight-through gradients."""
 
-    def __init__(self, levels: list[int]):
+    def __init__(self, levels: list[int], loss_use_half_width: bool = False):
         super().__init__()
         if not levels:
             raise ValueError("FSQ levels must contain at least one entry")
         self.register_buffer("levels", torch.tensor(levels, dtype=torch.float32))
         self.num_codes = int(torch.prod(self.levels).item())
         self.feature_size = len(levels)
+        self.loss_use_half_width = loss_use_half_width
 
     def forward(self, z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         half_width = (self.levels - 1) / 2
-        z_scaled = torch.tanh(z) * half_width
+        z_bounded = torch.tanh(z)
+        z_scaled = z_bounded * half_width
         z_rounded = torch.round(z_scaled)
         z_hat = z_rounded / half_width.clamp(min=1)
         z_decoded = z + (z_hat - z).detach()
@@ -41,7 +43,11 @@ class FSQ(nn.Module):
             dim=0,
         )
         codes = (per_dim_codes * strides).sum(dim=-1)
-        loss = F.mse_loss(z, z_hat.detach())
+        if self.loss_use_half_width:
+            loss_delta = z_scaled - z_rounded.detach()
+        else:
+            loss_delta = z_bounded - z_hat.detach()
+        loss = loss_delta.pow(2).mean(dim=-1)
         return z_decoded, codes, loss
 
     def decode_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
@@ -71,7 +77,13 @@ class VQBranch(nn.Module):
 
     def forward(self, z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         z_q, vq_out = self.vq(z)
-        return z_q, vq_out["q"].squeeze(-1), vq_out["loss"]
+        z_vq = vq_out["z"]
+        z_q_vq = vq_out["z_q"]
+        loss = (
+            (1.0 - self.vq.beta) * (z_vq - z_q_vq.detach()).pow(2).mean(dim=-1)
+            + self.vq.beta * (z_vq.detach() - z_q_vq).pow(2).mean(dim=-1)
+        )
+        return z_q, vq_out["q"].squeeze(-1), loss
 
     def decode_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
         """Look up branch VQ tokens in the current codebook."""
@@ -117,7 +129,7 @@ class NormformerProjection(nn.Module):
         if mask is None:
             mask = torch.ones(x.shape[:2], device=x.device, dtype=x.dtype)
         x = self.blocks(x, mask)
-        return self.output_projection(x)
+        return self.output_projection(x) * mask.unsqueeze(-1)
 
 
 class SplitPhi(nn.Module):
@@ -194,6 +206,11 @@ class SplitQuantizer(nn.Module):
             branch: self._branch_dim(branch, cfg, default_quantizer)
             for branch in self.branch_order
         }
+        configured_loss_weights = cfg.get("branch_loss_weights", {}) or {}
+        self.branch_loss_weights = {
+            branch: float(configured_loss_weights.get(branch, 1.0))
+            for branch in self.branch_order
+        }
         if sum(self.branch_dims.values()) <= 0:
             raise ValueError("At least one split quantizer branch must have positive dimension")
 
@@ -237,7 +254,10 @@ class SplitQuantizer(nn.Module):
     ) -> nn.Module:
         quantizer_type = self._branch_quantizer_type(branch, cfg, default_quantizer)
         if quantizer_type == "fsq":
-            return FSQ(cfg[f"fsq_{branch}_levels"])
+            return FSQ(
+                cfg[f"fsq_{branch}_levels"],
+                loss_use_half_width=bool(cfg.get("fsq_loss_use_half_width", False)),
+            )
         if quantizer_type == "vq":
             vq_kwargs = dict(cfg.get("vq_kwargs", {}))
             vq_kwargs["num_codes"] = int(cfg[f"vq_{branch}_num_codes"])
@@ -300,21 +320,40 @@ class SplitQuantizer(nn.Module):
         quantized_branches = {}
         branch_codes = {}
         branch_losses = {}
+        branch_weighted_losses = {}
+        mask_values = None if mask is None else mask.to(dtype=z.dtype)
+        mask_features = None if mask_values is None else mask_values.unsqueeze(-1)
+
+        def reduce_loss(loss: torch.Tensor) -> torch.Tensor:
+            if mask_values is None:
+                return loss.mean()
+            return (loss * mask_values).sum() / mask_values.sum().clamp_min(1.0)
 
         for branch, quantizer in self.quantizers.items():
-            z_q, codes, loss = quantizer(branch_latents[branch])
+            branch_input = branch_latents[branch]
+            if mask_features is not None:
+                branch_input = branch_input * mask_features
+            z_q, codes, loss = quantizer(branch_input)
+            if mask_features is not None:
+                z_q = z_q * mask_features
             quantized_branches[branch] = z_q
             branch_codes[branch] = codes
-            branch_losses[branch] = loss
+            branch_loss = reduce_loss(loss)
+            branch_losses[branch] = branch_loss
+            branch_weighted_losses[branch] = (
+                branch_loss * self.branch_loss_weights.get(branch, 1.0)
+            )
 
         z_q = self.psi(quantized_branches, mask)
-        loss = sum(branch_losses.values())
+        loss = sum(branch_weighted_losses.values())
         return z_q, {
             "z_q": z_q,
             "q": self._combine_codes(branch_codes),
             "loss": loss,
             "branch_q": branch_codes,
             "branch_loss": branch_losses,
+            "branch_loss_weighted": branch_weighted_losses,
+            "branch_loss_weights": self.branch_loss_weights,
             "branch_num_codes": self.branch_num_codes,
         }
 
