@@ -91,6 +91,87 @@ from gabbro.utils.utils import (
 log = get_pylogger(__name__)
 
 
+def _log_data_split_summary(trainer: L.Trainer, datamodule) -> None:
+    if trainer.global_rank != 0 or not trainer.loggers:
+        return
+    if not hasattr(datamodule, "data_split_summary"):
+        log.info("Datamodule does not expose data_split_summary; skipping split logging.")
+        return
+
+    summary = datamodule.data_split_summary()
+    rows = summary.get("rows", [])
+    if not rows:
+        log.info("Datamodule split summary is empty; skipping split logging.")
+        return
+
+    log.info("Resolved data split summary:")
+    for row in rows:
+        log.info(
+            "  split=%s class=%s label=%s files=%s events=%s batch_size=%s "
+            "sequence=%s eval_sequence=%s eval_min_pt=%s weight=%s",
+            row.get("split"),
+            row.get("class"),
+            row.get("label"),
+            row.get("file_count"),
+            row.get("event_count"),
+            row.get("batch_size"),
+            row.get("sequence_type"),
+            row.get("eval_sequence_type"),
+            row.get("eval_min_pt"),
+            row.get("sampling_weight"),
+        )
+
+    metrics = {}
+    totals: dict[str, int] = {}
+    for row in rows:
+        split = row["split"]
+        class_name = row["class"]
+        file_count = row.get("file_count")
+        event_count = row.get("event_count")
+        if file_count is not None:
+            metrics[f"data_splits/{split}/{class_name}/file_count"] = int(file_count)
+        if event_count is not None:
+            event_count = int(event_count)
+            metrics[f"data_splits/{split}/{class_name}/event_count"] = event_count
+            totals[split] = totals.get(split, 0) + event_count
+    for split, total in totals.items():
+        metrics[f"data_splits/{split}/total_event_count"] = total
+
+    columns = [
+        "split",
+        "class",
+        "label",
+        "file_count",
+        "event_count",
+        "batch_size",
+        "sequence_type",
+        "min_pt",
+        "eval_sequence_type",
+        "eval_min_pt",
+        "sampling_weight",
+    ]
+    table_data = [[row.get(column) for column in columns] for row in rows]
+
+    for lightning_logger in trainer.loggers:
+        lightning_logger.log_hyperparams({"data_splits": summary})
+        if metrics:
+            lightning_logger.log_metrics(metrics)
+        if isinstance(lightning_logger, L.pytorch.loggers.WandbLogger):
+            try:
+                import wandb
+
+                lightning_logger.experiment.config.update(
+                    {"data_splits": summary},
+                    allow_val_change=True,
+                )
+                lightning_logger.experiment.log(
+                    {"data_splits/table": wandb.Table(columns=columns, data=table_data)},
+                    commit=False,
+                )
+            except Exception as exc:
+                log.warning(f"Failed to log data split table to W&B: {exc}")
+
+
 def get_nodename_bigram():
     """Generate a unique run identifier based on the nodename and a random bigram.
     Example: `max-wng029_QuickBear`
@@ -280,6 +361,7 @@ def train(cfg: DictConfig) -> Tuple[dict, dict]:
     if logger and cfg.get("ckpt_path_for_evaluation") is None:
         log.info("Logging hyperparameters!")
         log_hyperparameters(object_dict)
+        _log_data_split_summary(trainer, datamodule)
 
     if cfg.get("train"):
         # --- Save config for reproducibility --- #
@@ -340,12 +422,25 @@ def train(cfg: DictConfig) -> Tuple[dict, dict]:
                     log.info(
                         f"Rank {process_rank}/[0-{world_size - 1}]: Using best model path from callback {name_best_ckpt}: {ckpt_path}"
                     )
+                    if ckpt_path == "":
+                        ckpt_path = f"{cfg.trainer.default_root_dir}/checkpoints/last.ckpt"
+                        log.warning(
+                            f"Rank {process_rank}/[0-{world_size - 1}]: Callback "
+                            f"{name_best_ckpt} did not report a best checkpoint. "
+                            f"Falling back to {ckpt_path}"
+                        )
                 # if best ckpt not found in that callback, try with other name
                 elif name_ckpt in callbacks:
                     ckpt_path = callbacks[name_ckpt].best_model_path
                     log.info(
                         f"Rank {process_rank}/[0-{world_size - 1}]: Using best model path from callback {name_ckpt}: {ckpt_path}"
                     )
+                    if ckpt_path == "":
+                        ckpt_path = f"{cfg.trainer.default_root_dir}/checkpoints/last.ckpt"
+                        log.warning(
+                            f"Rank {process_rank}/[0-{world_size - 1}]: Callback {name_ckpt} "
+                            f"did not report a best checkpoint. Falling back to {ckpt_path}"
+                        )
                 # if best ckpt not found there either, just use the last ckpt
                 # which is stored separately as last.ckpt
                 else:
@@ -447,7 +542,12 @@ def train(cfg: DictConfig) -> Tuple[dict, dict]:
                     logger=logger if cfg.get("ckpt_path_for_evaluation") is None else None,
                     callbacks=list(callbacks.values()),
                 )
-                trainer.test(model=model, datamodule=datamodule, ckpt_path=ckpt_path)
+                trainer.test(
+                    model=model,
+                    datamodule=datamodule,
+                    ckpt_path=ckpt_path,
+                    weights_only=False,
+                )
             else:
                 log.info(f"Skipping testing on rank {process_rank}")
         else:
@@ -456,7 +556,12 @@ def train(cfg: DictConfig) -> Tuple[dict, dict]:
                 logger=logger if cfg.get("ckpt_path_for_evaluation") is None else None,
                 callbacks=list(callbacks.values()),
             )
-            trainer.test(model=model, datamodule=datamodule, ckpt_path=ckpt_path)
+            trainer.test(
+                model=model,
+                datamodule=datamodule,
+                ckpt_path=ckpt_path,
+                weights_only=False,
+            )
 
     return None
 

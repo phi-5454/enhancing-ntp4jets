@@ -574,6 +574,127 @@ class OrbitParquetDataModule(L.LightningDataModule):
             self.hparams["class_to_label"] = self._class_to_label
             self.hparams["class_specs"] = self._class_specs
 
+    def data_split_summary(self) -> dict:
+        """Return resolved split metadata for logging and reproducibility."""
+
+        def split_row(
+            split: str,
+            class_name: str,
+            label: int,
+            files: list[str],
+            spec: dict,
+            event_count: Optional[int],
+            batch_size: int,
+        ) -> dict:
+            return {
+                "split": split,
+                "class": class_name,
+                "label": int(label),
+                "file_count": len(files),
+                "event_count": event_count,
+                "batch_size": int(batch_size),
+                "sequence_type": spec.get("sequence_type"),
+                "min_pt": spec.get("min_pt"),
+                "eval_sequence_type": spec.get("eval_sequence_type"),
+                "eval_min_pt": spec.get("eval_min_pt"),
+                "sampling_weight": spec.get("weight"),
+            }
+
+        if self._multi_class:
+            rows = []
+            for class_name, label in self._class_to_label.items():
+                train_spec = self._class_specs[class_name]
+                test_spec = self._test_class_specs.get(class_name, train_spec)
+                rows.append(
+                    split_row(
+                        "train",
+                        class_name,
+                        label,
+                        self._train_files_per_class[class_name],
+                        train_spec,
+                        train_spec["max_train_events"],
+                        self.batch_size_train,
+                    )
+                )
+                rows.append(
+                    split_row(
+                        "val",
+                        class_name,
+                        label,
+                        self._val_files_per_class[class_name],
+                        train_spec,
+                        train_spec["max_val_events"],
+                        self.batch_size_val,
+                    )
+                )
+                rows.append(
+                    split_row(
+                        "test",
+                        class_name,
+                        label,
+                        self._test_files_per_class.get(class_name, []),
+                        test_spec,
+                        test_spec.get("max_test_events"),
+                        self.batch_size_test,
+                    )
+                )
+            return {
+                "mode": "multi_class",
+                "train_fraction": float(self.hparams.train_fraction),
+                "split_seed": int(self.hparams.split_seed),
+                "class_to_label": dict(self._class_to_label),
+                "rows": rows,
+            }
+
+        rows = [
+            {
+                "split": "train",
+                "class": "all",
+                "label": int(self.hparams.jet_type_label),
+                "file_count": len(self.parquet_files_train),
+                "event_count": None,
+                "batch_size": int(self.batch_size_train),
+                "sequence_type": self.hparams.sequence_type,
+                "min_pt": self.hparams.min_pt,
+                "eval_sequence_type": None,
+                "eval_min_pt": None,
+                "sampling_weight": 1.0,
+            },
+            {
+                "split": "val",
+                "class": "all",
+                "label": int(self.hparams.jet_type_label),
+                "file_count": len(self.parquet_files_val),
+                "event_count": None,
+                "batch_size": int(self.batch_size_val),
+                "sequence_type": self.hparams.sequence_type,
+                "min_pt": self.hparams.min_pt,
+                "eval_sequence_type": None,
+                "eval_min_pt": None,
+                "sampling_weight": 1.0,
+            },
+            {
+                "split": "test",
+                "class": "all",
+                "label": int(self.hparams.jet_type_label),
+                "file_count": len(_dataset_files(self.parquet_files_test or [])),
+                "event_count": None,
+                "batch_size": int(self.batch_size_test),
+                "sequence_type": self.hparams.sequence_type,
+                "min_pt": self.hparams.min_pt,
+                "eval_sequence_type": None,
+                "eval_min_pt": None,
+                "sampling_weight": 1.0,
+            },
+        ]
+        return {
+            "mode": "single_class",
+            "train_fraction": float(self.hparams.train_fraction),
+            "split_seed": int(self.hparams.split_seed),
+            "class_to_label": {"all": int(self.hparams.jet_type_label)},
+            "rows": rows,
+        }
+
     @staticmethod
     def _normalize_class_specs(
         raw_specs,

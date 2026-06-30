@@ -44,6 +44,7 @@ class OrbitPlottingCallback(L.Callback):
         enable_physics_plots: bool = True,
         include_all_ratios: bool = True,
         jet_radius: float = 0.8,
+        include_codebook_histogram: bool = True,
     ):
         super().__init__()
         self.image_path = image_path
@@ -53,6 +54,7 @@ class OrbitPlottingCallback(L.Callback):
         self.enable_physics_plots = enable_physics_plots
         self.include_all_ratios = include_all_ratios
         self.jet_radius = jet_radius
+        self.include_codebook_histogram = include_codebook_histogram
 
     def on_validation_epoch_end(self, trainer, pl_module):
         if trainer.sanity_checking:
@@ -91,7 +93,17 @@ class OrbitPlottingCallback(L.Callback):
             )
         return f"test_{name}.{self.image_filetype}"
 
+    @staticmethod
+    def _wandb_figure_key(name: str) -> str:
+        parts = [part.strip().replace(" ", "_") for part in name.split("/") if part.strip()]
+        if len(parts) >= 3 and parts[0] in {"val", "test"}:
+            stage, group, plot_name = parts[0], parts[1], "/".join(parts[2:])
+            return f"{stage}_plots/{group}/{plot_name}"
+        return f"plots/{'_'.join(parts)}"
+
     def _log_figure(self, trainer, path: Path, name: str) -> None:
+        logged = False
+        wandb_key = self._wandb_figure_key(name)
         for lightning_logger in trainer.loggers:
             if isinstance(lightning_logger, L.pytorch.loggers.CometLogger):
                 lightning_logger.experiment.log_image(
@@ -99,16 +111,53 @@ class OrbitPlottingCallback(L.Callback):
                     name=name,
                     step=trainer.global_step,
                 )
+                logged = True
             elif isinstance(lightning_logger, L.pytorch.loggers.WandbLogger):
                 try:
                     import wandb
 
                     lightning_logger.experiment.log(
-                        {name: wandb.Image(str(path))},
-                        step=trainer.global_step,
+                        {
+                            wandb_key: wandb.Image(
+                                str(path),
+                                caption=name,
+                            )
+                        },
+                        commit=False,
                     )
+                    logged = True
                 except Exception as exc:
                     logger.warning(f"Failed to log {path} to W&B: {exc}")
+        if logged:
+            logger.info(f"Logged ORBIT figure {name} from {path}")
+        else:
+            logger.info(f"Saved ORBIT figure {name} to {path}; no image logger was active")
+
+    def _log_metrics(
+        self,
+        trainer,
+        stage: str,
+        group_name: str,
+        metrics: dict[str, float | int | None],
+    ) -> None:
+        prefix = f"{stage}_metrics" if group_name == "all" else f"{stage}_metrics/{group_name}"
+        scalar_metrics = {}
+        for name, value in metrics.items():
+            if value is None:
+                continue
+            if isinstance(value, np.generic):
+                value = value.item()
+            if isinstance(value, (float, int)):
+                scalar_metrics[f"{prefix}/{name}"] = value
+
+        if not scalar_metrics:
+            return
+
+        for lightning_logger in trainer.loggers:
+            lightning_logger.log_metrics(scalar_metrics)
+        logger.info(
+            f"Logged {len(scalar_metrics)} ORBIT scalar metrics for {stage}/{group_name}"
+        )
 
     def _num_codes(self, pl_module) -> int | None:
         vqlayer = getattr(pl_module.model, "vqlayer", None)
@@ -376,7 +425,12 @@ class OrbitPlottingCallback(L.Callback):
         axes[0].set_xlabel("Reclustered jet count")
         axes[0].set_ylabel("Events")
         axes[0].legend()
-        axes[1].hist(diff, bins=diff_bins, histtype="stepfilled", alpha=0.45)
+        axes[1].hist(
+            diff,
+            bins=diff_bins,
+            histtype="stepfilled",
+            alpha=0.45,
+        )
         axes[1].axvline(0, color="black", linestyle="--", alpha=0.5)
         axes[1].set_xlabel("Reconstructed - original jet count")
         axes[1].set_ylabel("Events")
@@ -489,11 +543,12 @@ class OrbitPlottingCallback(L.Callback):
                 feature_names,
                 title=f"{stage.capitalize()} {display_name} ORBIT reconstruction residuals",
             ),
-            f"{stage}/{group_name}/orbit_codebook_usage": plot_codebook_histogram(
+        }
+        if self.include_codebook_histogram:
+            figures[f"{stage}/{group_name}/orbit_codebook_usage"] = plot_codebook_histogram(
                 code_idx[mask],
                 num_codes=num_codes,
-            ),
-        }
+            )
         if self.enable_physics_plots:
             data_level = self._data_level(trainer)
             x_physical = self._to_physical_features(x_original)
@@ -586,12 +641,18 @@ class OrbitPlottingCallback(L.Callback):
                 histograms.update(
                     {f"physical_{key}": value for key, value in physics_histograms.items()}
                 )
-                metrics.update(
-                    {
-                        f"metrics/physical_mse_{name}": float(value)
-                        for name, value in zip(physics_feature_names, physics_mse)
-                    }
-                )
+                physical_mse_metrics = {}
+                physical_aliases = {
+                    "Eta": ["Eta", "eta"],
+                    "Phi": ["Phi", "phi"],
+                    "pT": ["pT"],
+                }
+                for name, value in zip(physics_feature_names, physics_mse):
+                    value = float(value)
+                    physical_mse_metrics[f"metrics/physical_mse_{name}"] = value
+                    for alias in physical_aliases.get(name, [name]):
+                        physical_mse_metrics[f"metrics/mse_{alias}"] = value
+                metrics.update(physical_mse_metrics)
                 metrics["metrics/physical_mse_total"] = float(np.mean(physics_mse))
                 figures.update(
                     {
@@ -606,6 +667,8 @@ class OrbitPlottingCallback(L.Callback):
                     }
                 )
 
+        self._log_metrics(trainer, stage, group_name, metrics)
+
         for name, fig in figures.items():
             filename_stem = name.split("/")[-1]
             if not preserve_legacy_names:
@@ -613,6 +676,7 @@ class OrbitPlottingCallback(L.Callback):
             filename = self._figure_name(trainer, stage, filename_stem)
             path = plot_dir / filename
             fig.savefig(path, dpi=300, bbox_inches="tight")
+            logger.info(f"Saved ORBIT figure {name} to {path}")
             self._log_figure(trainer, path, name)
             close_figure(fig)
 

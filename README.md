@@ -512,7 +512,9 @@ required on the cluster worker nodes:
 
 ```text
 condor/orbit_jet_production_smoke.sub  # one tiny GPU smoke job
+condor/orbit_wandb_logging_smoke.sub   # 10-batch ggHbb/minbias W&B logging smoke
 condor/orbit_vq_codebook_scan.sub      # one GPU job per VQ codebook size
+condor/orbit_fsq_codebook_scan.sub     # one GPU job per FSQ split-quantizer setting
 scripts/condor_run_training.sh         # shared Condor executable
 ```
 
@@ -537,7 +539,7 @@ directory once before submission:
 
 ```bash
 mkdir -p /path/to/output/condor_logs
-condor_submit condor/orbit_jet_production_smoke.sub
+condor_submit condor/orbit_wandb_logging_smoke.sub
 ```
 
 The wrapper sets `LOG_DIR` to `OUTPUT_DIR/SUITE_ID`, keeps W&B and Matplotlib
