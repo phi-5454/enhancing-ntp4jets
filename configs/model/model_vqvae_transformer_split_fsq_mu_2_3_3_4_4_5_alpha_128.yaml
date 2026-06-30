@@ -1,0 +1,11 @@
+defaults:
+  - model_vqvae_transformer_split
+  - _self_
+
+model_kwargs:
+  split_quantizer_cfg:
+    branch_loss_weights:
+      mu: 5.0
+      alpha: 5.0
+    fsq_mu_levels: [2, 3, 3, 4, 4, 5]
+    fsq_alpha_levels: [128]

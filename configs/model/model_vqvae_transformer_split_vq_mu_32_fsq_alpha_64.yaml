@@ -1,0 +1,16 @@
+defaults:
+  - model_vqvae_transformer_split
+  - _self_
+
+model_kwargs:
+  split_quantizer_cfg:
+    branch_order: ["mu", "alpha"]
+    mu_quantizer: vq
+    alpha_quantizer: fsq
+    branch_loss_weights:
+      mu: 5.0
+      alpha: 0.25
+    vq_mu_num_codes: 32
+    fsq_alpha_levels: [64]
+    vq_kwargs:
+      rotation_tr: False

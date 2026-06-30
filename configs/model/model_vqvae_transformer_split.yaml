@@ -10,17 +10,19 @@ model_kwargs:
   num_blocks: 3
   num_heads: 8
   alpha: 5
+  reconstruction_loss: l2
   old_transformer_implementation: false
   vq_kwargs:
     num_codes: 2048
     beta: 0.9
-    kmeans_init: true
+    kmeans_init: false
     norm: null
     cb_norm: null
     affine_lr: 0.0
     sync_nu: 2
     replace_freq: 20
     dim: -1
+    rotation_tr: False
 
   # mode: "vq" uses the single VectorQuant layer.
   # mode: "split" uses Phi -> branch quantizers -> Psi.
@@ -33,6 +35,9 @@ model_kwargs:
     quantizer: fsq
     mu_quantizer: null
     alpha_quantizer: null
+    branch_loss_weights:
+      mu: 1.0
+      alpha: 1.0
 
     # Phi and Psi are projection adapters around NormFormer stacks. The MLP
     # expansion factor is shared by both directions.
@@ -45,6 +50,9 @@ model_kwargs:
     fsq_mu_levels: [15, 15, 15]
     #fsq_mu_levels: [5, 4, 4, 3, 3, 3, 2, 2]
     fsq_alpha_levels: [1024]
+    # False: loss compares tanh(z) to rounded/normalized FSQ values.
+    # True: loss compares tanh(z) * half_width to rounded scalar bins.
+    fsq_loss_use_half_width: false
 
     vq_mu_dim: 8
     vq_mu_num_codes: 512
@@ -59,15 +67,23 @@ model_kwargs:
       sync_nu: 0.0
       replace_freq: 0
       dim: -1
+      rotation_tr: False
 
 optimizer:
   _target_: torch.optim.AdamW
   _partial_: true
-  lr: 0.001
+  lr: 0.0005
+  weight_decay: 0.01
 
 scheduler:
-  _target_: torch.optim.lr_scheduler.ConstantLR
+  _target_: gabbro.schedulers.lr_scheduler.OneCycleCooldown
   _partial_: true
+  warmup: 4
+  cooldown: 20
+  cooldown_final: 6
+  initial_lr: 0.0005
+  max_lr: 0.001
+  final_lr: 0.0003
 
 scheduler_lightning_kwargs:
   interval: epoch
