@@ -27,6 +27,7 @@
 - Tune the split quantizer configs for the actual particle and jet runs.
   The model now supports plain VQ and Phi/Psi split quantization with FSQ/VQ
   branches, but the checked-in split config is still a smoke-ready starting point.
+- Check which activation functions are actually used (default was GELU but apparently SiLU is also used, shouldnt make that much of a differnce though)
 
 ## Token Evaluation
 
