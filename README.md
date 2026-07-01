@@ -287,10 +287,10 @@ branch_loss = sum(per_token_branch_loss * part_mask) / sum(part_mask)
 
 This also covers the "single FSQ branch" scan configs, which are split
 quantizers with `branch_order: ["mu"]`; only the active `mu` branch contributes.
-The FSQ scan configs currently use `5.0` for all configured branch weights, so
-the mu-only FSQ runs use `5.0 * loss_quantizer_mu`, while the inactive `alpha`
-branch does not contribute. The split VQ-mu/FSQ-alpha scan configs use
-`mu: 5.0` and `alpha: 0.25`.
+The FSQ-related Condor scan configs currently use `mu: 0.25` and `alpha: 1.0`
+for branch loss weights. In mu-only FSQ runs this gives
+`0.25 * loss_quantizer_mu`, while the inactive `alpha` branch does not
+contribute. The same branch weights are used by the split VQ-mu/FSQ-alpha scan.
 
 FSQ loss-space caveat: the implementation must not compare the continuous
 latent directly to an integer packed code such as `[0, num_codes)`. That would
@@ -591,9 +591,13 @@ condor/orbit_jet_production_smoke.sub  # one tiny GPU smoke job
 condor/orbit_wandb_logging_smoke.sub   # 10-batch ggHbb/minbias W&B logging smoke
 condor/orbit_vq_codebook_scan.sub      # one GPU job per VQ codebook size
 condor/orbit_vq_rotation_scan.sub  # rotation-trick VQ diagnostic scan without k-means init
+condor/orbit_vq_rotation_512_guardrail_scan.sub # 512-code rotation-trick guardrail scan
 condor/orbit_fsq_codebook_scan.sub     # one GPU job per FSQ split-quantizer setting
 condor/orbit_fsq_l1_codebook_scan.sub  # FSQ split-quantizer scan with L1 reconstruction loss
 condor/orbit_split_vq_mu_fsq_alpha_l1_scan.sub # STE VQ-mu/FSQ-alpha scan with L1 reconstruction loss
+condor/orbit_fsq_noaux_2epoch_scan.sub # 2-epoch FSQ diagnostic with auxiliary loss disabled
+condor/orbit_fsq_l1_noaux_2epoch_scan.sub # 2-epoch L1 FSQ diagnostic with auxiliary loss disabled
+condor/orbit_split_vq_mu_fsq_alpha_l1_noaux_2epoch_scan.sub # 2-epoch mixed VQ/FSQ diagnostic with FSQ alpha loss disabled
 scripts/condor_run_training.sh         # shared Condor executable
 ```
 

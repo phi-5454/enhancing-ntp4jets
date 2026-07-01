@@ -172,6 +172,58 @@ def _log_data_split_summary(trainer: L.Trainer, datamodule) -> None:
                 log.warning(f"Failed to log data split table to W&B: {exc}")
 
 
+def _log_full_config_to_wandb(
+    trainer: L.Trainer,
+    cfg: DictConfig,
+    cfg_path: str | Path,
+    cfg_resolved_path: str | Path,
+) -> None:
+    """Upload complete Hydra configs to W&B without replacing existing hparams."""
+    if trainer.global_rank != 0 or not trainer.loggers:
+        return
+
+    cfg_path = Path(cfg_path)
+    cfg_resolved_path = Path(cfg_resolved_path)
+    for lightning_logger in trainer.loggers:
+        if not isinstance(lightning_logger, L.pytorch.loggers.WandbLogger):
+            continue
+        try:
+            import wandb
+
+            run = lightning_logger.experiment
+            config_payload = {
+                "full_config": OmegaConf.to_container(
+                    cfg,
+                    resolve=False,
+                    throw_on_missing=False,
+                ),
+                "full_config_resolved": OmegaConf.to_container(
+                    cfg,
+                    resolve=True,
+                    throw_on_missing=False,
+                ),
+                "full_config_files": {
+                    "config": str(cfg_path),
+                    "config_resolved": str(cfg_resolved_path),
+                },
+            }
+            run.config.update(config_payload, allow_val_change=True)
+
+            artifact = wandb.Artifact(
+                name=f"{run.id}-full-config",
+                type="config",
+                description="Complete unresolved and resolved Hydra configs for this run.",
+            )
+            if cfg_path.is_file():
+                artifact.add_file(str(cfg_path), name="config.yaml")
+            if cfg_resolved_path.is_file():
+                artifact.add_file(str(cfg_resolved_path), name="config_resolved.yaml")
+            run.log_artifact(artifact)
+            log.info("Uploaded full Hydra config to W&B config and artifact.")
+        except Exception as exc:
+            log.warning(f"Failed to upload full config to W&B: {exc}")
+
+
 def get_nodename_bigram():
     """Generate a unique run identifier based on the nodename and a random bigram.
     Example: `max-wng029_QuickBear`
@@ -376,6 +428,12 @@ def train(cfg: DictConfig) -> Tuple[dict, dict]:
             with open(cfg_resolved_file, "w") as f:
                 log.info(f"Saving resolved config to {cfg_resolved_file}")
                 OmegaConf.save(cfg, f, resolve=True)
+            _log_full_config_to_wandb(
+                trainer,
+                cfg,
+                cfg_backup_file,
+                cfg_resolved_file,
+            )
         # ---
 
         log.info("------------------")

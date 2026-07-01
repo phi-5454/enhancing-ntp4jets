@@ -327,7 +327,10 @@ class SplitQuantizer(nn.Module):
         def reduce_loss(loss: torch.Tensor) -> torch.Tensor:
             if mask_values is None:
                 return loss.mean()
-            return (loss * mask_values).sum() / mask_values.sum().clamp_min(1.0)
+            loss_mask = mask_values
+            while loss_mask.ndim < loss.ndim:
+                loss_mask = loss_mask.unsqueeze(-1)
+            return (loss * loss_mask).sum() / loss_mask.sum().clamp_min(1.0)
 
         for branch, quantizer in self.quantizers.items():
             branch_input = branch_latents[branch]

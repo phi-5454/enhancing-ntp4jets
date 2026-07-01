@@ -450,9 +450,12 @@ class VQVAELightning(L.LightningModule):
                 + self.model.vqlayer.beta
                 * (vq_out["z"].detach() - vq_out["z_q"]).pow(2).mean(dim=-1)
             )
+            quantizer_loss_mask = mask_particle
+            while quantizer_loss_mask.ndim < quantizer_loss_per_token.ndim:
+                quantizer_loss_mask = quantizer_loss_mask.unsqueeze(-1)
             quantizer_loss = (
-                quantizer_loss_per_token * mask_particle
-            ).sum() / mask_particle.sum().clamp_min(1)
+                quantizer_loss_per_token * quantizer_loss_mask
+            ).sum() / quantizer_loss_mask.sum().clamp_min(1)
         quantizer_loss_weighted = quantizer_loss if is_split_quantizer else alpha * quantizer_loss
         code_idx = vq_out["q"]
         loss = reco_loss + quantizer_loss_weighted
