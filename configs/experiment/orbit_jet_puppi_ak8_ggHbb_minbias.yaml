@@ -1,0 +1,69 @@
+# @package _global_
+
+# Two-class production-style particle-tokenizer run for ggHbb signal versus
+# minbias background. Validation/test event selection uses class-specific jet
+# collections: ggHbb requires an AK8 jet with pT >= 250, while minbias requires
+# at least one AK4 jet.
+
+defaults:
+  - override /feature_dict: feature_dict_orbit_absolute.yaml
+  - override /data: orbit_parquet.yaml
+  - override /model: model_vqvae_transformer.yaml
+  - override /callbacks: orbit_plotting_callbacks.yaml
+  - override /logger: csv.yaml        # swap to wandb.yaml when ready
+  - override /trainer: gpu.yaml
+  - _self_
+
+project_name: "orbit-particle-ggHbb-minbias"
+tags: ["orbit", "particle", "ggHbb", "minbias"]
+
+train: true
+test: true
+
+data:
+  sequence_type: particle
+  batch_size: 256
+  num_workers: 4
+  # Set ORBIT_MANIFEST_DIR before launching. For the local split requested here,
+  # it should contain ggHbb_train_val.txt, ggHbb_test.txt,
+  # minbias_train_val.txt, minbias_test.txt.
+  parquet_files_train_val_per_class:
+    ggHbb:
+      paths: ${oc.env:ORBIT_MANIFEST_DIR}/ggHbb_train_val.txt
+      eval_sequence_type: jet_ak8
+      eval_min_pt: 250
+      weight: 1.0
+      max_train_events: 100000
+      max_val_events: 100000
+    minbias:
+      paths: ${oc.env:ORBIT_MANIFEST_DIR}/minbias_train_val.txt
+      eval_sequence_type: jet_ak4
+      weight: 1.0
+      max_train_events: 100000
+      max_val_events: 100000
+  parquet_files_test_per_class:
+    ggHbb:
+      paths: ${oc.env:ORBIT_MANIFEST_DIR}/ggHbb_test.txt
+      eval_sequence_type: jet_ak8
+      eval_min_pt: 250
+      max_test_events: 10000
+    minbias:
+      paths: ${oc.env:ORBIT_MANIFEST_DIR}/minbias_test.txt
+      eval_sequence_type: jet_ak4
+      max_test_events: 10000
+
+trainer:
+  max_epochs: 30
+  enable_checkpointing: true
+
+model:
+  model_kwargs:
+    input_dim: 4
+
+# model_vqvae_transformer.yaml provides production defaults:
+# hidden_dim=128, latent_dim=8, num_blocks=4, num_heads=8, codebook=512, causal_decoder=true.
+# To use the split quantizer instead, pass: model=model_vqvae_transformer_split
+
+extras:
+  enforce_tags: false
+  print_config: true

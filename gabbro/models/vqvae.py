@@ -163,7 +163,7 @@ class VQVAETransformer(torch.nn.Module):
         max_sequence_len: int = 128,
         input_features_dict: Dict[str, Any] = None,
         input_dim: int = None,
-        old_transformer_implementation: bool = True,
+        old_transformer_implementation: bool = False,
         in_out_proj_cfg: Dict[str, Any] = None,
         latent_proj_cfg: Dict[str, Any] = None,
         transformer_cfg: dict = None,
@@ -205,7 +205,7 @@ class VQVAETransformer(torch.nn.Module):
                     "expansion_factor": 4,
                     "dropout_rate": 0.0,
                     "norm_before": True,
-                    "activation": "ReLU",
+                    "activation": "GELU",
                 },
                 "residual_cfg": {"gate_type": "local", "init_value": 1.0},
             }
@@ -420,30 +420,62 @@ class VQVAELightning(L.LightningModule):
             x_conditional=x_jet if self.model.conditional_dim > 0 else None,
         )
 
-        reco_loss = torch.sum(
-            (
-                x_particle_reco * mask_particle.unsqueeze(-1)
-                - x_particle * mask_particle.unsqueeze(-1)
-            )
-            ** 2
-        ) / torch.sum(mask_particle)
+        valid_mask = mask_particle.unsqueeze(-1)
+        reco_delta = (x_particle_reco - x_particle) * valid_mask
+        n_valid_particles = torch.sum(mask_particle).clamp_min(1)
+        n_valid_values = (n_valid_particles * x_particle.shape[-1]).clamp_min(1)
+        reco_loss = torch.sum(reco_delta**2) / n_valid_particles
+        reco_l2_per_value = torch.sum(reco_delta**2) / n_valid_values
+        reco_l1_per_value = torch.sum(torch.abs(reco_delta)) / n_valid_values
 
         alpha = self.hparams["model_kwargs"]["alpha"]
-        cmt_loss = vq_out["loss"]
+        quantizer_loss = vq_out["loss"].mean()
         code_idx = vq_out["q"]
-        loss = reco_loss + alpha * cmt_loss.mean()
+        loss = reco_loss + alpha * quantizer_loss
+        metrics = {
+            "loss_total": loss.detach(),
+            "loss_reco_l2": reco_loss.detach(),
+            "loss_reco_l2_per_value": reco_l2_per_value.detach(),
+            "loss_reco_l1_per_value": reco_l1_per_value.detach(),
+            "loss_quantizer": quantizer_loss.detach(),
+            "loss_quantizer_weighted": (alpha * quantizer_loss).detach(),
+        }
 
         if return_x:
-            return loss, x_particle, x_particle_reco, mask_particle, labels, code_idx
+            return loss, metrics, x_particle, x_particle_reco, mask_particle, labels, code_idx
 
-        return loss
+        return loss, metrics
+
+    def _log_step_metrics(
+        self,
+        prefix: str,
+        metrics: dict[str, torch.Tensor],
+        *,
+        on_step: bool,
+        on_epoch: bool,
+        prog_bar: bool = False,
+    ) -> None:
+        for name, value in metrics.items():
+            self.log(
+                f"{prefix}/{name}",
+                value,
+                on_step=on_step,
+                on_epoch=on_epoch,
+                prog_bar=prog_bar and name == "loss_total",
+            )
 
     def training_step(self, batch, batch_idx: int) -> torch.Tensor:
         """Perform a single training step on a batch of data from the training set."""
-        loss = self.model_step(batch)
+        loss, metrics = self.model_step(batch)
 
         self.train_loss_history.append(loss.detach().item())
         self.log("train_loss", loss.item(), on_step=True, on_epoch=True, prog_bar=True)
+        self._log_step_metrics(
+            "train_metrics",
+            metrics,
+            on_step=True,
+            on_epoch=True,
+        )
 
         return loss
 
@@ -493,7 +525,10 @@ class VQVAELightning(L.LightningModule):
         self._clear_concat_outputs("val")
 
     def validation_step(self, batch: Tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> None:
-        loss, x_original, x_reco, mask, labels, code_idx = self.model_step(batch, return_x=True)
+        loss, metrics, x_original, x_reco, mask, labels, code_idx = self.model_step(
+            batch,
+            return_x=True,
+        )
 
         # Keep only a small validation sample for expensive plotting/physics evaluation.
         if self._should_store_loop_batch(
@@ -505,7 +540,13 @@ class VQVAELightning(L.LightningModule):
             self.val_labels.append(labels.detach().cpu().numpy())
             self.val_code_idx.append(code_idx.detach().cpu().numpy())
 
-        self.log("val_loss", loss.item(), on_step=True, on_epoch=True, prog_bar=True)
+        self.log("val_loss", loss.item(), on_step=False, on_epoch=True, prog_bar=True)
+        self._log_step_metrics(
+            "val_metrics",
+            metrics,
+            on_step=False,
+            on_epoch=True,
+        )
 
         return loss
 
@@ -519,7 +560,10 @@ class VQVAELightning(L.LightningModule):
         self._clear_concat_outputs("test")
 
     def test_step(self, batch: Tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> None:
-        loss, x_original, x_reco, mask, labels, code_idx = self.model_step(batch, return_x=True)
+        loss, metrics, x_original, x_reco, mask, labels, code_idx = self.model_step(
+            batch,
+            return_x=True,
+        )
 
         if self._should_store_loop_batch(batch_idx, self.hparams.get("max_test_plot_batches")):
             self.test_x_original.append(x_original.detach().cpu().numpy())
@@ -528,7 +572,13 @@ class VQVAELightning(L.LightningModule):
             self.test_labels.append(labels.detach().cpu().numpy())
             self.test_code_idx.append(code_idx.detach().cpu().numpy())
 
-        self.log("test_loss", loss.item(), on_step=True, on_epoch=True, prog_bar=True)
+        self.log("test_loss", loss.item(), on_step=False, on_epoch=True, prog_bar=True)
+        self._log_step_metrics(
+            "test_metrics",
+            metrics,
+            on_step=False,
+            on_epoch=True,
+        )
 
     def tokenize_ak_array(
         self,
@@ -920,7 +970,7 @@ class VQVAELightning(L.LightningModule):
                 "optimizer": optimizer,
                 "lr_scheduler": {
                     "scheduler": scheduler,
-                    **self.hparams.scheduler_lightning_kwargs,
+                    **self.hparams.get("scheduler_lightning_kwargs", {}),
                 },
             }
 

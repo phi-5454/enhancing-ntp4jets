@@ -8,3 +8,4 @@ orbit_plotting_callback:
   enable_physics_plots: true
   include_all_ratios: true
   jet_radius: 0.8
+  include_codebook_histogram: true
