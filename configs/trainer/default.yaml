@@ -13,6 +13,10 @@ enable_progress_bar: False
 fast_dev_run: False
 num_sanity_val_steps: 2
 
+# Clip gradients by global norm for all trainer variants inheriting this config.
+gradient_clip_val: 1.0
+gradient_clip_algorithm: norm
+
 # Use integer limits for iterable parquet datasets. Fractional limits require
 # dataloaders with a known length.
 limit_train_batches: null
