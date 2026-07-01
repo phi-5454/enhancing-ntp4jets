@@ -446,9 +446,9 @@ class VQVAELightning(L.LightningModule):
         else:
             quantizer_loss_per_token = (
                 (1.0 - self.model.vqlayer.beta)
-                * (vq_out["z"] - vq_out["z_q"].detach()).pow(2).mean(dim=-1)
+                * (vq_out["z"] - vq_out["z_q"].detach()).pow(2).mean(dim=(-1, -2))
                 + self.model.vqlayer.beta
-                * (vq_out["z"].detach() - vq_out["z_q"]).pow(2).mean(dim=-1)
+                * (vq_out["z"].detach() - vq_out["z_q"]).pow(2).mean(dim=(-1, -2))
             )
             quantizer_loss = (
                 quantizer_loss_per_token * mask_particle
