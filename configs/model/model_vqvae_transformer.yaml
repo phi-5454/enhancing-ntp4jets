@@ -10,7 +10,7 @@ model_kwargs:
   num_blocks: 4
   num_heads: 8
   alpha: 10
-  causal_decoder: true
+  causal_decoder: false
   old_transformer_implementation: false
   vq_kwargs:
     num_codes: 512
