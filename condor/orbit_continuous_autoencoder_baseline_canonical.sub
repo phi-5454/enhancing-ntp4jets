@@ -1,0 +1,8 @@
+# Additive canonical-data variant. Override with:
+# condor_submit -append 'CANONICAL_EXPERIMENT=orbit_canonical_tt' condor/orbit_continuous_autoencoder_baseline_canonical.sub
+CANONICAL_EXPERIMENT = orbit_canonical_qcd_tt_vjets_vv
+SUITE_BASE = orbit_continuous_autoencoder_baseline_canonical
+RUN_NAME = continuous_autoencoder
+MODEL_ARGS = model=model_vqvae_transformer_continuous callbacks.orbit_plotting_callback.include_codebook_histogram=false trainer.max_epochs=30 trainer.limit_train_batches=null trainer.limit_val_batches=null
+include : condor/orbit_canonical_common.sub
+queue 1

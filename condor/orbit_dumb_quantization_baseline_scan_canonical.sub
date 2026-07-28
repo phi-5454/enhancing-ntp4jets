@@ -1,0 +1,6 @@
+CANONICAL_EXPERIMENT = orbit_canonical_qcd_tt_vjets_vv
+SUITE_BASE = orbit_dumb_quantization_baseline_scan_canonical
+RUN_NAME = dumb_quant_baseline_$(LEVEL)x3
+MODEL_ARGS = model=model_dumb_quantization_baseline model.q_levels=[$(LEVEL),$(LEVEL),$(LEVEL)] train=false test_without_checkpoint=true
+include : condor/orbit_canonical_common.sub
+queue LEVEL in (5, 8, 10, 13, 16, 20, 25)

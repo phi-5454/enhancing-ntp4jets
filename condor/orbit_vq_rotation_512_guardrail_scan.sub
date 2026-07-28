@@ -1,0 +1,63 @@
+# Rotation-trick VQ diagnostic scan at 512 codes.
+# Submit from the repository root:
+#   mkdir -p /eos/user/y/yelberke/enhancing_ntp4jets_runs/condor_logs
+#   condor_submit condor/orbit_vq_rotation_512_guardrail_scan.sub
+
+executable = scripts/condor_run_training.sh
+
+PROJECT_DIR = /eos/user/y/yelberke/enhancing-ntp4jets
+OUTPUT_DIR = /eos/user/y/yelberke/enhancing_ntp4jets_runs
+CONDA_ENV = /eos/home-y/yelberke/conda_condor_orbit_env
+SUITE_ID = orbit_vq_rotation_512_guardrail_scan_$(Cluster)
+
+# The ggHbb/minbias split manifests live here:
+#   ggHbb_train_val.txt, ggHbb_test.txt, minbias_train_val.txt, minbias_test.txt
+ORBIT_MANIFEST_DIR = /eos/user/y/yelberke/gghbb_minbias_files
+GABBRO_ENV_FILE = /eos/user/y/yelberke/wandb.env
+
+arguments = $(PROJECT_DIR) $(OUTPUT_DIR) train $(SUITE_ID) $(Process) \
+  experiment=orbit_jet_puppi_ak8_ggHbb_minbias \
+  model=model_vqvae_transformer \
+  logger=wandb.yaml \
+  task_name=orbit_particle_ggHbb_minbias_vq_rotation_512_$(RUN_NAME) \
+  logger.wandb.name=orbit_particle_ggHbb_minbias_vq_rotation_512_$(RUN_NAME)_$(Cluster)_$(Process) \
+  logger.wandb.group=$(SUITE_ID) \
+  logger.wandb.project=orbit-tokenizer \
+  model.model_kwargs.causal_decoder=false \
+  model.model_kwargs.vq_kwargs.num_codes=512 \
+  model.model_kwargs.vq_kwargs.rotation_tr=true \
+  model.model_kwargs.vq_kwargs.sync_nu=$(SYNC_NU) \
+  model.model_kwargs.vq_kwargs.affine_lr=0.0 \
+  model.model_kwargs.vq_kwargs.replace_freq=$(REPLACE_FREQ) \
+  model.model_kwargs.vq_kwargs.beta=$(BETA) \
+  model.model_kwargs.vq_kwargs.kmeans_init=false \
+  callbacks.orbit_plotting_callback.include_codebook_histogram=false \
+  test=true \
+  trainer.max_epochs=30 \
+  trainer.limit_train_batches=null \
+  trainer.limit_val_batches=null \
+  data.num_workers=4
+
+environment = "ORBIT_MANIFEST_DIR=$(ORBIT_MANIFEST_DIR) GABBRO_ENV_FILE=$(GABBRO_ENV_FILE) CONDA_ENV=$(CONDA_ENV) WANDB_MODE=online"
+
+log    = $(OUTPUT_DIR)/condor_logs/orbit_vq_rotation_512_guardrail_scan_$(Cluster).log
+output = $(OUTPUT_DIR)/condor_logs/orbit_vq_rotation_512_guardrail_scan_$(RUN_NAME)_$(Cluster)_$(Process).out
+error  = $(OUTPUT_DIR)/condor_logs/orbit_vq_rotation_512_guardrail_scan_$(RUN_NAME)_$(Cluster)_$(Process).err
+
+should_transfer_files = YES
+when_to_transfer_output = ON_EXIT
+
+request_cpus = 4
+request_memory = 16GB
+request_gpus = 1
+
++JobFlavour = "tomorrow"
+
+queue RUN_NAME, SYNC_NU, REPLACE_FREQ, BETA from (
+  no_guardrails, 0, 0, 0.9
+  replacement_100, 0, 100, 0.9
+  replacement_500, 0, 500, 0.9
+  low_beta, 0, 0, 0.7
+  tiny_sync_005, 0.05, 0, 0.9
+  tiny_sync_01, 0.1, 0, 0.9
+)

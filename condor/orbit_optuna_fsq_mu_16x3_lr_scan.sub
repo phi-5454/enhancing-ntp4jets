@@ -1,0 +1,43 @@
+# Optuna learning-rate tuning for FSQ 16x3.
+# Submit from the repository root:
+#   mkdir -p /eos/user/y/yelberke/enhancing_ntp4jets_runs/condor_logs
+#   condor_submit condor/orbit_optuna_fsq_mu_16x3_lr_scan.sub
+#
+# This runs one resumable native Optuna study with 16 short L2 trials, no test stage,
+# and minimizes val_metrics/loss_reco. The sampled variable is lr_scale,
+# which scales optimizer.lr and the one-cycle initial/max/final LR together.
+
+executable = scripts/condor_run_training.sh
+
+PROJECT_DIR = /eos/user/y/yelberke/enhancing-ntp4jets
+OUTPUT_DIR = /eos/user/y/yelberke/enhancing_ntp4jets_runs
+CONDA_ENV = /eos/home-y/yelberke/conda_condor_orbit_env
+SUITE_ID = orbit_optuna_fsq_mu_16x3_lr_scan_$(Cluster)
+
+ORBIT_MANIFEST_DIR = /eos/user/y/yelberke/gghbb_minbias_files
+GABBRO_ENV_FILE = /eos/user/y/yelberke/wandb.env
+
+arguments = $(PROJECT_DIR) $(OUTPUT_DIR) optuna $(SUITE_ID) $(Process) \
+  experiment=orbit_jet_puppi_ak8_ggHbb_minbias \
+  hparams_search=orbit_optuna_fsq_mu_16x3_lr \
+  logger=wandb.yaml \
+  logger.wandb.group=optuna_lr_fsq_mu_16x3_$(Cluster) \
+  logger.wandb.project=orbit-tokenizer \
+  data.num_workers=4
+
+environment = "ORBIT_MANIFEST_DIR=$(ORBIT_MANIFEST_DIR) GABBRO_ENV_FILE=$(GABBRO_ENV_FILE) CONDA_ENV=$(CONDA_ENV) WANDB_MODE=online"
+
+log    = $(OUTPUT_DIR)/condor_logs/orbit_optuna_fsq_mu_16x3_lr_scan_$(Cluster).log
+output = $(OUTPUT_DIR)/condor_logs/orbit_optuna_fsq_mu_16x3_lr_scan_$(Cluster)_$(Process).out
+error  = $(OUTPUT_DIR)/condor_logs/orbit_optuna_fsq_mu_16x3_lr_scan_$(Cluster)_$(Process).err
+
+should_transfer_files = YES
+when_to_transfer_output = ON_EXIT
+
+request_cpus = 4
+request_memory = 16GB
+request_gpus = 1
+
++JobFlavour = "tomorrow"
+
+queue 1

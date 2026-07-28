@@ -1,0 +1,14 @@
+CANONICAL_EXPERIMENT = orbit_canonical_qcd_tt_vjets_vv
+SUITE_BASE = orbit_split_vq_mu_fsq_alpha128_scan_canonical
+MODEL_ARGS = model=$(MODEL_CONFIG) callbacks.orbit_plotting_callback.include_codebook_histogram=false trainer.max_epochs=30 trainer.limit_train_batches=null trainer.limit_val_batches=null
+include : condor/orbit_canonical_common.sub
+queue RUN_NAME, MODEL_CONFIG from (
+  vq_mu_1_fsq_alpha_128, model_vqvae_transformer_split_vq_mu_1_fsq_alpha_128
+  vq_mu_2_fsq_alpha_128, model_vqvae_transformer_split_vq_mu_2_fsq_alpha_128
+  vq_mu_4_fsq_alpha_128, model_vqvae_transformer_split_vq_mu_4_fsq_alpha_128
+  vq_mu_8_fsq_alpha_128, model_vqvae_transformer_split_vq_mu_8_fsq_alpha_128
+  vq_mu_16_fsq_alpha_128, model_vqvae_transformer_split_vq_mu_16_fsq_alpha_128
+  vq_mu_32_fsq_alpha_128, model_vqvae_transformer_split_vq_mu_32_fsq_alpha_128
+  vq_mu_64_fsq_alpha_128, model_vqvae_transformer_split_vq_mu_64_fsq_alpha_128
+  vq_mu_128_fsq_alpha_128, model_vqvae_transformer_split_vq_mu_128_fsq_alpha_128
+)

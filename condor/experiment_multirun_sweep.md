@@ -1,0 +1,11 @@
+condor_submit condor/orbit_fsq_codebook_scan.sub
+condor_submit condor/orbit_vq_ste_scan.sub
+condor_submit condor/orbit_vq_rotation_scan.sub
+condor_submit condor/orbit_split_fsq_alpha32_scan.sub
+condor_submit condor/orbit_split_fsq_alpha64_scan.sub
+condor_submit condor/orbit_split_fsq_alpha128_scan.sub
+condor_submit condor/orbit_split_vq_mu_fsq_alpha32_scan.sub
+condor_submit condor/orbit_split_vq_mu_fsq_alpha64_scan.sub
+condor_submit condor/orbit_split_vq_mu_fsq_alpha128_scan.sub
+condor_submit condor/orbit_dumb_learned_quantization_baseline_scan.sub
+condor_submit condor/orbit_dumb_quantization_baseline_scan.sub

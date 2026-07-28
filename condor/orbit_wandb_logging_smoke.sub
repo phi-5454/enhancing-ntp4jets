@@ -1,0 +1,53 @@
+# One small HTCondor job to validate W&B scalar/image logging for the
+# ggHbb/minbias particle tokenizer setup. Submit from the repository root:
+#   mkdir -p /eos/user/y/yelberke/enhancing_ntp4jets_runs/condor_logs
+#   condor_submit condor/orbit_wandb_logging_smoke.sub
+#
+# This uses configs/experiment/orbit_jet_puppi_ak8_ggHbb_minbias_wandb_smoke.yaml:
+# 10 train events/class, 10 val events/class, 10 test events/class, batch_size=2.
+# That is 10 train batches, 10 val batches, and 10 test batches total if both
+# classes have enough events after the validation/test jet filters.
+
+executable = scripts/condor_run_training.sh
+
+# Site-specific paths. PROJECT_DIR must be visible on the worker node.
+PROJECT_DIR = /eos/user/y/yelberke/enhancing-ntp4jets
+OUTPUT_DIR = /eos/user/y/yelberke/enhancing_ntp4jets_runs
+CONDA_ENV = /eos/home-y/yelberke/conda_condor_orbit_env
+SUITE_ID = orbit_wandb_logging_smoke_$(Cluster)
+
+# The ggHbb/minbias split manifests live here:
+#   ggHbb_train_val.txt, ggHbb_test.txt, minbias_train_val.txt, minbias_test.txt
+ORBIT_MANIFEST_DIR = /eos/user/y/yelberke/gghbb_minbias_files
+
+# Must provide WANDB_API_KEY and any WANDB_ENTITY setting needed by the account.
+GABBRO_ENV_FILE = /eos/user/y/yelberke/wandb.env
+
+arguments = $(PROJECT_DIR) $(OUTPUT_DIR) train $(SUITE_ID) $(Process) \
+  experiment=orbit_jet_puppi_ak8_ggHbb_minbias_wandb_smoke \
+  trainer=gpu.yaml \
+  task_name=orbit_particle_ggHbb_minbias_wandb_smoke \
+  logger.wandb.name=orbit_particle_ggHbb_minbias_wandb_smoke_$(Cluster)_$(Process) \
+  logger.wandb.group=$(SUITE_ID) \
+  logger.wandb.project=orbit-tokenizer \
+  test=true \
+  +trainer.log_every_n_steps=1
+
+environment = "ORBIT_MANIFEST_DIR=$(ORBIT_MANIFEST_DIR) GABBRO_ENV_FILE=$(GABBRO_ENV_FILE) CONDA_ENV=$(CONDA_ENV) WANDB_MODE=online"
+
+# Condor requires the log directory to exist before submission on many sites.
+log    = $(OUTPUT_DIR)/condor_logs/orbit_wandb_logging_smoke_$(Cluster).log
+output = $(OUTPUT_DIR)/condor_logs/orbit_wandb_logging_smoke_$(Cluster)_$(Process).out
+error  = $(OUTPUT_DIR)/condor_logs/orbit_wandb_logging_smoke_$(Cluster)_$(Process).err
+
+should_transfer_files = YES
+when_to_transfer_output = ON_EXIT
+
+request_cpus = 2
+request_memory = 16GB
+request_gpus = 1
+
+# Give the job room for environment startup plus plotting/W&B upload.
++JobFlavour = "microcentury"
+
+queue 1

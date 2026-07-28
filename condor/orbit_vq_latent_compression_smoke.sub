@@ -1,0 +1,48 @@
+# Tiny compressed-latent VQ smoke. Submit from the repository root:
+#   mkdir -p /eos/user/y/yelberke/enhancing_ntp4jets_runs/condor_logs
+#   condor_submit condor/orbit_vq_latent_compression_smoke.sub
+#
+# This uses the ggHbb/minbias W&B smoke data limits and validates train/val/test
+# with a true half-length latent sequence bottleneck and a larger VQ codebook.
+
+executable = scripts/condor_run_training.sh
+
+PROJECT_DIR = /eos/user/y/yelberke/enhancing-ntp4jets
+OUTPUT_DIR = /eos/user/y/yelberke/enhancing_ntp4jets_runs
+CONDA_ENV = /eos/home-y/yelberke/conda_condor_orbit_env
+SUITE_ID = orbit_vq_latent_compression_smoke_$(Cluster)
+
+ORBIT_MANIFEST_DIR = /eos/user/y/yelberke/gghbb_minbias_files
+GABBRO_ENV_FILE = /eos/user/y/yelberke/wandb.env
+
+arguments = $(PROJECT_DIR) $(OUTPUT_DIR) train $(SUITE_ID) $(Process) \
+  experiment=orbit_jet_puppi_ak8_ggHbb_minbias_wandb_smoke \
+  trainer=gpu.yaml \
+  model=model_vqvae_transformer_vq_latent_compress \
+  task_name=orbit_particle_ggHbb_minbias_vq_ste_latent_ratio_0p5_codes_8192_smoke \
+  logger.wandb.name=orbit_particle_ggHbb_minbias_vq_ste_latent_ratio_0p5_codes_8192_smoke_$(Cluster)_$(Process) \
+  logger.wandb.group=$(SUITE_ID) \
+  logger.wandb.project=orbit-tokenizer \
+  model.model_kwargs.causal_decoder=false \
+  model.model_kwargs.vq_kwargs.num_codes=8192 \
+  model.model_kwargs.vq_kwargs.rotation_tr=false \
+  callbacks.orbit_plotting_callback.include_codebook_histogram=false \
+  test=true \
+  +trainer.log_every_n_steps=1
+
+environment = "ORBIT_MANIFEST_DIR=$(ORBIT_MANIFEST_DIR) GABBRO_ENV_FILE=$(GABBRO_ENV_FILE) CONDA_ENV=$(CONDA_ENV) WANDB_MODE=online"
+
+log    = $(OUTPUT_DIR)/condor_logs/orbit_vq_latent_compression_smoke_$(Cluster).log
+output = $(OUTPUT_DIR)/condor_logs/orbit_vq_latent_compression_smoke_$(Cluster)_$(Process).out
+error  = $(OUTPUT_DIR)/condor_logs/orbit_vq_latent_compression_smoke_$(Cluster)_$(Process).err
+
+should_transfer_files = YES
+when_to_transfer_output = ON_EXIT
+
+request_cpus = 2
+request_memory = 16GB
+request_gpus = 1
+
++JobFlavour = "microcentury"
+
+queue 1

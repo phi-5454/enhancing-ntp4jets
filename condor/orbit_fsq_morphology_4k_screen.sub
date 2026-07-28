@@ -1,0 +1,72 @@
+# Six-epoch FSQ morphology screening sweep around |C| ~= 4k.
+# Submit from the repository root:
+#   mkdir -p /eos/user/y/yelberke/enhancing_ntp4jets_runs/condor_logs
+#   condor_submit condor/orbit_fsq_morphology_4k_screen.sub
+
+executable = scripts/condor_run_training.sh
+
+PROJECT_DIR = /eos/user/y/yelberke/enhancing-ntp4jets
+OUTPUT_DIR = /eos/user/y/yelberke/enhancing_ntp4jets_runs
+CONDA_ENV = /eos/home-y/yelberke/conda_condor_orbit_env
+SUITE_ID = orbit_fsq_morphology_4k_screen_$(Cluster)
+
+# The ggHbb/minbias split manifests live here:
+#   ggHbb_train_val.txt, ggHbb_test.txt, minbias_train_val.txt, minbias_test.txt
+ORBIT_MANIFEST_DIR = /eos/user/y/yelberke/gghbb_minbias_files
+GABBRO_ENV_FILE = /eos/user/y/yelberke/wandb.env
+
+arguments = $(PROJECT_DIR) $(OUTPUT_DIR) train $(SUITE_ID) $(Process) \
+  experiment=orbit_jet_puppi_ak8_ggHbb_minbias \
+  model=$(MODEL_CONFIG) \
+  logger=wandb.yaml \
+  task_name=orbit_particle_ggHbb_minbias_$(RUN_NAME) \
+  logger.wandb.name=orbit_particle_ggHbb_minbias_$(RUN_NAME)_$(Cluster)_$(Process) \
+  logger.wandb.group=$(SUITE_ID) \
+  logger.wandb.project=orbit-tokenizer \
+  model.model_kwargs.causal_decoder=false \
+  callbacks.orbit_plotting_callback.include_codebook_histogram=false \
+  test=false \
+  trainer.max_epochs=6 \
+  trainer.limit_train_batches=null \
+  trainer.limit_val_batches=null \
+  data.num_workers=4
+
+environment = "ORBIT_MANIFEST_DIR=$(ORBIT_MANIFEST_DIR) GABBRO_ENV_FILE=$(GABBRO_ENV_FILE) CONDA_ENV=$(CONDA_ENV) WANDB_MODE=online"
+
+log    = $(OUTPUT_DIR)/condor_logs/orbit_fsq_morphology_4k_screen_$(Cluster).log
+output = $(OUTPUT_DIR)/condor_logs/orbit_fsq_morphology_4k_screen_$(RUN_NAME)_$(Cluster)_$(Process).out
+error  = $(OUTPUT_DIR)/condor_logs/orbit_fsq_morphology_4k_screen_$(RUN_NAME)_$(Cluster)_$(Process).err
+
+should_transfer_files = YES
+when_to_transfer_output = ON_EXIT
+
+request_cpus = 4
+request_memory = 16GB
+request_gpus = 1
+
++JobFlavour = "tomorrow"
+
+queue RUN_NAME, MODEL_CONFIG from (
+  fsq_morph_16_16_16, model_vqvae_transformer_split_fsq_morph_16_16_16
+  fsq_morph_8_8_8_8, model_vqvae_transformer_split_fsq_morph_8_8_8_8
+  fsq_morph_4x6, model_vqvae_transformer_split_fsq_morph_4x6
+  fsq_morph_2x8_4x2, model_vqvae_transformer_split_fsq_morph_2x8_4x2
+  fsq_morph_2_16_128, model_vqvae_transformer_split_fsq_morph_2_16_128
+  fsq_morph_4_8_128, model_vqvae_transformer_split_fsq_morph_4_8_128
+  fsq_morph_4_16_64, model_vqvae_transformer_split_fsq_morph_4_16_64
+  fsq_morph_5_9_91, model_vqvae_transformer_split_fsq_morph_5_9_91
+  fsq_morph_6_6_114, model_vqvae_transformer_split_fsq_morph_6_6_114
+  fsq_morph_7_7_84, model_vqvae_transformer_split_fsq_morph_7_7_84
+  fsq_morph_8_8_64, model_vqvae_transformer_split_fsq_morph_8_8_64
+  fsq_morph_9_9_50, model_vqvae_transformer_split_fsq_morph_9_9_50
+  fsq_morph_10_10_41, model_vqvae_transformer_split_fsq_morph_10_10_41
+  fsq_morph_12_12_29, model_vqvae_transformer_split_fsq_morph_12_12_29
+  fsq_morph_2_45_45, model_vqvae_transformer_split_fsq_morph_2_45_45
+  fsq_morph_4_32_32, model_vqvae_transformer_split_fsq_morph_4_32_32
+  fsq_morph_5_29_29, model_vqvae_transformer_split_fsq_morph_5_29_29
+  fsq_morph_6_26_26, model_vqvae_transformer_split_fsq_morph_6_26_26
+  fsq_morph_2x6_4x3, model_vqvae_transformer_split_fsq_morph_2x6_4x3
+  fsq_morph_2x7_4_8, model_vqvae_transformer_split_fsq_morph_2x7_4_8
+  fsq_morph_2x6_4_16, model_vqvae_transformer_split_fsq_morph_2x6_4_16
+  fsq_morph_2x4_4x4, model_vqvae_transformer_split_fsq_morph_2x4_4x4
+)

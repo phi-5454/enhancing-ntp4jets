@@ -1,0 +1,63 @@
+# Submit from the repository root:
+#   condor_submit condor/orbit_jet_production_smoke.sub
+#
+# Edit PROJECT_DIR, OUTPUT_DIR, and ORBIT_MANIFEST_DIR for the target
+# account/site before submitting. CONDA_ENV should point to an existing conda
+# environment on the worker node. GABBRO_ENV_FILE is optional for this CSV smoke
+# job.
+
+executable = scripts/condor_run_training.sh
+
+# Site-specific paths. PROJECT_DIR must be visible on the worker node.
+# OUTPUT_DIR should be on a shared filesystem with enough space for Hydra
+# outputs, W&B files, checkpoints, and Condor logs.
+PROJECT_DIR = /eos/user/y/yelberke/enhancing-ntp4jets
+OUTPUT_DIR = /eos/user/y/yelberke/enhancing_ntp4jets_runs
+CONDA_ENV = /eos/home-y/yelberke/conda_condor_orbit_env
+SUITE_ID = orbit_jet_smoke_$(Cluster)
+
+# The production experiment reads per-class manifests from this directory.
+# Generate them with scripts/make_eos_manifests.py before submitting.
+ORBIT_MANIFEST_DIR = /eos/user/y/yelberke/orbit_manifests
+
+# Optional for this smoke job because it uses CSV logging. Set this to a file
+# containing WANDB_API_KEY, WANDB_ENTITY, LOG_DIR, etc. if needed.
+GABBRO_ENV_FILE =
+
+# Arguments after $(Process) are passed directly to gabbro/train.py as Hydra
+# overrides. Keep this job intentionally tiny; it is meant to validate Condor,
+# the conda environment, CUDA, manifest paths, and basic data loading.
+arguments = $(PROJECT_DIR) $(OUTPUT_DIR) train $(SUITE_ID) $(Process) \
+  experiment=orbit_jet_puppi_ak8_ggHbb_minbias \
+  logger=csv.yaml \
+  task_name=orbit_jet_condor_smoke \
+  trainer.max_epochs=1 \
+  trainer.limit_train_batches=1 \
+  trainer.limit_val_batches=1 \
+  trainer.limit_test_batches=0 \
+  +trainer.log_every_n_steps=1 \
+  data.num_workers=4
+
+environment = "ORBIT_MANIFEST_DIR=$(ORBIT_MANIFEST_DIR) GABBRO_ENV_FILE=$(GABBRO_ENV_FILE) CONDA_ENV=$(CONDA_ENV)"
+
+# Condor requires the log directory to exist before submission on many sites:
+#   mkdir -p $(OUTPUT_DIR)/condor_logs
+log    = $(OUTPUT_DIR)/condor_logs/orbit_jet_smoke_$(Cluster).log
+output = $(OUTPUT_DIR)/condor_logs/orbit_jet_smoke_$(Cluster)_$(Process).out
+error  = $(OUTPUT_DIR)/condor_logs/orbit_jet_smoke_$(Cluster)_$(Process).err
+
+# The code and outputs live on a shared filesystem, but these settings are kept
+# explicit because many HTCondor pools require a file-transfer policy.
+should_transfer_files = YES
+when_to_transfer_output = ON_EXIT
+
+# Match data.num_workers to request_cpus unless you intentionally oversubscribe.
+request_cpus = 4
+request_memory = 16GB
+request_gpus = 1
+
+# Espresso is appropriate for the one-epoch smoke test. Use a longer flavour for
+# production training.
++JobFlavour = "espresso"
+
+queue 1

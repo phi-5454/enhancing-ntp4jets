@@ -1,0 +1,46 @@
+# Test-only dumb quantization baselines for transformed eta/phi/log-pT.
+# Submit from the repository root:
+#   mkdir -p /eos/user/y/yelberke/enhancing_ntp4jets_runs/condor_logs
+#   condor_submit condor/orbit_dumb_quantization_baseline_scan.sub
+
+executable = scripts/condor_run_training.sh
+
+PROJECT_DIR = /eos/user/y/yelberke/enhancing-ntp4jets
+OUTPUT_DIR = /eos/user/y/yelberke/enhancing_ntp4jets_runs
+CONDA_ENV = /eos/home-y/yelberke/conda_condor_orbit_env
+SUITE_ID = orbit_dumb_quantization_baseline_scan_$(Cluster)
+
+# The ggHbb/minbias split manifests live here:
+#   ggHbb_train_val.txt, ggHbb_test.txt, minbias_train_val.txt, minbias_test.txt
+ORBIT_MANIFEST_DIR = /eos/user/y/yelberke/gghbb_minbias_files
+GABBRO_ENV_FILE = /eos/user/y/yelberke/wandb.env
+
+arguments = $(PROJECT_DIR) $(OUTPUT_DIR) train $(SUITE_ID) $(Process) \
+  experiment=orbit_jet_puppi_ak8_ggHbb_minbias_dumb_baseline \
+  logger=wandb.yaml \
+  task_name=orbit_particle_ggHbb_minbias_dumb_quant_baseline_$(LEVEL)x3 \
+  logger.wandb.name=orbit_particle_ggHbb_minbias_dumb_quant_baseline_$(LEVEL)x3_$(Cluster)_$(Process) \
+  logger.wandb.group=$(SUITE_ID) \
+  logger.wandb.project=orbit-tokenizer \
+  model.q_levels=[$(LEVEL),$(LEVEL),$(LEVEL)] \
+  test=true \
+  train=false \
+  test_without_checkpoint=true \
+  data.num_workers=4
+
+environment = "ORBIT_MANIFEST_DIR=$(ORBIT_MANIFEST_DIR) GABBRO_ENV_FILE=$(GABBRO_ENV_FILE) CONDA_ENV=$(CONDA_ENV) WANDB_MODE=online"
+
+log    = $(OUTPUT_DIR)/condor_logs/orbit_dumb_quantization_baseline_scan_$(Cluster).log
+output = $(OUTPUT_DIR)/condor_logs/orbit_dumb_quantization_baseline_scan_$(LEVEL)x3_$(Cluster)_$(Process).out
+error  = $(OUTPUT_DIR)/condor_logs/orbit_dumb_quantization_baseline_scan_$(LEVEL)x3_$(Cluster)_$(Process).err
+
+should_transfer_files = YES
+when_to_transfer_output = ON_EXIT
+
+request_cpus = 4
+request_memory = 16GB
+request_gpus = 1
+
++JobFlavour = "workday"
+
+queue LEVEL in (5, 8, 10, 13, 16, 20, 25)

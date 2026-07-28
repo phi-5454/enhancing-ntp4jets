@@ -1,0 +1,6 @@
+CANONICAL_EXPERIMENT = orbit_canonical_qcd_tt_vjets_vv
+SUITE_BASE = orbit_vq_rotation_scan_canonical
+RUN_NAME = vq_rotation_codes_$(NUM_CODES)
+MODEL_ARGS = model=model_vqvae_transformer model.model_kwargs.vq_kwargs.num_codes=$(NUM_CODES) model.model_kwargs.vq_kwargs.rotation_tr=true model.model_kwargs.vq_kwargs.rotation_scale_min=null model.model_kwargs.vq_kwargs.rotation_scale_max=2.0 model.model_kwargs.vq_kwargs.sync_nu=0 model.model_kwargs.vq_kwargs.affine_lr=0.0 model.model_kwargs.vq_kwargs.replace_freq=500 model.model_kwargs.vq_kwargs.kmeans_init=false callbacks.orbit_plotting_callback.include_codebook_histogram=false trainer.max_epochs=30 trainer.limit_train_batches=null trainer.limit_val_batches=null
+include : condor/orbit_canonical_common.sub
+queue NUM_CODES in (128, 256, 512, 1024, 2048, 4096, 8192, 16384)
