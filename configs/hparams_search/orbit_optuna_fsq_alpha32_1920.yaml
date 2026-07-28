@@ -1,0 +1,13 @@
+# @package _global_
+
+defaults:
+  - orbit_optuna_loss_weight_base
+  - override /model: model_vqvae_transformer_split_fsq_mu_5_4_3_2_alpha_32
+  - _self_
+
+task_name: orbit_optuna_loss_weight_fsq_alpha32_1920
+
+optuna:
+  search_space:
+    model.model_kwargs.split_quantizer_cfg.branch_loss_weights.mu: {type: float, low: 0.01, high: 3.0, log: true}
+    model.model_kwargs.split_quantizer_cfg.branch_loss_weights.alpha: {type: float, low: 0.01, high: 3.0, log: true}

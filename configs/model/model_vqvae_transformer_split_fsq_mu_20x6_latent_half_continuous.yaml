@@ -1,0 +1,7 @@
+defaults:
+  - model_vqvae_transformer_split_fsq_mu_20x6_latent_half
+  - _self_
+
+# Isolates the learned half-length compressor/expander from discretization.
+model_kwargs:
+  quantization_enabled: false

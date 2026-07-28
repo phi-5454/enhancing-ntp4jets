@@ -1,0 +1,13 @@
+defaults:
+  - model_vqvae_transformer_split
+  - _self_
+
+model_kwargs:
+  latent_dim: 3
+  split_quantizer_cfg:
+    bypass_single_branch_projection: true
+    branch_order: ["mu"]
+    branch_loss_weights:
+      mu: 0.25
+      alpha: 1.0
+    fsq_mu_levels: [10, 10, 10]

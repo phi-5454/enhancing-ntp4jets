@@ -1,0 +1,59 @@
+# @package _global_
+
+# Train and validate only on minbias, then test on both minbias and ggHbb.
+
+defaults:
+  - override /feature_dict: feature_dict_orbit_absolute.yaml
+  - override /data: orbit_parquet.yaml
+  - override /model: model_vqvae_transformer.yaml
+  - override /callbacks: orbit_plotting_callbacks.yaml
+  - override /logger: csv.yaml
+  - override /trainer: gpu.yaml
+  - _self_
+
+project_name: "orbit-particle-minbias-train-only"
+tags: ["orbit", "particle", "ggHbb", "minbias", "single-class-training"]
+
+train: true
+test: true
+
+data:
+  sequence_type: particle
+  batch_size: 256
+  num_workers: 4
+  parquet_files_train_val_per_class:
+    ggHbb:
+      paths: ${oc.env:ORBIT_MANIFEST_DIR}/ggHbb_train_val.txt
+      eval_sequence_type: jet_ak8
+      eval_min_pt: 250
+      weight: 1.0
+      max_train_events: 0
+      max_val_events: 0
+    minbias:
+      paths: ${oc.env:ORBIT_MANIFEST_DIR}/minbias_train_val.txt
+      eval_sequence_type: jet_ak4
+      weight: 1.0
+      max_train_events: 100000
+      max_val_events: 100000
+  parquet_files_test_per_class:
+    ggHbb:
+      paths: ${oc.env:ORBIT_MANIFEST_DIR}/ggHbb_test.txt
+      eval_sequence_type: jet_ak8
+      eval_min_pt: 250
+      max_test_events: 10000
+    minbias:
+      paths: ${oc.env:ORBIT_MANIFEST_DIR}/minbias_test.txt
+      eval_sequence_type: jet_ak4
+      max_test_events: 10000
+
+trainer:
+  max_epochs: 30
+  enable_checkpointing: true
+
+model:
+  model_kwargs:
+    input_dim: 4
+
+extras:
+  enforce_tags: false
+  print_config: true

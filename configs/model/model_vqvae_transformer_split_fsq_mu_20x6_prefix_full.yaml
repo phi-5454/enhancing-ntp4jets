@@ -1,0 +1,12 @@
+defaults:
+  - model_vqvae_transformer_split_fsq_mu_20x6
+  - _self_
+
+# Ratio-one control for direct prefix masking. No valid latent is dropped.
+model_kwargs:
+  latent_sequence_compression:
+    enabled: true
+    ratio: 1.0
+    min_tokens: 1
+    rounding: ceil
+    mode: direct_prefix_masking

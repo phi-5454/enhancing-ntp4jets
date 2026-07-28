@@ -1,0 +1,26 @@
+# @package _global_
+
+defaults:
+  - orbit_optuna_loss_weight_base
+  - override /model: model_vqvae_transformer_split_fsq_mu_16x3
+  - _self_
+
+task_name: orbit_optuna_lr_fsq_mu_16x3
+tags: ["orbit", "particle", "ggHbb", "minbias", "optuna", "learning_rate", "fsq", "16x3", "l2"]
+
+# One scalar Optuna variable keeps the one-cycle schedule shape fixed while
+# scanning lower FSQ learning-rate regimes.
+lr_scale: 1.0
+
+model:
+  optimizer:
+    lr: ${eval:'0.0005 * ${lr_scale}'}
+  scheduler:
+    initial_lr: ${eval:'0.0005 * ${lr_scale}'}
+    max_lr: ${eval:'0.001 * ${lr_scale}'}
+    final_lr: ${eval:'0.0003 * ${lr_scale}'}
+
+optuna:
+  target_trials: 16
+  search_space:
+    lr_scale: {type: float, low: 0.001, high: 1.0, log: true}

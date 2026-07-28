@@ -1,0 +1,27 @@
+# @package _global_
+
+defaults:
+  - override /feature_dict: feature_dict_orbit_absolute.yaml
+  - override /data: orbit_downstream_paired.yaml
+  - override /model: model_orbit_event_classifier.yaml
+  - override /callbacks: orbit_classifier_callbacks.yaml
+  - override /logger: csv.yaml
+  - override /trainer: gpu.yaml
+  - _self_
+
+project_name: orbit-downstream-event-classifier
+task_name: orbit_downstream_event_classifier
+tags: [orbit, downstream, classifier, five-class]
+train: true
+test: true
+
+trainer:
+  min_epochs: 1
+  max_epochs: 50
+  enable_progress_bar: true
+  num_sanity_val_steps: 0
+  deterministic: true
+
+extras:
+  enforce_tags: false
+  print_config: true

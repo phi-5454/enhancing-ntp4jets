@@ -1,0 +1,8 @@
+defaults:
+  - model_vqvae_transformer_split_fsq_mu_21x3
+  - _self_
+
+model_kwargs:
+  latent_dim: 3
+  split_quantizer_cfg:
+    bypass_single_branch_projection: true

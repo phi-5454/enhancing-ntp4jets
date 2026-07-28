@@ -1,0 +1,14 @@
+defaults:
+  - model_vqvae_transformer
+  - _self_
+
+# Quantize only the leading ceil(N / 2) encoder latents while reconstructing
+# the original full-length particle sequence.
+model_kwargs:
+  causal_decoder: false
+  latent_sequence_compression:
+    enabled: true
+    ratio: 0.5
+    min_tokens: 1
+    rounding: ceil
+    mode: direct_prefix_masking

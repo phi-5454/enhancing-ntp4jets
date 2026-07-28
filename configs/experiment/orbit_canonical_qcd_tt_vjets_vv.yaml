@@ -1,0 +1,113 @@
+# @package _global_
+
+defaults:
+  - override /feature_dict: feature_dict_orbit_absolute.yaml
+  - override /data: orbit_canonical.yaml
+  - override /model: model_vqvae_transformer.yaml
+  - override /callbacks: orbit_plotting_callbacks.yaml
+  - override /logger: csv.yaml
+  - override /trainer: gpu.yaml
+  - _self_
+
+project_name: orbit-canonical-qcd-tt-vjets-vv
+task_name: orbit_canonical_qcd_tt_vjets_vv
+tags: [orbit, canonical, QCD, tt, VJets, VV, particle]
+train: true
+test: true
+
+data:
+  process_catalog:
+    QCD_HT50tobb: {train_val: "${oc.env:ORBIT_MANIFEST_DIR}/QCD_HT50tobb_train_val.txt", test: "${oc.env:ORBIT_MANIFEST_DIR}/QCD_HT50tobb_test.txt"}
+    QCD_HT50toInf: {train_val: "${oc.env:ORBIT_MANIFEST_DIR}/QCD_HT50toInf_train_val.txt", test: "${oc.env:ORBIT_MANIFEST_DIR}/QCD_HT50toInf_test.txt"}
+    tt_hadronic: {train_val: "${oc.env:ORBIT_MANIFEST_DIR}/tt0123j_5f_ckm_LO_MLM_hadronic_train_val.txt", test: "${oc.env:ORBIT_MANIFEST_DIR}/tt0123j_5f_ckm_LO_MLM_hadronic_test.txt"}
+    tt_leptonic: {train_val: "${oc.env:ORBIT_MANIFEST_DIR}/tt0123j_5f_ckm_LO_MLM_leptonic_train_val.txt", test: "${oc.env:ORBIT_MANIFEST_DIR}/tt0123j_5f_ckm_LO_MLM_leptonic_test.txt"}
+    tt_semileptonic: {train_val: "${oc.env:ORBIT_MANIFEST_DIR}/tt0123j_5f_ckm_LO_MLM_semiLeptonic_train_val.txt", test: "${oc.env:ORBIT_MANIFEST_DIR}/tt0123j_5f_ckm_LO_MLM_semiLeptonic_test.txt"}
+    WJetsToLNu: {train_val: "${oc.env:ORBIT_MANIFEST_DIR}/WJetsToLNu_13TeV-madgraphMLM-pythia8_train_val.txt", test: "${oc.env:ORBIT_MANIFEST_DIR}/WJetsToLNu_13TeV-madgraphMLM-pythia8_test.txt"}
+    WJetsToQQ: {train_val: "${oc.env:ORBIT_MANIFEST_DIR}/WJetsToQQ_13TeV-madgraphMLM-pythia8_train_val.txt", test: "${oc.env:ORBIT_MANIFEST_DIR}/WJetsToQQ_13TeV-madgraphMLM-pythia8_test.txt"}
+    DYJetsToLL: {train_val: "${oc.env:ORBIT_MANIFEST_DIR}/DYJetsToLL_13TeV-madgraphMLM-pythia8_train_val.txt", test: "${oc.env:ORBIT_MANIFEST_DIR}/DYJetsToLL_13TeV-madgraphMLM-pythia8_test.txt"}
+    ZJetsTobb: {train_val: "${oc.env:ORBIT_MANIFEST_DIR}/ZJetsTobb_13TeV-madgraphMLM-pythia8_train_val.txt", test: "${oc.env:ORBIT_MANIFEST_DIR}/ZJetsTobb_13TeV-madgraphMLM-pythia8_test.txt"}
+    ZJetsTocc: {train_val: "${oc.env:ORBIT_MANIFEST_DIR}/ZJetsTocc_13TeV-madgraphMLM-pythia8_train_val.txt", test: "${oc.env:ORBIT_MANIFEST_DIR}/ZJetsTocc_13TeV-madgraphMLM-pythia8_test.txt"}
+    ZJetsToQQ: {train_val: "${oc.env:ORBIT_MANIFEST_DIR}/ZJetsToQQ_13TeV-madgraphMLM-pythia8_train_val.txt", test: "${oc.env:ORBIT_MANIFEST_DIR}/ZJetsToQQ_13TeV-madgraphMLM-pythia8_test.txt"}
+    ZJetsTovv: {train_val: "${oc.env:ORBIT_MANIFEST_DIR}/ZJetsTovv_13TeV-madgraphMLM-pythia8_train_val.txt", test: "${oc.env:ORBIT_MANIFEST_DIR}/ZJetsTovv_13TeV-madgraphMLM-pythia8_test.txt"}
+    WW_hadronic: {train_val: "${oc.env:ORBIT_MANIFEST_DIR}/WW_hadronic_train_val.txt", test: "${oc.env:ORBIT_MANIFEST_DIR}/WW_hadronic_test.txt"}
+    WW_leptonic: {train_val: "${oc.env:ORBIT_MANIFEST_DIR}/WW_leptonic_train_val.txt", test: "${oc.env:ORBIT_MANIFEST_DIR}/WW_leptonic_test.txt"}
+    WW_semileptonic: {train_val: "${oc.env:ORBIT_MANIFEST_DIR}/WW_semileptonic_train_val.txt", test: "${oc.env:ORBIT_MANIFEST_DIR}/WW_semileptonic_test.txt"}
+    WZ_hadronic: {train_val: "${oc.env:ORBIT_MANIFEST_DIR}/WZ_hadronic_train_val.txt", test: "${oc.env:ORBIT_MANIFEST_DIR}/WZ_hadronic_test.txt"}
+    WZ_leptonic: {train_val: "${oc.env:ORBIT_MANIFEST_DIR}/WZ_leptonic_train_val.txt", test: "${oc.env:ORBIT_MANIFEST_DIR}/WZ_leptonic_test.txt"}
+    WZ_semileptonic: {train_val: "${oc.env:ORBIT_MANIFEST_DIR}/WZ_semileptonic_train_val.txt", test: "${oc.env:ORBIT_MANIFEST_DIR}/WZ_semileptonic_test.txt"}
+    ZZ_hadronic: {train_val: "${oc.env:ORBIT_MANIFEST_DIR}/ZZ_hadronic_train_val.txt", test: "${oc.env:ORBIT_MANIFEST_DIR}/ZZ_hadronic_test.txt"}
+    ZZ_leptonic: {train_val: "${oc.env:ORBIT_MANIFEST_DIR}/ZZ_leptonic_train_val.txt", test: "${oc.env:ORBIT_MANIFEST_DIR}/ZZ_leptonic_test.txt"}
+    ZZ_semileptonic: {train_val: "${oc.env:ORBIT_MANIFEST_DIR}/ZZ_semileptonic_train_val.txt", test: "${oc.env:ORBIT_MANIFEST_DIR}/ZZ_semileptonic_test.txt"}
+    ggHbb: {test: "${oc.env:ORBIT_MANIFEST_DIR}/ggHbb_test.txt"}
+
+  train_event_budget: 200000
+  val_event_budget: 200000
+  train_val_processes:
+    QCD_HT50tobb: {paths: "${data.process_catalog.QCD_HT50tobb.train_val}", group: QCD}
+    QCD_HT50toInf: {paths: "${data.process_catalog.QCD_HT50toInf.train_val}", group: QCD}
+    tt_hadronic: {paths: "${data.process_catalog.tt_hadronic.train_val}", group: tt}
+    tt_leptonic: {paths: "${data.process_catalog.tt_leptonic.train_val}", group: tt}
+    tt_semileptonic: {paths: "${data.process_catalog.tt_semileptonic.train_val}", group: tt}
+    WJetsToLNu: {paths: "${data.process_catalog.WJetsToLNu.train_val}", group: VJets}
+    WJetsToQQ: {paths: "${data.process_catalog.WJetsToQQ.train_val}", group: VJets}
+    DYJetsToLL: {paths: "${data.process_catalog.DYJetsToLL.train_val}", group: VJets}
+    ZJetsTobb: {paths: "${data.process_catalog.ZJetsTobb.train_val}", group: VJets}
+    ZJetsTocc: {paths: "${data.process_catalog.ZJetsTocc.train_val}", group: VJets}
+    ZJetsToQQ: {paths: "${data.process_catalog.ZJetsToQQ.train_val}", group: VJets}
+    ZJetsTovv: {paths: "${data.process_catalog.ZJetsTovv.train_val}", group: VJets}
+    WW_hadronic: {paths: "${data.process_catalog.WW_hadronic.train_val}", group: VV}
+    WW_leptonic: {paths: "${data.process_catalog.WW_leptonic.train_val}", group: VV}
+    WW_semileptonic: {paths: "${data.process_catalog.WW_semileptonic.train_val}", group: VV}
+    WZ_hadronic: {paths: "${data.process_catalog.WZ_hadronic.train_val}", group: VV}
+    WZ_leptonic: {paths: "${data.process_catalog.WZ_leptonic.train_val}", group: VV}
+    WZ_semileptonic: {paths: "${data.process_catalog.WZ_semileptonic.train_val}", group: VV}
+    ZZ_hadronic: {paths: "${data.process_catalog.ZZ_hadronic.train_val}", group: VV}
+    ZZ_leptonic: {paths: "${data.process_catalog.ZZ_leptonic.train_val}", group: VV}
+    ZZ_semileptonic: {paths: "${data.process_catalog.ZZ_semileptonic.train_val}", group: VV}
+
+  test_suites:
+    training_like:
+      # Total across all canonical training-like processes.
+      event_budget: 10000
+      processes:
+        QCD_HT50tobb: {paths: "${data.process_catalog.QCD_HT50tobb.test}", group: QCD}
+        QCD_HT50toInf: {paths: "${data.process_catalog.QCD_HT50toInf.test}", group: QCD}
+        tt_hadronic: {paths: "${data.process_catalog.tt_hadronic.test}", group: tt}
+        tt_leptonic: {paths: "${data.process_catalog.tt_leptonic.test}", group: tt}
+        tt_semileptonic: {paths: "${data.process_catalog.tt_semileptonic.test}", group: tt}
+        WJetsToLNu: {paths: "${data.process_catalog.WJetsToLNu.test}", group: VJets}
+        WJetsToQQ: {paths: "${data.process_catalog.WJetsToQQ.test}", group: VJets}
+        DYJetsToLL: {paths: "${data.process_catalog.DYJetsToLL.test}", group: VJets}
+        ZJetsTobb: {paths: "${data.process_catalog.ZJetsTobb.test}", group: VJets}
+        ZJetsTocc: {paths: "${data.process_catalog.ZJetsTocc.test}", group: VJets}
+        ZJetsToQQ: {paths: "${data.process_catalog.ZJetsToQQ.test}", group: VJets}
+        ZJetsTovv: {paths: "${data.process_catalog.ZJetsTovv.test}", group: VJets}
+        WW_hadronic: {paths: "${data.process_catalog.WW_hadronic.test}", group: VV}
+        WW_leptonic: {paths: "${data.process_catalog.WW_leptonic.test}", group: VV}
+        WW_semileptonic: {paths: "${data.process_catalog.WW_semileptonic.test}", group: VV}
+        WZ_hadronic: {paths: "${data.process_catalog.WZ_hadronic.test}", group: VV}
+        WZ_leptonic: {paths: "${data.process_catalog.WZ_leptonic.test}", group: VV}
+        WZ_semileptonic: {paths: "${data.process_catalog.WZ_semileptonic.test}", group: VV}
+        ZZ_hadronic: {paths: "${data.process_catalog.ZZ_hadronic.test}", group: VV}
+        ZZ_leptonic: {paths: "${data.process_catalog.ZZ_leptonic.test}", group: VV}
+        ZZ_semileptonic: {paths: "${data.process_catalog.ZZ_semileptonic.test}", group: VV}
+    tt_vs_gghbb:
+      # Total across tt subprocesses and ggHbb, not per process.
+      event_budget: 10000
+      processes:
+        tt_hadronic: {paths: "${data.process_catalog.tt_hadronic.test}", group: tt}
+        tt_leptonic: {paths: "${data.process_catalog.tt_leptonic.test}", group: tt}
+        tt_semileptonic: {paths: "${data.process_catalog.tt_semileptonic.test}", group: tt}
+        ggHbb: {paths: "${data.process_catalog.ggHbb.test}", group: ggHbb}
+
+trainer:
+  max_epochs: 30
+  enable_checkpointing: true
+
+model:
+  model_kwargs:
+    input_dim: 4
+
+extras:
+  enforce_tags: false
+  print_config: true

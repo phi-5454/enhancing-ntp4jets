@@ -1,0 +1,7 @@
+defaults:
+  - model_vqvae_transformer_split_fsq_mu_20x6_prefix_half
+  - _self_
+
+# Isolates half-length prefix masking from the FSQ discretization.
+model_kwargs:
+  quantization_enabled: false

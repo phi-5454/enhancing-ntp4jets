@@ -4,6 +4,7 @@ defaults:
   - lr_monitor.yaml
   - orbit_plotting_callback.yaml
   - token_export_callback.yaml
+  - gradient_monitoring.yaml
   - _self_
 
 model_summary:
@@ -15,3 +16,13 @@ model_checkpoint:
   save_top_k: 1
   save_last: true
   auto_insert_metric_name: false
+
+gradient_monitoring:
+  logging_interval: 10
+  depth: 0
+  prefix: grad/global
+
+gradient_monitoring_global:
+  logging_interval: 50
+  depth: 2
+  prefix: grad/components

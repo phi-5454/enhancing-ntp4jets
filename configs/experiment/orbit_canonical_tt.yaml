@@ -1,0 +1,66 @@
+# @package _global_
+
+defaults:
+  - override /feature_dict: feature_dict_orbit_absolute.yaml
+  - override /data: orbit_canonical.yaml
+  - override /model: model_vqvae_transformer.yaml
+  - override /callbacks: orbit_plotting_callbacks.yaml
+  - override /logger: csv.yaml
+  - override /trainer: gpu.yaml
+  - _self_
+
+project_name: orbit-canonical-tt
+task_name: orbit_canonical_tt
+tags: [orbit, canonical, tt, particle]
+train: true
+test: true
+
+data:
+  process_catalog:
+    tt_hadronic:
+      train_val: "${oc.env:ORBIT_MANIFEST_DIR}/tt0123j_5f_ckm_LO_MLM_hadronic_train_val.txt"
+      test: "${oc.env:ORBIT_MANIFEST_DIR}/tt0123j_5f_ckm_LO_MLM_hadronic_test.txt"
+    tt_leptonic:
+      train_val: "${oc.env:ORBIT_MANIFEST_DIR}/tt0123j_5f_ckm_LO_MLM_leptonic_train_val.txt"
+      test: "${oc.env:ORBIT_MANIFEST_DIR}/tt0123j_5f_ckm_LO_MLM_leptonic_test.txt"
+    tt_semileptonic:
+      train_val: "${oc.env:ORBIT_MANIFEST_DIR}/tt0123j_5f_ckm_LO_MLM_semiLeptonic_train_val.txt"
+      test: "${oc.env:ORBIT_MANIFEST_DIR}/tt0123j_5f_ckm_LO_MLM_semiLeptonic_test.txt"
+    ggHbb:
+      test: "${oc.env:ORBIT_MANIFEST_DIR}/ggHbb_test.txt"
+
+  train_event_budget: 200000
+  val_event_budget: 200000
+  train_val_processes:
+    tt_hadronic: {paths: "${data.process_catalog.tt_hadronic.train_val}", group: tt}
+    tt_leptonic: {paths: "${data.process_catalog.tt_leptonic.train_val}", group: tt}
+    tt_semileptonic: {paths: "${data.process_catalog.tt_semileptonic.train_val}", group: tt}
+
+  test_suites:
+    training_like:
+      # Total across all tt subprocesses; keep validation bottlenecks modest.
+      event_budget: 10000
+      processes:
+        tt_hadronic: {paths: "${data.process_catalog.tt_hadronic.test}", group: tt}
+        tt_leptonic: {paths: "${data.process_catalog.tt_leptonic.test}", group: tt}
+        tt_semileptonic: {paths: "${data.process_catalog.tt_semileptonic.test}", group: tt}
+    tt_vs_gghbb:
+      # Total across tt subprocesses and ggHbb, not per process.
+      event_budget: 10000
+      processes:
+        tt_hadronic: {paths: "${data.process_catalog.tt_hadronic.test}", group: tt}
+        tt_leptonic: {paths: "${data.process_catalog.tt_leptonic.test}", group: tt}
+        tt_semileptonic: {paths: "${data.process_catalog.tt_semileptonic.test}", group: tt}
+        ggHbb: {paths: "${data.process_catalog.ggHbb.test}", group: ggHbb}
+
+trainer:
+  max_epochs: 30
+  enable_checkpointing: true
+
+model:
+  model_kwargs:
+    input_dim: 4
+
+extras:
+  enforce_tags: false
+  print_config: true

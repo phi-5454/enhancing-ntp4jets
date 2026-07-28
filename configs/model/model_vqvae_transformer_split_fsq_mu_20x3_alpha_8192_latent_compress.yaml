@@ -1,0 +1,22 @@
+defaults:
+  - model_vqvae_transformer_split
+  - _self_
+
+model_kwargs:
+  causal_decoder: false
+  latent_sequence_compression:
+    enabled: true
+    ratio: 0.5
+    min_tokens: 1
+    rounding: ceil
+    mode: learned_cross_attention
+    num_heads: ${model.model_kwargs.num_heads}
+    dropout_rate: 0.0
+    query_residual: true
+  split_quantizer_cfg:
+    branch_order: ["mu", "alpha"]
+    branch_loss_weights:
+      mu: 0.25
+      alpha: 1.0
+    fsq_mu_levels: [20, 20, 20]
+    fsq_alpha_levels: [8192]

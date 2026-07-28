@@ -1,0 +1,8 @@
+defaults:
+  - model_vqvae_transformer
+  - _self_
+
+# Full-length continuous autoencoder. This retains the VQ transformer's encoder,
+# latent projection, and decoder, while bypassing discrete quantization.
+model_kwargs:
+  quantization_enabled: false

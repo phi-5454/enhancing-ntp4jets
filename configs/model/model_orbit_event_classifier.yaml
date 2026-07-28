@@ -1,0 +1,11 @@
+_target_: gabbro.models.orbit_event_classifier.OrbitEventClassifierLightning
+
+input_dim: 12
+hidden_dim: 128
+num_heads: 8
+num_enc_blocks: 4
+num_class_blocks: 2
+dropout_rate: 0.1
+learning_rate: 0.001
+weight_decay: 0.0001
+

@@ -92,7 +92,7 @@ model:
     in_out_proj_cfg: null
     latent_proj_cfg: null
     input_features_dict: ${feature_dict} # this is the feature dict to use, e.g. feature_dict_kin_massless.yaml
-    causal_decoder: true # if true, the decoder uses a causal mask
+    causal_decoder: false # if true, the decoder uses a causal mask
     conditional_dim: 0
     hidden_dim: 128
     latent_dim: 8

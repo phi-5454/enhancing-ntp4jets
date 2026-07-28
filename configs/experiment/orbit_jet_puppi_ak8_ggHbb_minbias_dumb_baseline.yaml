@@ -1,0 +1,23 @@
+# @package _global_
+
+defaults:
+  - orbit_jet_puppi_ak8_ggHbb_minbias
+  - override /model: model_dumb_quantization_baseline
+  - override /logger: wandb.yaml
+  - _self_
+
+task_name: orbit_particle_ggHbb_minbias_dumb_quantization_baseline
+tags: ["orbit", "particle", "ggHbb", "minbias", "dumb-baseline"]
+
+train: false
+test: true
+test_without_checkpoint: true
+
+logger:
+  wandb:
+    project: orbit-tokenizer
+    group: orbit_dumb_quantization_baseline
+    name: ${task_name}
+
+model:
+  model_kwargs: null

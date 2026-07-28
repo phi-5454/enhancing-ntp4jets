@@ -1,5 +1,8 @@
 # @package _global_
 
+pid:
+  enabled: false
+
 defaults:
   - orbit_parquet_smoke.yaml
   - override /data: orbit_jet_parquet.yaml

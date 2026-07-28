@@ -1,0 +1,15 @@
+defaults:
+  - model_vqvae_transformer_split_fsq_mu_20x6
+  - _self_
+
+# Half-length compressed latent sequence with the ordinary FSQ bottleneck.
+model_kwargs:
+  latent_sequence_compression:
+    enabled: true
+    ratio: 0.5
+    min_tokens: 1
+    rounding: ceil
+    mode: learned_cross_attention
+    num_heads: ${model.model_kwargs.num_heads}
+    dropout_rate: 0.0
+    query_residual: true

@@ -1,0 +1,37 @@
+# @package _global_
+
+defaults:
+  - _self_
+
+optimized_metric: val_metrics/loss_reco
+test: false
+tags: ["orbit", "particle", "ggHbb", "minbias", "optuna", "loss_weight", "l2"]
+
+trainer:
+  max_epochs: 6
+  enable_checkpointing: false
+  num_sanity_val_steps: 0
+
+callbacks:
+  model_checkpoint: null
+  orbit_plotting_callback: null
+  token_export_callback: null
+  gradient_monitoring: null
+
+extras:
+  enforce_tags: false
+  print_config: false
+
+model:
+  max_validation_plot_batches: 0
+  max_test_plot_batches: 0
+  model_kwargs:
+    causal_decoder: false
+    reconstruction_loss: l2
+
+optuna:
+  study_name: ${task_name}
+  direction: minimize
+  seed: 12345
+  target_trials: 12
+  search_space: {}

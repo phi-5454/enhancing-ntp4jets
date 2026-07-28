@@ -1,0 +1,22 @@
+# @package _global_
+
+defaults:
+  - orbit_canonical_qcd_tt_vjets_vv
+  - _self_
+
+project_name: orbit-canonical-qcd-tt-vjets-vv-full-event
+task_name: orbit_canonical_qcd_tt_vjets_vv_full_event
+tags: [orbit, canonical, QCD, tt, VJets, VV, particle-full, full-event]
+
+data:
+  sequence_type: particle_full
+  max_sequence_length: 500
+  batch_size: 16
+
+model:
+  model_kwargs:
+    max_sequence_len: 500
+
+trainer:
+  accumulate_grad_batches: 16
+

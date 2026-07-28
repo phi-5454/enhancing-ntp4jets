@@ -1,0 +1,28 @@
+_target_: gabbro.models.vqvae.DumbQuantizationBaselineLightning
+pid_cfg: ${pid}
+
+# Uniform quantization levels for transformed eta, phi, and log-pT.
+q_levels: [21, 21, 21]
+binning: uniform
+
+# eta is stored as Eta / 3 in OrbitPreprocessor.  Uniform bins therefore span
+# physical eta in [-4.5, 4.5]. This setting is ignored by binning=learned,
+# which fits eta bin centers from valid training particles.
+eta_range: [-1.5, 1.5]
+
+# phi is reconstructed from cos/sin with atan2, quantized, then converted back
+# to cos/sin for the usual ORBIT metrics and plots.
+phi_range: [-3.141592653589793, 3.141592653589793]
+
+# If null, estimate from valid train particles before testing.
+pt_range: null
+pt_range_num_train_batches: 1000
+
+# Used only for binning=learned. Learned bins are fitted from valid train
+# particles before test evaluation and then held fixed for the test loop.
+learned_bins_num_train_batches: 1000
+learned_bins_max_iters: 100
+learned_bins_tol: 1.0e-6
+
+max_validation_plot_batches: 0
+max_test_plot_batches: null

@@ -1,0 +1,11 @@
+defaults:
+  - model_vqvae_transformer_split
+  - _self_
+
+# Single-branch FSQ control with 20^6 = 64M possible scalar-code combinations.
+model_kwargs:
+  split_quantizer_cfg:
+    branch_order: ["mu"]
+    branch_loss_weights:
+      mu: 0.25
+    fsq_mu_levels: [20, 20, 20, 20, 20, 20]

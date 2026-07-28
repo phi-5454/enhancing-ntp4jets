@@ -1,0 +1,19 @@
+# @package _global_
+
+defaults:
+  - orbit_optuna_loss_weight_base
+  - override /model: model_vqvae_transformer
+  - _self_
+
+task_name: orbit_optuna_loss_weight_vq_ste_2048
+
+model:
+  model_kwargs:
+    alpha: 10
+    vq_kwargs:
+      num_codes: 2048
+      rotation_tr: false
+
+optuna:
+  search_space:
+    model.model_kwargs.alpha: {type: float, low: 0.1, high: 30.0, log: true}

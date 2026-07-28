@@ -61,7 +61,7 @@ model:
     input_dim: 4
 
 # model_vqvae_transformer.yaml provides production defaults:
-# hidden_dim=128, latent_dim=8, num_blocks=4, num_heads=8, codebook=512, causal_decoder=true.
+# hidden_dim=128, latent_dim=8, num_blocks=4, num_heads=8, codebook=512, causal_decoder=false.
 # To use the split quantizer instead, pass: model=model_vqvae_transformer_split
 
 extras:

@@ -1,0 +1,19 @@
+_target_: gabbro.data.orbit_parquet.CanonicalOrbitParquetDataModule
+
+train_val_processes: null
+test_suites: null
+train_event_budget: 200000
+val_event_budget: 200000
+
+sequence_type: particle
+pid_cfg: ${pid}
+max_sequence_length: null
+batch_size: 256
+num_workers: 4
+train_fraction: 0.8
+split_seed: 42
+shuffle_train: true
+shuffle_seed: 42
+mask_column: null
+mask_min_value: null
+min_pt: null

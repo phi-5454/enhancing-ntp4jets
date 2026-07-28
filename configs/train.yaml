@@ -45,6 +45,7 @@ train: true
 # lightning chooses best weights based on the metric specified in checkpoint callback
 test: true
 test_only_on_rank_zero: true
+test_without_checkpoint: false
 
 # simply provide checkpoint path to resume training
 ckpt_path: null
@@ -65,3 +66,11 @@ output_dir_resub: null
 # this is only used for bookkeeping. It doesn't do anything with the code itself, but
 # can be used with the `dataset_size_to_dataset_kwargs` function from gabbro.utils.submit_tools
 dataset_size_id: null
+
+# Eight-way particle PID reconstruction. Set pid.enabled=false to recover the
+# legacy four-kinematic-feature data/model/loss path.
+pid:
+  enabled: true
+  num_classes: 8
+  loss_weight: 1.0
+  class_names: [neutral_hadron, photon, negative_hadron, positive_hadron, electron, positron, muon, antimuon]

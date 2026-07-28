@@ -1,0 +1,17 @@
+# @package _global_
+
+defaults:
+  - orbit_downstream_event_classifier
+  - _self_
+
+project_name: orbit-downstream-event-classifier-full-event
+task_name: orbit_downstream_event_classifier_full_event
+tags: [orbit, downstream, classifier, five-class, particle-full, full-event]
+
+data:
+  batch_size: 16
+  max_sequence_length: 500
+
+trainer:
+  accumulate_grad_batches: 16
+

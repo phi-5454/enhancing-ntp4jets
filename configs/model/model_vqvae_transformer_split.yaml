@@ -11,6 +11,8 @@ model_kwargs:
   num_heads: 8
   alpha: 5
   reconstruction_loss: l2
+  pid_cfg: ${pid}
+  causal_decoder: false
   old_transformer_implementation: false
   vq_kwargs:
     num_codes: 2048
@@ -23,6 +25,8 @@ model_kwargs:
     replace_freq: 20
     dim: -1
     rotation_tr: False
+    rotation_scale_min: null
+    rotation_scale_max: null
 
   # mode: "vq" uses the single VectorQuant layer.
   # mode: "split" uses Phi -> branch quantizers -> Psi.
@@ -68,6 +72,8 @@ model_kwargs:
       replace_freq: 0
       dim: -1
       rotation_tr: False
+      rotation_scale_min: null
+      rotation_scale_max: null
 
 optimizer:
   _target_: torch.optim.AdamW

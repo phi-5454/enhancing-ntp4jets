@@ -11,7 +11,8 @@ model_kwargs:
   num_heads: 8
   alpha: 10
   reconstruction_loss: l2
-  causal_decoder: true
+  pid_cfg: ${pid}
+  causal_decoder: false
   old_transformer_implementation: false
   transformer_cfg:
     attn_cfg:
@@ -38,6 +39,8 @@ model_kwargs:
     replace_freq: 500
     dim: -1
     rotation_tr: False
+    rotation_scale_min: null
+    rotation_scale_max: null
   split_quantizer_cfg: null
 
 optimizer:

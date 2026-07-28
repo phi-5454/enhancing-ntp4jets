@@ -86,10 +86,9 @@ def get_submodules(module: nn.Module, depth: int = 1, prefix="") -> list:
 class LogGradNorm(Callback):
     """Logs the gradient norm."""
 
-    def __init__(self, logging_interval: int = 1, depth: int = -1, prefix: str = "grad"):
+    def __init__(self, logging_interval: int = 1, depth: int = -1):
         self.logging_interval = logging_interval
         self.depth = depth
-        self.prefix = prefix
 
     def on_before_optimizer_step(
         self, _trainer: Trainer, pl_module: LightningModule, _optimizer: Optimizer
@@ -99,23 +98,15 @@ class LogGradNorm(Callback):
             for subname, module in sub_modules:
                 grad = gradient_norm(module)
                 if grad > 0:
-                    metric_name = subname or "total"
-                    pl_module.log(
-                        f"{self.prefix}/{metric_name}",
-                        grad,
-                        on_step=True,
-                        on_epoch=False,
-                        prog_bar=False,
-                    )
+                    self.log("grad/" + subname, grad)
 
 
 class LogWeightNorm(Callback):
     """Logs the weight norm."""
 
-    def __init__(self, logging_interval: int = 1, depth: int = -1, prefix: str = "weight"):
+    def __init__(self, logging_interval: int = 1, depth: int = -1):
         self.logging_interval = logging_interval
         self.depth = depth
-        self.prefix = prefix
 
     def on_before_optimizer_step(
         self, _trainer: Trainer, pl_module: LightningModule, _optimizer: Optimizer
@@ -124,11 +115,4 @@ class LogWeightNorm(Callback):
             sub_modules = get_submodules(pl_module, self.depth)
             for subname, module in sub_modules:
                 weight = weight_norm(module)
-                metric_name = subname or "total"
-                pl_module.log(
-                    f"{self.prefix}/{metric_name}",
-                    weight,
-                    on_step=True,
-                    on_epoch=False,
-                    prog_bar=False,
-                )
+                self.log("weight/" + subname, weight)

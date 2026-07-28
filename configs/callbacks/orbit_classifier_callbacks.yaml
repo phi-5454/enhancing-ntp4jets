@@ -1,0 +1,17 @@
+defaults:
+  - model_checkpoint.yaml
+  - early_stopping.yaml
+
+model_checkpoint:
+  monitor: val_macro_auroc
+  mode: max
+  save_top_k: 1
+  filename: "orbit_classifier_epoch_{epoch:03d}"
+
+early_stopping:
+  monitor: val_macro_auroc
+  mode: max
+  patience: 10
+  min_delta: 0.0001
+  strict: true
+

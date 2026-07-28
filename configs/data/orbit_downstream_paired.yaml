@@ -1,0 +1,8 @@
+_target_: gabbro.data.orbit_downstream.PairedOrbitDataModule
+
+data_dir: ${oc.env:ORBIT_DOWNSTREAM_DIR}
+train_representation: original
+batch_size: null
+num_workers: 4
+max_sequence_length: null
+seed: ${seed}
