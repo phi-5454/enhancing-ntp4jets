@@ -16,18 +16,25 @@ def _write(output_path: pathlib.Path, table: pa.Table, n_events: int) -> None:
 
 def generate_particle_parquet(output_path: pathlib.Path, n_events: int = 200, seed: int = 0):
     rng = np.random.default_rng(seed)
-    eta, phi, pt, puppiw = [], [], [], []
+    eta, phi, pt, puppiw, pid, charge = [], [], [], [], [], []
+    pid_values = np.asarray([130, 22, -211, 211, 11, -11, 13, -13], dtype=np.int32)
+    charge_values = np.asarray([0, 0, -1, 1, -1, 1, -1, 1], dtype=np.int8)
     for _ in range(n_events):
         n = int(rng.integers(5, 30))
         eta.append(rng.uniform(-3.0, 3.0, n).astype(np.float32))
         phi.append(rng.uniform(-np.pi, np.pi, n).astype(np.float32))
         pt.append(rng.exponential(10.0, n).astype(np.float32))
         puppiw.append(rng.uniform(0.0, 1.0, n).astype(np.float32))
+        pid_indices = rng.integers(0, len(pid_values), n)
+        pid.append(pid_values[pid_indices])
+        charge.append(charge_values[pid_indices])
     table = pa.table({
         "L1T_PUPPIPart_Eta": pa.array(eta, type=pa.list_(pa.float32())),
         "L1T_PUPPIPart_Phi": pa.array(phi, type=pa.list_(pa.float32())),
         "L1T_PUPPIPart_PT": pa.array(pt, type=pa.list_(pa.float32())),
         "L1T_PUPPIPart_PuppiW": pa.array(puppiw, type=pa.list_(pa.float32())),
+        "L1T_PUPPIPart_PID": pa.array(pid, type=pa.list_(pa.int32())),
+        "L1T_PUPPIPart_Charge": pa.array(charge, type=pa.list_(pa.int8())),
     })
     _write(output_path, table, n_events)
 
