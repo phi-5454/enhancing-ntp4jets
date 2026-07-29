@@ -3,12 +3,19 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from pathlib import Path
+from collections import defaultdict
+from collections.abc import Callable
 
 import matplotlib.pyplot as plt
 import numpy as np
-import torch
+try:
+    import torch
+except ImportError:
+    torch = None
 from matplotlib.lines import Line2D
+from matplotlib.colors import Normalize
 
 import gabbro.plotting.utils as plot_utils
 
@@ -21,16 +28,19 @@ CODEBOOK_FAMILY_COLORS = {
     "fsq": plot_utils.DEFAULT_COLORS[0],
     "vq_ste": plot_utils.DEFAULT_COLORS[1],
     "vq_rotation": plot_utils.DEFAULT_COLORS[2],
+    "kmeans": plot_utils.DEFAULT_COLORS[3],
 }
 CODEBOOK_FAMILY_MARKERS = {
     "fsq": "o",
     "vq_ste": "s",
     "vq_rotation": "^",
+    "kmeans": "D",
 }
 CODEBOOK_FAMILY_LABELS = {
     "fsq": "FSQ",
     "vq_ste": "VQ STE",
     "vq_rotation": "VQ rotation",
+    "kmeans": "FAISS k-means",
 }
 SCATTER_MARKERS = ("o", "s", "^", "D", "v", "P", "X", "*", "<", ">", "h", "8")
 HISTOGRAM_LINEWIDTH = 2
@@ -51,6 +61,33 @@ RATIO_WSPACE = 0.25
 ATTENTION_DELTA_FIGSIZE = (6, 5)
 ATTENTION_MAP_FIGSIZE = (5, 4)
 SCATTER_FIGSIZE = (8, 6)
+TRANSFORMED_FEATURE_RANGES = {
+    "L1T_PUPPIPart_Eta": (-1.5, 1.5),
+    "L1T_PUPPIPart_Phi_cos": (-1.0, 1.0),
+    "L1T_PUPPIPart_Phi_sin": (-1.0, 1.0),
+    "L1T_PUPPIPart_PT": (-2.0, 5.0),
+}
+TRANSFORMED_RESIDUAL_RANGE = (-0.5, 0.5)
+PHYSICAL_FEATURE_RANGES = {
+    "pT": (0.0, 2_000.0),
+    "Eta": (-4.5, 4.5),
+    "Phi": (-math.pi, math.pi),
+}
+PHYSICAL_RESIDUAL_RANGES = {
+    "pT": (-50.0, 50.0),
+    "Eta": (-2.0, 2.0),
+    "Phi": (-1.0, 1.0),
+}
+MINBIAS_PHYSICAL_FEATURE_RANGES = {
+    **PHYSICAL_FEATURE_RANGES,
+    "pT": (0.0, 200.0),
+}
+ENERGY_RANGE = (0.0, 2_500.0)
+ENERGY_RESIDUAL_RANGE = (-50.0, 50.0)
+MISSING_ET_RANGE = (0.0, 1_000.0)
+JET_MASS_RANGE = (0.0, 1_800.0)
+JET_MASS_RESIDUAL_RANGE = (-50.0, 50.0)
+TAU32_RESIDUAL_RANGE = (-0.4, 0.4)
 KINEMATIC_LABELS = {
     "pT": r"$p_T$",
     "Eta": r"$\eta$",
@@ -97,6 +134,413 @@ def _finite_pair(original: np.ndarray, reconstructed: np.ndarray) -> tuple[np.nd
     return original[finite], reconstructed[finite]
 
 
+def _linear_bins(value_range: tuple[float, float], n_bins: int) -> np.ndarray:
+    return np.linspace(value_range[0], value_range[1], n_bins + 1)
+
+
+def _clip_to_hist_range(values: np.ndarray, bins: np.ndarray) -> np.ndarray:
+    values = np.asarray(values)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return values
+    return np.clip(values, bins[0], bins[-1])
+
+
+def _density_hist_with_overflow(values: np.ndarray, bins: np.ndarray) -> np.ndarray:
+    counts, _ = np.histogram(_clip_to_hist_range(values, bins), bins=bins, density=True)
+    return np.nan_to_num(counts, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _counts_hist_with_overflow(values: np.ndarray, bins: np.ndarray) -> np.ndarray:
+    counts, _ = np.histogram(_clip_to_hist_range(values, bins), bins=bins)
+    return counts
+
+
+def _angular_difference(reconstructed: np.ndarray, original: np.ndarray) -> np.ndarray:
+    return np.remainder(reconstructed - original + np.pi, 2 * np.pi) - np.pi
+
+
+def event_marker_areas(pt: np.ndarray) -> np.ndarray:
+    """Return bounded, logarithmically scaled event-display marker areas."""
+    log_pt = np.log10(np.clip(np.asarray(pt, dtype=float), 0.5, 500.0))
+    fraction = (log_pt - np.log10(0.5)) / (np.log10(500.0) - np.log10(0.5))
+    return 18.0 + 220.0 * np.clip(fraction, 0.0, 1.0)
+
+
+def plot_particle_count_histograms(
+    counts_by_class: dict[str, np.ndarray],
+):
+    """Plot combined and class-wise model-input particle multiplicities."""
+    counts_by_class = {
+        str(name): np.asarray(values, dtype=np.int64)
+        for name, values in counts_by_class.items()
+        if len(values)
+    }
+    if not counts_by_class:
+        raise ValueError("counts_by_class must contain at least one event")
+
+    plot_utils.set_mpl_style()
+    combined = np.concatenate(list(counts_by_class.values()))
+    maximum = int(np.max(combined)) if len(combined) else 0
+    bins = np.arange(maximum + 2, dtype=np.float64) - 0.5
+    figure, axes = plt.subplots(1, 2, figsize=(14, 5), constrained_layout=True)
+
+    axes[0].hist(
+        combined,
+        bins=bins,
+        histtype="step",
+        linewidth=HISTOGRAM_LINEWIDTH,
+        color=ORIGINAL_COLOR,
+        label=f"All classes (n={len(combined):,})",
+    )
+    axes[0].set_title("Joint training sample")
+    axes[0].legend(prop={"size": 9})
+
+    for index, (class_name, values) in enumerate(counts_by_class.items()):
+        axes[1].hist(
+            values,
+            bins=bins,
+            histtype="step",
+            linewidth=HISTOGRAM_LINEWIDTH,
+            color=RUN_COLORS[index % len(RUN_COLORS)],
+            label=f"{class_name} (n={len(values):,})",
+        )
+    axes[1].set_title("Training sample by class")
+    axes[1].legend(prop={"size": 9})
+
+    for axis in axes:
+        axis.set_xlabel("Input particles per event")
+        axis.set_ylabel("Events")
+        axis.grid(alpha=0.25)
+    return figure
+
+
+def reconstruction_loss_metrics(
+    original: np.ndarray,
+    reconstructed: np.ndarray,
+    mask: np.ndarray,
+    reconstruction_loss: str,
+) -> dict[str, float]:
+    """Compute the model's masked reconstruction reductions on NumPy arrays."""
+    if reconstruction_loss not in {"l1", "l2"}:
+        raise ValueError(f"Unknown reconstruction_loss={reconstruction_loss!r}")
+    valid_particles = np.clip(np.sum(mask), a_min=1, a_max=None)
+    valid_values = valid_particles * original.shape[-1]
+    delta = (reconstructed - original) * mask[..., None]
+    l2 = float(np.sum(delta**2) / valid_particles)
+    l1 = float(np.sum(np.abs(delta)) / valid_particles)
+    l2_per_value = float(np.sum(delta**2) / valid_values)
+    l1_per_value = float(np.sum(np.abs(delta)) / valid_values)
+    return {
+        "loss_reco": l1 if reconstruction_loss == "l1" else l2,
+        "loss_reco_l1": l1,
+        "loss_reco_l2": l2,
+        "loss_reco_l1_per_value": l1_per_value,
+        "loss_reco_l2_per_value": l2_per_value,
+    }
+
+
+@dataclass(frozen=True)
+class CodeBranchSpec:
+    """Mixed-radix metadata needed to unpack one quantizer branch."""
+
+    name: str
+    num_codes: int
+    levels: tuple[int, ...] | None = None
+    component_names: tuple[str, ...] | None = None
+
+
+def _metric_name(value: str) -> str:
+    return value.replace("/", "_").replace(" ", "_")
+
+
+def _empirical_entropy_bits(values: np.ndarray) -> tuple[float, int]:
+    values = np.asarray(values).reshape(-1)
+    if values.size == 0:
+        return 0.0, 0
+    _, counts = np.unique(values, return_counts=True)
+    probabilities = counts.astype(np.float64) / counts.sum()
+    entropy = -np.sum(probabilities * np.log2(probabilities))
+    return float(entropy), int(len(counts))
+
+
+def code_entropy_metrics(
+    code_idx: np.ndarray,
+    code_mask: np.ndarray,
+    input_mask: np.ndarray,
+    num_codes: int | None,
+    branch_specs: tuple[CodeBranchSpec, ...] = (),
+) -> dict[str, float | int | None]:
+    """Compute sparse marginal entropy and length-aware rate metrics."""
+    codes = np.asarray(code_idx)
+    latent_mask = np.asarray(code_mask, dtype=bool)
+    particle_mask = np.asarray(input_mask, dtype=bool)
+    if codes.ndim == latent_mask.ndim + 1 and codes.shape[-1] == 1:
+        codes = codes[..., 0]
+    if codes.shape != latent_mask.shape:
+        raise ValueError(
+            f"code_idx and code_mask must match, got {codes.shape} and {latent_mask.shape}"
+        )
+    if particle_mask.ndim != 2 or particle_mask.shape[0] != latent_mask.shape[0]:
+        raise ValueError("input_mask must have one row per event")
+
+    valid_codes = codes[latent_mask].astype(np.int64, copy=False)
+    if np.any(valid_codes < 0):
+        raise ValueError("Valid token IDs must be non-negative")
+    if num_codes is not None and np.any(valid_codes >= int(num_codes)):
+        raise ValueError("Valid token IDs must be smaller than num_codes")
+    entropy, active_codes = _empirical_entropy_bits(valid_codes)
+    n_events = int(latent_mask.shape[0])
+    n_latent_tokens = int(latent_mask.sum())
+    n_input_particles = int(particle_mask.sum())
+    mean_latent_tokens = n_latent_tokens / max(n_events, 1)
+    mean_input_particles = n_input_particles / max(n_events, 1)
+    effective_token_ratio = n_latent_tokens / max(n_input_particles, 1)
+
+    fixed_bits_per_token = None
+    normalized_entropy = None
+    fraction_of_fixed_width = None
+    utilization = None
+    total_codebook_size = None
+    if num_codes is not None:
+        total_codebook_size = int(num_codes)
+        if total_codebook_size < 1:
+            raise ValueError("num_codes must be positive")
+        fixed_bits_per_token = int(total_codebook_size - 1).bit_length()
+        utilization = active_codes / total_codebook_size
+        if total_codebook_size > 1:
+            normalized_entropy = entropy / math.log2(total_codebook_size)
+        if fixed_bits_per_token > 0:
+            fraction_of_fixed_width = entropy / fixed_bits_per_token
+
+    metrics: dict[str, float | int | None] = {
+        "metrics/active_codes_total": active_codes,
+        "metrics/utilization_total": utilization,
+        "metrics/total_codebook_size": total_codebook_size,
+        "metrics/entropy/marginal_bits_per_token": entropy,
+        "metrics/entropy/perplexity": float(2**entropy),
+        "metrics/entropy/normalized_to_log2_codebook": normalized_entropy,
+        "metrics/entropy/fixed_bits_per_token": fixed_bits_per_token,
+        "metrics/entropy/fraction_of_fixed_width": fraction_of_fixed_width,
+        "metrics/rate/mean_latent_tokens_per_event": mean_latent_tokens,
+        "metrics/rate/mean_input_particles_per_event": mean_input_particles,
+        "metrics/rate/effective_token_ratio": effective_token_ratio,
+        "metrics/rate/marginal_bits_per_event": entropy * mean_latent_tokens,
+        "metrics/rate/marginal_bits_per_input_particle": entropy * effective_token_ratio,
+        "metrics/rate/fixed_bits_per_event": (
+            None
+            if fixed_bits_per_token is None
+            else fixed_bits_per_token * mean_latent_tokens
+        ),
+        "metrics/rate/fixed_bits_per_input_particle": (
+            None
+            if fixed_bits_per_token is None
+            else fixed_bits_per_token * effective_token_ratio
+        ),
+        "metrics/rate/sample_events": n_events,
+        "metrics/rate/sample_latent_tokens": n_latent_tokens,
+        "metrics/rate/sample_input_particles": n_input_particles,
+    }
+
+    if not branch_specs or valid_codes.size == 0:
+        return metrics
+
+    represented_codes = math.prod(spec.num_codes for spec in branch_specs)
+    if num_codes is not None and represented_codes != int(num_codes):
+        raise ValueError(
+            "Branch codebook product must equal the combined codebook size, got "
+            f"{represented_codes} and {num_codes}"
+        )
+
+    branch_entropy_sum = 0.0
+    component_entropy_sum = 0.0
+    packed_residual = valid_codes.copy()
+    for branch_spec in branch_specs:
+        if branch_spec.num_codes < 1:
+            raise ValueError(f"Branch {branch_spec.name!r} must have at least one code")
+        branch_codes = packed_residual % branch_spec.num_codes
+        packed_residual //= branch_spec.num_codes
+        branch_entropy, _ = _empirical_entropy_bits(branch_codes)
+        branch_name = _metric_name(branch_spec.name)
+        metrics[f"metrics/entropy/branch/{branch_name}/bits_per_token"] = branch_entropy
+        branch_entropy_sum += branch_entropy
+
+        if branch_spec.levels is None:
+            metrics[
+                f"metrics/entropy/component/{branch_name}/code/bits_per_token"
+            ] = branch_entropy
+            component_entropy_sum += branch_entropy
+            continue
+
+        if branch_spec.component_names is not None and (
+            len(branch_spec.component_names) != len(branch_spec.levels)
+        ):
+            raise ValueError(
+                f"Branch {branch_spec.name!r} component names and levels must match"
+            )
+        represented_branch_codes = math.prod(branch_spec.levels)
+        if represented_branch_codes != branch_spec.num_codes:
+            raise ValueError(
+                f"Branch {branch_spec.name!r} levels represent "
+                f"{represented_branch_codes} codes, not {branch_spec.num_codes}"
+            )
+        component_residual = branch_codes.copy()
+        for component_index, level in enumerate(branch_spec.levels):
+            if level < 1:
+                raise ValueError(f"FSQ levels must be positive, got {level}")
+            component_codes = component_residual % level
+            component_residual //= level
+            component_entropy, _ = _empirical_entropy_bits(component_codes)
+            component_name = (
+                branch_spec.component_names[component_index]
+                if branch_spec.component_names is not None
+                else f"dim_{component_index}"
+            )
+            component_name = _metric_name(component_name)
+            metrics[
+                f"metrics/entropy/component/{branch_name}/{component_name}/bits_per_token"
+            ] = component_entropy
+            component_entropy_sum += component_entropy
+        if np.any(component_residual != 0):
+            raise ValueError(
+                f"Branch {branch_spec.name!r} codes exceed its FSQ morphology"
+            )
+
+    if np.any(packed_residual != 0):
+        raise ValueError("Packed token IDs exceed the supplied branch morphology")
+
+    metrics["metrics/entropy/branch_sum_marginals_bits_per_token"] = branch_entropy_sum
+    metrics["metrics/entropy/branch_total_correlation_bits_per_token"] = max(
+        branch_entropy_sum - entropy,
+        0.0,
+    )
+    metrics["metrics/entropy/component_sum_marginals_bits_per_token"] = (
+        component_entropy_sum
+    )
+    metrics["metrics/entropy/component_total_correlation_bits_per_token"] = max(
+        component_entropy_sum - entropy,
+        0.0,
+    )
+    return metrics
+
+
+def plot_event_reconstruction_grid(
+    event_groups: list[tuple[str, np.ndarray, np.ndarray, np.ndarray]],
+    events_per_group: int = 3,
+):
+    """Plot matched original/reconstructed particle events in eta--phi space."""
+    if events_per_group < 1:
+        raise ValueError("events_per_group must be positive")
+    if not event_groups:
+        raise ValueError("event_groups must not be empty")
+
+    plot_utils.set_mpl_style()
+    fig, axes = plt.subplots(
+        len(event_groups),
+        events_per_group,
+        figsize=(5.2 * events_per_group, 4.4 * len(event_groups)),
+        squeeze=False,
+        constrained_layout=True,
+        sharex=True,
+        sharey=True,
+    )
+    cmap = plt.get_cmap("viridis")
+    color_norm = Normalize(vmin=np.log10(0.5), vmax=np.log10(500.0), clip=True)
+
+    for row, (group_name, original, reconstructed, mask) in enumerate(event_groups):
+        for column in range(events_per_group):
+            ax = axes[row, column]
+            if column >= original.shape[0]:
+                ax.text(0.5, 0.5, "No event available", ha="center", va="center",
+                        transform=ax.transAxes)
+                ax.set_axis_off()
+                continue
+
+            event_mask = mask[column].astype(bool)
+            original_event = original[column, event_mask]
+            reconstructed_event = reconstructed[column, event_mask]
+            original_finite = np.all(np.isfinite(original_event), axis=1)
+            reconstructed_finite = np.all(np.isfinite(reconstructed_event), axis=1)
+            original_event = original_event[original_finite]
+            reconstructed_event = reconstructed_event[reconstructed_finite]
+
+            if original_event.size:
+                ax.scatter(
+                    original_event[:, 0],
+                    original_event[:, 1],
+                    s=event_marker_areas(original_event[:, 2]),
+                    c=np.log10(np.clip(original_event[:, 2], 0.5, 500.0)),
+                    cmap=cmap,
+                    norm=color_norm,
+                    marker="o",
+                    alpha=0.65,
+                    edgecolors="black",
+                    linewidths=0.3,
+                    zorder=2,
+                )
+            if reconstructed_event.size:
+                ax.scatter(
+                    reconstructed_event[:, 0],
+                    reconstructed_event[:, 1],
+                    s=event_marker_areas(reconstructed_event[:, 2]),
+                    c=np.log10(np.clip(reconstructed_event[:, 2], 0.5, 500.0)),
+                    cmap=cmap,
+                    norm=color_norm,
+                    marker="x",
+                    alpha=0.9,
+                    linewidths=1.0,
+                    zorder=3,
+                )
+
+            ax.set_xlim(*PHYSICAL_FEATURE_RANGES["Eta"])
+            ax.set_ylim(*PHYSICAL_FEATURE_RANGES["Phi"])
+            ax.grid(alpha=0.2)
+            _set_title(ax, f"{group_name} event {column + 1}")
+            if row == len(event_groups) - 1:
+                ax.set_xlabel(r"$\eta$")
+            if column == 0:
+                ax.set_ylabel(r"$\phi$")
+
+    legend_handles = [
+        Line2D(
+            [0],
+            [0],
+            marker="o",
+            markersize=8,
+            linestyle="none",
+            markerfacecolor="grey",
+            markeredgecolor="black",
+            markeredgewidth=0.8,
+            alpha=0.75,
+            label="Original",
+        ),
+        Line2D(
+            [0],
+            [0],
+            marker="x",
+            markersize=9,
+            linestyle="none",
+            color="black",
+            markeredgewidth=1.8,
+            label="Reconstructed",
+        ),
+    ]
+    fig.legend(
+        handles=legend_handles,
+        loc="outside lower center",
+        ncols=2,
+    )
+    colorbar = fig.colorbar(
+        plt.cm.ScalarMappable(norm=color_norm, cmap=cmap),
+        ax=axes,
+        location="right",
+        shrink=0.82,
+        pad=0.02,
+    )
+    colorbar.set_label(r"$\log_{10}(p_{\mathrm{T}} / \mathrm{GeV})$")
+    return fig
+
+
 def _hist_bins(original: np.ndarray, reconstructed: np.ndarray, n_bins: int) -> np.ndarray:
     values = np.concatenate([original, reconstructed])
     values = values[np.isfinite(values)]
@@ -125,25 +569,22 @@ def collect_reconstruction_histograms(
             _masked_values(x_np[..., i], mask_np),
             _masked_values(x_hat_np[..., i], mask_np),
         )
-        bins = _hist_bins(original, reconstructed, n_bins)
-        clean_name = _clean_feature_name(feature_name)
-        histograms[f"{clean_name}_orig_counts"] = np.histogram(
-            original,
-            bins=bins,
-            density=True,
-        )[0]
-        histograms[f"{clean_name}_reco_counts"] = np.histogram(
-            reconstructed,
-            bins=bins,
-            density=True,
-        )[0]
-        histograms[f"{clean_name}_bins"] = bins
-        diff_counts, diff_bins = np.histogram(
-            reconstructed - original,
-            bins=n_bins,
-            density=True,
+        bins = _linear_bins(
+            TRANSFORMED_FEATURE_RANGES.get(feature_name, (-1.0, 1.0)),
+            n_bins,
         )
-        histograms[f"{clean_name}_diff_counts"] = diff_counts
+        clean_name = _clean_feature_name(feature_name)
+        histograms[f"{clean_name}_orig_counts"] = _density_hist_with_overflow(original, bins)
+        histograms[f"{clean_name}_reco_counts"] = _density_hist_with_overflow(
+            reconstructed,
+            bins,
+        )
+        histograms[f"{clean_name}_bins"] = bins
+        diff_bins = _linear_bins(TRANSFORMED_RESIDUAL_RANGE, n_bins)
+        histograms[f"{clean_name}_diff_counts"] = _density_hist_with_overflow(
+            reconstructed - original,
+            diff_bins,
+        )
         histograms[f"{clean_name}_diff_bins"] = diff_bins
     return histograms
 
@@ -302,6 +743,8 @@ def plot_feature_histograms(
         ax.set_xlabel(_feature_label(feature_name))
         ax.set_ylabel("Density")
         ax.legend()
+        if feature_name.lower() in {"pt", "p_t"} or feature_name.endswith("_PT"):
+            ax.set_yscale("log", nonpositive="clip")
     for ax in axes[len(feature_names) :]:
         ax.axis("off")
     fig.tight_layout()
@@ -346,26 +789,17 @@ def _validate_data_level(data_level: str) -> None:
 
 
 def _safe_density_hist(values, bins):
-    counts, _ = np.histogram(values, bins=bins, density=True)
-    return np.nan_to_num(counts, nan=0.0, posinf=0.0, neginf=0.0)
+    return _density_hist_with_overflow(values, bins)
 
 
-def _physical_feature_bins(feature_name: str, original: np.ndarray, reconstructed: np.ndarray):
-    values = np.concatenate([original, reconstructed])
-    values = values[np.isfinite(values)]
-    if values.size == 0:
-        return np.linspace(0.0, 1.0, 50)
-    if feature_name == "pT":
-        min_val = max(float(values.min()), 1e-8)
-        max_val = max(float(values.max()), min_val * 1.01)
-        return np.logspace(np.log10(min_val), np.log10(max_val), 50)
-    min_val = float(values.min())
-    max_val = float(values.max())
-    if min_val == max_val:
-        width = max(abs(min_val) * 0.1, 1e-3)
-        min_val -= width
-        max_val += width
-    return np.linspace(min_val, max_val, 50)
+def _physical_feature_bins(
+    feature_name: str,
+    original: np.ndarray,
+    reconstructed: np.ndarray,
+    feature_ranges: dict[str, tuple[float, float]] | None = None,
+):
+    ranges = feature_ranges or PHYSICAL_FEATURE_RANGES
+    return _linear_bins(ranges.get(feature_name, (0.0, 1.0)), 50)
 
 
 def collect_physical_reconstruction_histograms(
@@ -384,7 +818,20 @@ def collect_physical_reconstruction_histograms(
     reco_jet_etas=(),
     true_jet_phis=(),
     reco_jet_phis=(),
+    unfiltered_true_jet_pts=(),
+    unfiltered_reco_jet_pts=(),
+    unfiltered_true_jet_masses=(),
+    unfiltered_reco_jet_masses=(),
+    unfiltered_true_tau32s=(),
+    unfiltered_reco_tau32s=(),
+    unfiltered_true_jet_etas=(),
+    unfiltered_reco_jet_etas=(),
+    unfiltered_true_jet_phis=(),
+    unfiltered_reco_jet_phis=(),
     data_level: str = "particle",
+    physical_feature_ranges: dict[str, tuple[float, float]] | None = None,
+    missing_et_range: tuple[float, float] = MISSING_ET_RANGE,
+    jet_mass_range: tuple[float, float] = JET_MASS_RANGE,
 ) -> dict[str, np.ndarray]:
     """Collect ORBIT paper-style histograms in physical coordinates.
 
@@ -398,39 +845,81 @@ def collect_physical_reconstruction_histograms(
         true_jet_pts = np.asarray(true_jet_pts)
         reco_jet_pts = np.asarray(reco_jet_pts)
         fractional_diff = (reco_jet_pts - true_jet_pts) / (true_jet_pts + 1e-8)
-        counts, bins = np.histogram(fractional_diff, bins=50, range=(-0.5, 0.5))
-        histograms["jet_pt_resolution_counts"] = counts
+        bins = _linear_bins((-0.5, 0.5), 50)
+        histograms["jet_pt_resolution_counts"] = _counts_hist_with_overflow(
+            fractional_diff,
+            bins,
+        )
         histograms["jet_pt_resolution_bins"] = bins
+
+    if len(unfiltered_true_jet_pts) > 0:
+        unfiltered_true_jet_pts = np.asarray(unfiltered_true_jet_pts)
+        unfiltered_reco_jet_pts = np.asarray(unfiltered_reco_jet_pts)
+        fractional_diff = (
+            unfiltered_reco_jet_pts - unfiltered_true_jet_pts
+        ) / (unfiltered_true_jet_pts + 1e-8)
+        bins = _linear_bins((-0.5, 0.5), 50)
+        histograms["jet_pt_resolution_unfiltered_counts"] = (
+            _counts_hist_with_overflow(fractional_diff, bins)
+        )
+        histograms["jet_pt_resolution_unfiltered_bins"] = bins
 
     if len(true_jet_etas) > 0:
         true_jet_etas = np.asarray(true_jet_etas)
         reco_jet_etas = np.asarray(reco_jet_etas)
         diff = reco_jet_etas - true_jet_etas
-        counts, bins = np.histogram(diff, bins=50)
-        histograms["jet_eta_resolution_counts"] = counts
+        bins = _linear_bins(PHYSICAL_RESIDUAL_RANGES["Eta"], 50)
+        histograms["jet_eta_resolution_counts"] = _counts_hist_with_overflow(diff, bins)
         histograms["jet_eta_resolution_bins"] = bins
+
+    if len(unfiltered_true_jet_etas) > 0:
+        diff = np.asarray(unfiltered_reco_jet_etas) - np.asarray(
+            unfiltered_true_jet_etas
+        )
+        bins = _linear_bins(PHYSICAL_RESIDUAL_RANGES["Eta"], 50)
+        histograms["jet_eta_resolution_unfiltered_counts"] = (
+            _counts_hist_with_overflow(diff, bins)
+        )
+        histograms["jet_eta_resolution_unfiltered_bins"] = bins
 
     if len(true_jet_phis) > 0:
         true_jet_phis = np.asarray(true_jet_phis)
         reco_jet_phis = np.asarray(reco_jet_phis)
-        diff = reco_jet_phis - true_jet_phis
-        counts, bins = np.histogram(diff, bins=50)
-        histograms["jet_phi_resolution_counts"] = counts
+        diff = _angular_difference(reco_jet_phis, true_jet_phis)
+        bins = _linear_bins(PHYSICAL_RESIDUAL_RANGES["Phi"], 50)
+        histograms["jet_phi_resolution_counts"] = _counts_hist_with_overflow(diff, bins)
         histograms["jet_phi_resolution_bins"] = bins
+
+    if len(unfiltered_true_jet_phis) > 0:
+        diff = _angular_difference(
+            np.asarray(unfiltered_reco_jet_phis),
+            np.asarray(unfiltered_true_jet_phis),
+        )
+        bins = _linear_bins(PHYSICAL_RESIDUAL_RANGES["Phi"], 50)
+        histograms["jet_phi_resolution_unfiltered_counts"] = (
+            _counts_hist_with_overflow(diff, bins)
+        )
+        histograms["jet_phi_resolution_unfiltered_bins"] = bins
 
     for i, feature_name in enumerate(feature_names):
         original, reconstructed = _finite_pair(x_np[:, i], x_hat_np[:, i])
-        bins = _physical_feature_bins(feature_name, original, reconstructed)
+        bins = _physical_feature_bins(
+            feature_name,
+            original,
+            reconstructed,
+            feature_ranges=physical_feature_ranges,
+        )
         clean_name = _clean_feature_name(feature_name)
         histograms[f"{clean_name}_orig_counts"] = _safe_density_hist(original, bins)
         histograms[f"{clean_name}_reco_counts"] = _safe_density_hist(reconstructed, bins)
         histograms[f"{clean_name}_bins"] = bins
-        diff_counts, diff_bins = np.histogram(
-            reconstructed - original,
-            bins=50,
-            density=True,
+        diff = (
+            _angular_difference(reconstructed, original)
+            if feature_name == "Phi"
+            else reconstructed - original
         )
-        histograms[f"{clean_name}_diff_counts"] = np.nan_to_num(diff_counts)
+        diff_bins = _linear_bins(PHYSICAL_RESIDUAL_RANGES.get(feature_name, (-1.0, 1.0)), 50)
+        histograms[f"{clean_name}_diff_counts"] = _density_hist_with_overflow(diff, diff_bins)
         histograms[f"{clean_name}_diff_bins"] = diff_bins
 
     energy_orig = x_np[:, 2] * np.cosh(x_np[:, 0])
@@ -439,21 +928,21 @@ def collect_physical_reconstruction_histograms(
     energy_orig = energy_orig[finite_energy]
     energy_reco = energy_reco[finite_energy]
     if energy_orig.size > 0:
-        min_val = max(float(min(energy_orig.min(), energy_reco.min())), 1e-8)
-        max_val = max(float(max(energy_orig.max(), energy_reco.max())), min_val * 1.01)
-        energy_bins = np.logspace(np.log10(min_val), np.log10(max_val), num=50)
+        energy_bins = _linear_bins(ENERGY_RANGE, 50)
         histograms["energy_orig_counts"] = _safe_density_hist(energy_orig, energy_bins)
         histograms["energy_reco_counts"] = _safe_density_hist(energy_reco, energy_bins)
         histograms["energy_bins"] = energy_bins
-        counts, bins = np.histogram(energy_reco - energy_orig, bins=50, density=True)
-        histograms["energy_residuals_counts"] = np.nan_to_num(counts)
-        histograms["energy_residuals_bins"] = bins
+        energy_residual_bins = _linear_bins(ENERGY_RESIDUAL_RANGE, 50)
+        histograms["energy_residuals_counts"] = _density_hist_with_overflow(
+            energy_reco - energy_orig,
+            energy_residual_bins,
+        )
+        histograms["energy_residuals_bins"] = energy_residual_bins
 
     if data_level == "particle" and len(true_missing_ets) > 0:
         true_missing_ets = np.asarray(true_missing_ets)
         reco_missing_ets = np.asarray(reco_missing_ets)
-        max_missing_et = max(float(true_missing_ets.max()), float(reco_missing_ets.max()), 1e-8)
-        missing_et_bins = np.linspace(0, max_missing_et, 50)
+        missing_et_bins = _linear_bins(missing_et_range, 50)
         histograms["missing_et_orig_counts"] = _safe_density_hist(
             true_missing_ets,
             missing_et_bins,
@@ -470,7 +959,7 @@ def collect_physical_reconstruction_histograms(
         true_tau32s = np.asarray(true_tau32s)
         reco_tau32s = np.asarray(reco_tau32s)
 
-        mass_bins = np.linspace(0, 600, 50)
+        mass_bins = _linear_bins(jet_mass_range, 50)
         histograms["jet_mass_orig_counts"] = _safe_density_hist(
             true_jet_masses,
             mass_bins,
@@ -481,19 +970,36 @@ def collect_physical_reconstruction_histograms(
         )
         histograms["jet_mass_bins"] = mass_bins
 
-        mass_diff_bins = np.linspace(-50, 50, 50)
+        mass_diff_bins = _linear_bins(JET_MASS_RESIDUAL_RANGE, 50)
         histograms["jet_mass_diff_counts"] = _safe_density_hist(
             reco_jet_masses - true_jet_masses,
             mass_diff_bins,
         )
         histograms["jet_mass_diff_bins"] = mass_diff_bins
 
-        tau_diff_bins = np.linspace(-0.4, 0.4, 50)
+        tau_diff_bins = _linear_bins(TAU32_RESIDUAL_RANGE, 50)
         histograms["tau32_diff_counts"] = _safe_density_hist(
             reco_tau32s - true_tau32s,
             tau_diff_bins,
         )
         histograms["tau32_diff_bins"] = tau_diff_bins
+
+    if data_level == "particle" and len(unfiltered_true_jet_masses) > 0:
+        unfiltered_true_jet_masses = np.asarray(unfiltered_true_jet_masses)
+        unfiltered_reco_jet_masses = np.asarray(unfiltered_reco_jet_masses)
+        mass_diff_bins = _linear_bins(JET_MASS_RESIDUAL_RANGE, 50)
+        histograms["jet_mass_diff_unfiltered_counts"] = _safe_density_hist(
+            unfiltered_reco_jet_masses - unfiltered_true_jet_masses,
+            mass_diff_bins,
+        )
+        histograms["jet_mass_diff_unfiltered_bins"] = mass_diff_bins
+
+        tau_diff_bins = _linear_bins(TAU32_RESIDUAL_RANGE, 50)
+        histograms["tau32_diff_unfiltered_counts"] = _safe_density_hist(
+            np.asarray(unfiltered_reco_tau32s) - np.asarray(unfiltered_true_tau32s),
+            tau_diff_bins,
+        )
+        histograms["tau32_diff_unfiltered_bins"] = tau_diff_bins
 
     return histograms
 
@@ -587,7 +1093,7 @@ def plot_physical_feature_histograms(
         axis.set_ylabel("Density")
         axis.legend(prop={"size": 10})
         if feature_name == "pT":
-            axis.set_xscale("log")
+            axis.set_yscale("log", nonpositive="clip")
         if axis_idx in ratio_axes:
             _configure_ratio_axis(ratio_axes[axis_idx], xlabel=feature_name)
             axis.tick_params(labelbottom=False)
@@ -637,7 +1143,7 @@ def plot_energy_histograms(
                 label=label,
                 color=color,
             )
-    axes[0].set_xscale("log")
+    axes[0].set_yscale("log", nonpositive="clip")
     _set_title(axes[0], title)
     axes[0].set_xlabel("Energy [GeV]")
     axes[0].set_ylabel("Density")
@@ -672,6 +1178,7 @@ def plot_missing_transverse_energy(histograms: dict[str, np.ndarray]):
     )
     ax.set_xlabel(r"Missing transverse energy $E_T^\mathrm{miss}$ [GeV]")
     ax.set_ylabel("Density")
+    ax.set_yscale("log", nonpositive="clip")
     _set_title(ax, "Missing Transverse Energy")
     ax.legend(prop={"size": 10})
     plt.tight_layout()
@@ -718,10 +1225,10 @@ def plot_paper_kinematic_distributions(
                     label=label,
                     color=color,
                 )
-        if feature_name == "pT":
-            axis.set_xscale("log")
         axis.set_xlabel(feature_label)
         axis.set_ylabel("Density")
+        if feature_name == "pT":
+            axis.set_yscale("log", nonpositive="clip")
         _set_title(axis, f"{feature_label} distribution")
         axis.legend(prop={"size": 10})
 
@@ -780,6 +1287,7 @@ def physical_reconstruction_plots(
     histograms: dict[str, np.ndarray],
     data_level: str = "particle",
     include_all_ratios: bool = False,
+    jet_matching_cut_label: str = r"With $\Delta R$ cutoff",
 ) -> dict[str, object]:
     """Build ORBIT paper and exploratory single-run reconstruction figures."""
     figures = paper_reconstruction_plots(histograms, data_level)
@@ -790,33 +1298,75 @@ def physical_reconstruction_plots(
     if has_pt_res and (has_eta_res or has_phi_res):
         fig, axes = plt.subplots(1, 3, figsize=SUBSTRUCTURE_SIMPLE_FIGSIZE)
         _set_suptitle(fig, "Jet Kinematic Resolution", fontsize=16)
-        _hist_step(axes[0], histograms["jet_pt_resolution_bins"],
-                   histograms["jet_pt_resolution_counts"], color=RESIDUAL_COLOR)
+        _hist_step(
+            axes[0],
+            histograms["jet_pt_resolution_bins"],
+            histograms["jet_pt_resolution_counts"],
+            label=jet_matching_cut_label,
+            color=RESIDUAL_COLOR,
+        )
+        if "jet_pt_resolution_unfiltered_counts" in histograms:
+            _hist_step(
+                axes[0],
+                histograms["jet_pt_resolution_unfiltered_bins"],
+                histograms["jet_pt_resolution_unfiltered_counts"],
+                label=r"No $\Delta R$ cutoff",
+                color=RUN_COLORS[3],
+            )
         axes[0].axvline(0, color=REFERENCE_LINE_COLOR, linestyle=REFERENCE_LINE_STYLE,
                         alpha=REFERENCE_LINE_ALPHA)
         axes[0].set_xlabel(r"$(p_T^\mathrm{reco} - p_T^\mathrm{true}) / p_T^\mathrm{true}$")
         axes[0].set_ylabel("Number of Jets")
         _set_title(axes[0], r"Fractional $p_T$ Resolution")
+        axes[0].legend()
 
         if has_eta_res:
-            _hist_step(axes[1], histograms["jet_eta_resolution_bins"],
-                       histograms["jet_eta_resolution_counts"], color=RESIDUAL_COLOR)
+            _hist_step(
+                axes[1],
+                histograms["jet_eta_resolution_bins"],
+                histograms["jet_eta_resolution_counts"],
+                label=jet_matching_cut_label,
+                color=RESIDUAL_COLOR,
+            )
+            if "jet_eta_resolution_unfiltered_counts" in histograms:
+                _hist_step(
+                    axes[1],
+                    histograms["jet_eta_resolution_unfiltered_bins"],
+                    histograms["jet_eta_resolution_unfiltered_counts"],
+                    label=r"No $\Delta R$ cutoff",
+                    color=RUN_COLORS[3],
+                )
             axes[1].axvline(0, color=REFERENCE_LINE_COLOR, linestyle=REFERENCE_LINE_STYLE,
                             alpha=REFERENCE_LINE_ALPHA)
             axes[1].set_xlabel(r"$\eta^\mathrm{reco} - \eta^\mathrm{true}$")
             axes[1].set_ylabel("Number of Jets")
             _set_title(axes[1], r"$\eta$ Residual")
+            axes[1].legend()
         else:
             axes[1].axis("off")
 
         if has_phi_res:
-            _hist_step(axes[2], histograms["jet_phi_resolution_bins"],
-                       histograms["jet_phi_resolution_counts"], color=RESIDUAL_COLOR)
+            _hist_step(
+                axes[2],
+                histograms["jet_phi_resolution_bins"],
+                histograms["jet_phi_resolution_counts"],
+                label=jet_matching_cut_label,
+                color=RESIDUAL_COLOR,
+            )
+            if "jet_phi_resolution_unfiltered_counts" in histograms:
+                _hist_step(
+                    axes[2],
+                    histograms["jet_phi_resolution_unfiltered_bins"],
+                    histograms["jet_phi_resolution_unfiltered_counts"],
+                    label=r"No $\Delta R$ cutoff",
+                    color=RUN_COLORS[3],
+                )
             axes[2].axvline(0, color=REFERENCE_LINE_COLOR, linestyle=REFERENCE_LINE_STYLE,
                             alpha=REFERENCE_LINE_ALPHA)
             axes[2].set_xlabel(r"$\phi^\mathrm{reco} - \phi^\mathrm{true}$")
             axes[2].set_ylabel("Number of Jets")
             _set_title(axes[2], r"$\phi$ Residual")
+            axes[2].legend()
         else:
             axes[2].axis("off")
 
@@ -824,8 +1374,21 @@ def physical_reconstruction_plots(
         figures["jet_kinematic_resolution"] = fig
     elif has_pt_res:
         fig, ax = plt.subplots(figsize=RESOLUTION_FIGSIZE)
-        _hist_step(ax, histograms["jet_pt_resolution_bins"],
-                   histograms["jet_pt_resolution_counts"], color=RESIDUAL_COLOR)
+        _hist_step(
+            ax,
+            histograms["jet_pt_resolution_bins"],
+            histograms["jet_pt_resolution_counts"],
+            label=jet_matching_cut_label,
+            color=RESIDUAL_COLOR,
+        )
+        if "jet_pt_resolution_unfiltered_counts" in histograms:
+            _hist_step(
+                ax,
+                histograms["jet_pt_resolution_unfiltered_bins"],
+                histograms["jet_pt_resolution_unfiltered_counts"],
+                label=r"No $\Delta R$ cutoff",
+                color=RUN_COLORS[3],
+            )
         ax.axvline(0, color=REFERENCE_LINE_COLOR, linestyle=REFERENCE_LINE_STYLE,
                    alpha=REFERENCE_LINE_ALPHA)
         ax.set_xlabel(
@@ -834,6 +1397,7 @@ def physical_reconstruction_plots(
         )
         ax.set_ylabel("Number of Jets")
         _set_title(ax, "Jet Transverse Momentum Recovery")
+        ax.legend()
         figures["jet_pt_resolution"] = fig
 
     figures["kinematics"] = plot_physical_feature_histograms(
@@ -865,19 +1429,50 @@ def physical_reconstruction_plots(
         _set_title(axes[0], "Jet Mass")
         axes[0].set_xlabel("Jet Mass [GeV]")
         axes[0].set_ylabel("Density")
+        axes[0].set_yscale("log", nonpositive="clip")
         axes[0].legend()
 
+        mass_residual_series = [
+            (
+                histograms["jet_mass_diff_counts"],
+                jet_matching_cut_label,
+                RESIDUAL_COLOR,
+            )
+        ]
+        if "jet_mass_diff_unfiltered_counts" in histograms:
+            mass_residual_series.append(
+                (
+                    histograms["jet_mass_diff_unfiltered_counts"],
+                    r"No $\Delta R$ cutoff",
+                    RUN_COLORS[3],
+                )
+            )
         plot_physical_residual_histogram(
             axes[1],
             histograms["jet_mass_diff_bins"],
-            _single_run_residual_series(histograms["jet_mass_diff_counts"]),
+            mass_residual_series,
             xlabel=r"$m^\mathrm{reco} - m^\mathrm{orig}$ [GeV]",
             title="Jet Mass Residuals",
         )
+        tau_residual_series = [
+            (
+                histograms["tau32_diff_counts"],
+                jet_matching_cut_label,
+                RESIDUAL_COLOR,
+            )
+        ]
+        if "tau32_diff_unfiltered_counts" in histograms:
+            tau_residual_series.append(
+                (
+                    histograms["tau32_diff_unfiltered_counts"],
+                    r"No $\Delta R$ cutoff",
+                    RUN_COLORS[3],
+                )
+            )
         plot_physical_residual_histogram(
             axes[2],
             histograms["tau32_diff_bins"],
-            _single_run_residual_series(histograms["tau32_diff_counts"]),
+            tau_residual_series,
             xlabel=r"$\tau_{32}^\mathrm{reco} - \tau_{32}^\mathrm{orig}$",
             title=r"$\tau_{32}$ Residuals",
         )
@@ -1002,11 +1597,25 @@ def close_figure(fig) -> None:
     plt.close(fig)
 
 
+def _multirun_mplhep():
+    """Apply the shared HEP plotting style used by all multirun figures."""
+    return plot_utils.set_mpl_style()
+
+
 def save_figures(figures: dict[str, object], output_dir: str | Path, suffix: str = "png") -> None:
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     for name, fig in figures.items():
         fig.savefig(output_path / f"{name}.{suffix}", dpi=300, bbox_inches="tight")
+
+
+def _multirun_feature_uses_log_y(feature_name: str) -> bool:
+    lower_name = feature_name.lower()
+    return "energy" in lower_name or "pt" in lower_name or "missing_et" in lower_name
+
+
+def _multirun_feature_uses_log_x(feature_name: str) -> bool:
+    return feature_name in {"physical_pT", "physical_energy"}
 
 
 def plot_multirun_feature_histograms(
@@ -1015,32 +1624,45 @@ def plot_multirun_feature_histograms(
     title: str = "Reconstruction comparison",
 ):
     """Overlay reconstructed feature histograms from several runs."""
-    plot_utils.set_mpl_style()
+    hep = _multirun_mplhep()
     fig, axes = _grid(len(feature_names))
     _set_suptitle(fig, title, fontsize=16)
     reference = runs[0]["histograms"]
     for i, feature_name in enumerate(feature_names):
         ax = axes[i]
         clean_name = _clean_feature_name(feature_name)
-        _hist_fill(
-            ax,
-            reference[f"{clean_name}_bins"],
+        hep.histplot(
             reference[f"{clean_name}_orig_counts"],
+            reference[f"{clean_name}_bins"],
+            ax=ax,
             label="Original",
             color=TRUTH_REFERENCE_COLOR,
+            histtype="fill",
+            alpha=TRUTH_REFERENCE_FILL_ALPHA,
         )
         for j, run in enumerate(runs):
             histograms = run["histograms"]
-            _hist_step(
-                ax,
-                histograms[f"{clean_name}_bins"],
+            hep.histplot(
                 histograms[f"{clean_name}_reco_counts"],
+                histograms[f"{clean_name}_bins"],
+                ax=ax,
                 label=run["label"],
                 color=RUN_COLORS[j % len(RUN_COLORS)],
+                histtype="step",
+                linewidth=HISTOGRAM_LINEWIDTH,
             )
         _set_title(ax, _feature_label(feature_name))
         ax.set_xlabel(_feature_label(feature_name))
         ax.set_ylabel("Density")
+        if _multirun_feature_uses_log_x(feature_name):
+            ax.set_xscale("log")
+            positive_bins = reference[f"{clean_name}_bins"][
+                reference[f"{clean_name}_bins"] > 0
+            ]
+            if positive_bins.size > 0:
+                ax.set_xlim(left=positive_bins[0])
+        if _multirun_feature_uses_log_y(feature_name):
+            ax.set_yscale("log", nonpositive="clip")
         ax.legend(prop={"size": 8})
     for ax in axes[len(feature_names) :]:
         ax.axis("off")
@@ -1054,7 +1676,7 @@ def plot_multirun_residual_histograms(
     title: str = "Reconstruction residual comparison",
 ):
     """Overlay reconstructed-minus-original residuals from several runs."""
-    plot_utils.set_mpl_style()
+    hep = _multirun_mplhep()
     fig, axes = _grid(len(feature_names))
     _set_suptitle(fig, title, fontsize=16)
     for i, feature_name in enumerate(feature_names):
@@ -1062,12 +1684,14 @@ def plot_multirun_residual_histograms(
         clean_name = _clean_feature_name(feature_name)
         for j, run in enumerate(runs):
             histograms = run["histograms"]
-            _hist_step(
-                ax,
-                histograms[f"{clean_name}_diff_bins"],
+            hep.histplot(
                 histograms[f"{clean_name}_diff_counts"],
+                histograms[f"{clean_name}_diff_bins"],
+                ax=ax,
                 label=run["label"],
                 color=RUN_COLORS[j % len(RUN_COLORS)],
+                histtype="step",
+                linewidth=HISTOGRAM_LINEWIDTH,
             )
         ax.axvline(
             0.0,
@@ -1092,31 +1716,93 @@ def plot_multirun_metric(
     title: str,
     log_x: bool = True,
     log_y: bool = False,
+    x_metric: str = "total_codebook_size",
+    xlabel: str = "Total codebook size",
+    reference_fn: Callable[[np.ndarray], np.ndarray] | None = None,
+    reference_label: str | None = None,
+    vertical_reference: float | None = None,
+    vertical_reference_label: str | None = None,
+    horizontal_reference: float | None = None,
+    horizontal_reference_label: str | None = None,
 ):
-    """Plot a scalar metric against total codebook size."""
-    plot_utils.set_mpl_style()
+    """Plot one scalar metric against another, grouped by run family."""
+    _multirun_mplhep()
     usable_records = [
         record
         for record in records
-        if record.get(metric) is not None and record.get("total_codebook_size") is not None
+        if record.get(metric) is not None and record.get(x_metric) is not None
     ]
     if not usable_records:
         return None
 
     fig, ax = plt.subplots(figsize=SCATTER_FIGSIZE)
-    for i, record in enumerate(usable_records):
-        ax.scatter(
-            record["total_codebook_size"],
-            record[metric],
-            label=record["label"],
-            color=RUN_COLORS[i % len(RUN_COLORS)],
-            marker=SCATTER_MARKERS[i % len(SCATTER_MARKERS)],
+    grouped_records = defaultdict(list)
+    for record in usable_records:
+        grouped_records[record.get("plot_family") or record["label"]].append(record)
+
+    for i, (family, family_records) in enumerate(grouped_records.items()):
+        color = RUN_COLORS[i % len(RUN_COLORS)]
+        marker = SCATTER_MARKERS[i % len(SCATTER_MARKERS)]
+        family_records = sorted(
+            family_records,
+            key=lambda record: (record[x_metric], str(record["label"])),
         )
-    if log_x:
+        x_values = [record[x_metric] for record in family_records]
+        y_values = [record[metric] for record in family_records]
+        if len(family_records) > 1:
+            ax.plot(
+                x_values,
+                y_values,
+                color=color,
+                linewidth=1.5,
+                alpha=0.75,
+                label=family,
+            )
+            scatter_label = None
+        else:
+            scatter_label = family
+        ax.scatter(
+            x_values,
+            y_values,
+            label=scatter_label,
+            color=color,
+            marker=marker,
+            zorder=3,
+        )
+    if reference_fn is not None:
+        reference_x = np.asarray(
+            sorted({float(record[x_metric]) for record in usable_records}),
+            dtype=np.float64,
+        )
+        ax.plot(
+            reference_x,
+            reference_fn(reference_x),
+            color=REFERENCE_LINE_COLOR,
+            linestyle=REFERENCE_LINE_STYLE,
+            alpha=REFERENCE_LINE_ALPHA,
+            label=reference_label,
+        )
+    if vertical_reference is not None:
+        ax.axvline(
+            vertical_reference,
+            color=REFERENCE_LINE_COLOR,
+            linestyle=REFERENCE_LINE_STYLE,
+            alpha=REFERENCE_LINE_ALPHA,
+            label=vertical_reference_label,
+        )
+    if horizontal_reference is not None:
+        ax.axhline(
+            horizontal_reference,
+            color=REFERENCE_LINE_COLOR,
+            linestyle=REFERENCE_LINE_STYLE,
+            alpha=REFERENCE_LINE_ALPHA,
+            label=horizontal_reference_label,
+        )
+    if log_x and all(record[x_metric] > 0 for record in usable_records):
         ax.set_xscale("log")
     if log_y and all(record[metric] > 0 for record in usable_records):
         ax.set_yscale("log")
-    ax.set_xlabel("Total codebook size")
+    ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
     _set_title(ax, title)
     ax.legend(prop={"size": 8})
