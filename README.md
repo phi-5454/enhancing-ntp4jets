@@ -1,8 +1,4 @@
-# ORBIT Tokenizer
-
-This repository combines three related codebases:
-
-- the Hydra and Lightning training pipeline from [`enhancing-ntp4jets`](https://github.com/uhh-pd-ml/enhancing-ntp4jets/tree/main);
+# ORBIT TokenizerThis repository combines three related codebases:- the Hydra and Lightning training pipeline from [`enhancing-ntp4jets`](https://github.com/uhh-pd-ml/enhancing-ntp4jets/tree/main);
 - the event-level jet tokenization use case from the [L1T tokenizer repo](https://github.com/philiw/vq-tokenizer-l1t);
 - the parquet loader, split-quantizer architecture, and selected plotting
   conventions used by the current ORBIT tokenization workflow.
@@ -149,6 +145,14 @@ collection before particle padding. `weight` controls train-time class sampling
 when multiple class datasets are interleaved. Event caps are applied after
 object cuts and validation/test event filters.
 
+The three event caps also define split-specific class composition. Set a cap
+to `0` to keep a class in the shared label mapping while disabling it for that
+split. For example, a class with `max_train_events: 0` and
+`max_val_events: 0` can still be evaluated with a positive
+`max_test_events`. Unequal positive caps provide different class ratios for
+training, validation, and testing. The `weight` field controls train-time
+interleaving order; the event caps control how many examples each split uses.
+
 `parquet_files_train_val_per_class` is mutually exclusive with
 `parquet_files_train_val` and explicit `parquet_files_train`/`parquet_files_val`.
 Use `parquet_files_test_per_class` for class-labelled test plots and metrics;
@@ -214,6 +218,21 @@ OUTPUT_DIR=/tmp/enhancing-smoke \
 ```
 
 ### Train with the single VQ quantizer
+
+Particle PID is enabled by default. Raw `L1T_PUPPIPart_PID` and
+`L1T_PUPPIPart_Charge` values are mapped to eight categories (neutral hadron,
+photon, negative/positive hadron, electron/positron, and muon/antimuon). PID is
+provided to the encoder as a one-hot vector and reconstructed with masked
+cross-entropy alongside the four-feature kinematic loss. Disable the complete
+PID path for legacy comparisons with:
+
+```bash
+pid.enabled=false
+```
+
+The PID loss coefficient is configurable through `pid.loss_weight` and defaults
+to `1.0`. Jet-sequence experiments disable PID because their elements are jets,
+not particles.
 
 The following is a runnable starting point for particle tokenization:
 
@@ -287,10 +306,17 @@ branch_loss = sum(per_token_branch_loss * part_mask) / sum(part_mask)
 
 This also covers the "single FSQ branch" scan configs, which are split
 quantizers with `branch_order: ["mu"]`; only the active `mu` branch contributes.
-The FSQ scan configs currently use `5.0` for all configured branch weights, so
-the mu-only FSQ runs use `5.0 * loss_quantizer_mu`, while the inactive `alpha`
-branch does not contribute. The split VQ-mu/FSQ-alpha scan configs use
-`mu: 5.0` and `alpha: 0.25`.
+For one-branch split quantizers, `bypass_single_branch_projection: true` skips
+`Phi` and `Psi` entirely and sends the model latent directly through the active
+branch quantizer. This is only valid when the active branch dimension matches
+`model.model_kwargs.latent_dim`; for example, an FSQ branch with levels
+`[21, 21, 21]` must use `latent_dim: 3`.
+The pure three-dimensional FSQ codebook scans enable this bypass so they match
+the direct encoder-quantizer-decoder structure of the single-VQ scans.
+The FSQ-related Condor scan configs currently use `mu: 0.25` and `alpha: 1.0`
+for branch loss weights. In mu-only FSQ runs this gives
+`0.25 * loss_quantizer_mu`, while the inactive `alpha` branch does not
+contribute. The same branch weights are used by the split VQ-mu/FSQ-alpha scan.
 
 FSQ loss-space caveat: the implementation must not compare the continuous
 latent directly to an integer packed code such as `[0, num_codes)`. That would
@@ -321,6 +347,31 @@ Validation and test logs include both raw and weighted branch terms, for example
 `val_metrics/loss_quantizer_mu`, `val_metrics/loss_quantizer_mu_weighted`,
 `val_metrics/loss_quantizer_alpha`, and
 `val_metrics/loss_quantizer_alpha_weighted`.
+
+### Shorten the transmitted latent sequence
+
+`model.model_kwargs.latent_sequence_compression` supports two experimental
+modes. `learned_cross_attention` uses learned compressor and expander queries.
+`direct_prefix_masking` instead retains the first
+`ceil(number_of_particles * ratio)` encoder latents in each event. It assumes
+the valid input particles form a prefix ordered by descending pT.
+
+In direct-prefix mode, only the retained prefix is passed to the quantizer and
+used for its losses, codebook updates, utilization metrics, and exported token
+mask. Dropped valid positions are zero before quantization and receive learned,
+position-specific mask embeddings before the decoder. The decoder and
+reconstruction loss still use the original full particle mask, so the output
+sequence retains its original length. Supported controls are `ratio` in
+`(0, 1]`, `min_tokens`, and `rounding: ceil`.
+
+The ratio-one direct-prefix mode retains every valid latent and does not use the
+mask embeddings, making it numerically equivalent to the uncompressed direct
+path for the same initialization. The initial half-length comparison can be
+submitted with:
+
+```bash
+condor_submit condor/orbit_fsq_prefix_masking_ablation.sub
+```
 
 To use the L1T-style event representation, replace
 `experiment=orbit_parquet_smoke` with `experiment=orbit_jet_parquet_smoke`.
@@ -416,6 +467,7 @@ trainer.num_sanity_val_steps=0
 | `sequence_type` | Input prefix      | Default length |
 | --------------- | ----------------- | -------------: |
 | `particle`      | `L1T_PUPPIPart`   |            128 |
+| `particle_full` | `L1T_PUPPIPart`   |            500 |
 | `jet_ak4`       | `L1T_JetAK4`      |             14 |
 | `jet_ak8`       | `L1T_JetAK8`      |              7 |
 | `jet_puppi_ak4` | `L1T_JetPuppiAK4` |             14 |
@@ -432,6 +484,12 @@ jet_type_labels: [batch]
 The four features are scaled `eta`, `cos(phi)`, `sin(phi)`, and transformed
 `pT`. Coordinates remain absolute: `eta` and `phi` are not made relative to a
 jet axis.
+
+`particle` keeps the established `PuppiW > 0.05` selection. The additive
+`particle_full` mode applies no PUPPI-weight cut and retains the first 500
+candidates in the stored descending-$p_T$ order. `PuppiW` is not an input or
+reconstruction target, so full-event four-vectors use the stored unweighted
+candidate $p_T$.
 
 ## Repository Structure
 
@@ -495,6 +553,103 @@ arrays are saved under `saved_histograms/`, and compact metrics JSON files land
 under `saved_metrics/`. The same plot images are logged to W&B or Comet when
 those loggers are active.
 
+For multi-class ORBIT runs, the callback writes separate `all`, `ggHbb`, and
+`minbias` artifacts whenever those classes are present in the selected split.
+Each class metrics file includes `loss_reco`, `loss_reco_l1`, `loss_reco_l2`,
+their per-value reductions, `metrics/active_codes_total`, and
+`metrics/utilization_total`. Validation artifacts intentionally use the
+configured bounded plotting sample; test artifacts use the full configured
+test sample by default. Select a class during comparison collection with, for
+example, `--stage test --group ggHbb` or `--stage test --group minbias`.
+
+The same files include sparse empirical token-rate measurements under
+`metrics/entropy/` and `metrics/rate/`. The primary values are marginal entropy
+in bits per latent token, marginal bits per event, and marginal bits per input
+particle. The latter two multiply token entropy by the observed latent length,
+so reduced-sequence models receive the corresponding rate reduction. Split
+quantizers additionally report branch entropy, FSQ scalar-dimension entropy,
+and total correlation. All calculations use the latent `code_mask`; they do
+not require the optional codebook histogram.
+
+These values estimate a static independent-token entropy coder. They do not
+include sequence-conditional probabilities, coder headers, metadata, or an
+actual compressed byte stream. The logged sample event/token counts make the
+bounded validation estimate explicit; use test entropy for model comparison.
+
+### Binary event export
+
+`scripts/export_orbit_event_binaries.py` writes matched, length-prefixed binary
+files for storage-size studies. For each requested test class it writes the
+raw `L1T_PUPPIPart_PT`, `L1T_PUPPIPart_Eta`, and `L1T_PUPPIPart_Phi` values
+directly from parquet, plus the valid quantized token IDs. No model feature
+transformation is applied to the original values, and their source floating
+precision is retained. The checkpoint-defined particle mask, event selection,
+particle order, and sequence cap are applied to both representations (128 for
+legacy particle mode and 500 for full-event mode). Token IDs use
+the narrowest unsigned integer type that can represent the configured
+codebook. Padding is omitted, while a uint32 event length preserves each event
+boundary. Every file embeds a JSON schema; the accompanying `manifest.json`
+records byte sizes, hashes, checkpoint, event selection, particle counts, and
+token counts.
+
+For VQ-STE scan `957029`, process 4 is the 2048-code run. Export 1000 test
+events from each class with:
+
+```bash
+RUN_ROOT=../enhancing_ntp4jets_runs/orbit_vq_ste_scan_957029/orbit-particle-ggHbb-minbias/runs
+RUN_DIR=$(for config in "$RUN_ROOT"/*/config_resolved.yaml; do
+  grep -q '^task_name: orbit_particle_ggHbb_minbias_vq_ste_codes_2048$' "$config" \
+    && dirname "$config"
+done)
+
+conda run -p /eos/home-y/yelberke/conda_condor_orbit_env \
+  python scripts/export_orbit_event_binaries.py \
+  --run-dir "$RUN_DIR" \
+  --output-dir ../enhancing_ntp4jets_runs/orbit_binary_export_957029_4 \
+  --events-per-class 1000 \
+  --device cuda
+```
+
+The original files contain `[PT, Eta, Phi]` exactly as read from parquet. The
+2048-code token files use little-endian uint16 IDs.
+
+### GPU FAISS k-means baseline
+
+`model_faiss_kmeans_baseline` provides a test-only classical baseline that
+fits one centroid dictionary to valid transformed training particles and then
+reconstructs each test particle with its nearest centroid. It uses the same
+`eta/3`, `cos(phi)`, `sin(phi)`, and `log(pT)-1.8` representation and the same
+masked L2 objective as the neural tokenizer. No extra normalization or
+projection onto the phi unit circle is applied.
+
+The fitting sample is capped at one million particles. Per-class particle
+quotas follow the configured train-time class weights, so the default 1:1
+ggHbb/minbias setup contributes 500k particles from each class rather than
+implicitly favoring the class with larger event multiplicity. The fitted
+centroids and metadata are saved under `artifacts/` and uploaded as a W&B
+`codebook` artifact. All normal test plots, class-specific reconstruction
+metrics, utilization, entropy, and effective-rate metrics are reused.
+
+GPU-enabled FAISS is intentionally an optional environment dependency. Verify
+the exact Condor environment before submitting:
+
+```bash
+conda run -p /eos/home-y/yelberke/conda_condor_orbit_env \
+  python -c 'import faiss; print(faiss.__version__, faiss.get_num_gpus())'
+```
+
+The final value must be at least one. The Condor jobs repeat this check and
+fail before reading data if GPU FAISS is unavailable; they never silently use
+CPU clustering.
+
+```bash
+condor_submit condor/orbit_faiss_kmeans_smoke.sub
+condor_submit condor/orbit_faiss_kmeans_scan.sub
+```
+
+The full scan matches the VQ grid from 128 through 16384 centroids and appears
+as the `FAISS k-means` family in multirun scalar plots.
+
 ### Supported loggers
 
 Select a logger with a Hydra override:
@@ -547,6 +702,12 @@ LOG_DIR="$PWD/outputs" uv run --locked python gabbro/train.py -m \
 ```
 
 Each job writes its own plots, compressed histograms, and compact metrics JSON.
+At training start, the ORBIT plotting callback also samples at most 2,048
+training events and writes `plots/train_start_input_particle_multiplicity.png`.
+The figure contains the joint distribution and class-wise overlays of the
+post-selection model-input particle count. Configure this with
+`callbacks.orbit_plotting_callback.train_particle_count_max_events`, or disable
+it with `callbacks.orbit_plotting_callback.include_train_particle_count_histogram=false`.
 After the sweep finishes, aggregate the jobs with:
 
 ```bash
@@ -558,6 +719,79 @@ Use `--stage test` to select test artifacts instead of validation artifacts. By
 default, the script creates `comparisons/<stage>/all/` inside the multirun
 directory. Use `--group <class>` to collect class-specific artifacts, for
 example `--stage test --group ggHbb` or `--stage test --group minbias`.
+To compare arbitrary run output directories instead of a Hydra multirun
+directory, pass them explicitly:
+
+```bash
+uv run --locked python scripts/collect_orbit_multirun.py \
+  --run-dir /path/to/run_a /path/to/run_b /path/to/run_c \
+  --stage test \
+  --group all \
+  --output-dir /path/to/comparison
+```
+
+To set display labels explicitly, use repeatable `--run` entries. The label is
+optional; unlabeled entries fall back to the W&B name, then `task_name`, then the
+directory name:
+
+```bash
+uv run --locked python scripts/collect_orbit_multirun.py \
+  --run /path/to/run_a "FSQ 20x3" \
+  --run /path/to/run_b "VQ rotation 4096" \
+  --run /path/to/run_c \
+  --stage test \
+  --group all \
+  --output-dir /path/to/comparison
+```
+
+To connect points as a family in scalar plots, use repeatable `--family`
+entries. Each family gets a consistent color and its points are connected by a
+line ordered by total codebook size:
+
+```bash
+uv run --locked python scripts/collect_orbit_multirun.py \
+  --family FSQ /path/to/fsq_15x3 /path/to/fsq_20x3 /path/to/fsq_21x3 \
+  --family VQ /path/to/vq_4096 /path/to/vq_8192 \
+  --stage test \
+  --group all \
+  --output-dir /path/to/comparison
+```
+
+Generated comparison plots can also be uploaded to W&B:
+
+```bash
+uv run --locked python scripts/collect_orbit_multirun.py \
+  --family FSQ /path/to/fsq_15x3 /path/to/fsq_20x3 \
+  --family VQ /path/to/vq_4096 /path/to/vq_8192 \
+  --stage test \
+  --group all \
+  --output-dir /path/to/comparison \
+  --wandb-project orbit-tokenizer \
+  --wandb-name fsq_vs_vq_test_comparison \
+  --wandb-group orbit_multirun_comparisons
+```
+
+The particle rate-distortion plot includes a vertical reference at 43
+bits/input particle, representing the original particle encoding. To also show
+the reconstruction error of a continuous autoencoder as a horizontal reference,
+pass its MSE explicitly:
+
+```bash
+uv run --locked python scripts/collect_orbit_multirun.py \
+  --multirun-dir "${LOG_DIR}/orbit-smoke/multiruns/<timestamp>" \
+  --continuous-autoencoder-mse 0.00123
+```
+
+The value must use the same reconstruction-MSE definition and data split as the
+plotted runs. Override the source-size reference with
+`--original-bits-per-input-particle` if the input representation changes.
+
+Each explicit run entry must point at a single Hydra run directory containing
+`.hydra/config.yaml`. The collector first looks for `saved_histograms/` and
+`saved_metrics/` directly under that run directory, then falls back to
+`evaluation/best.ckpt/` and other `evaluation/*/` artifact directories. If
+`--output-dir` is omitted in explicit-run mode, outputs are written under
+`./orbit_run_comparison/<stage>/<group>/`.
 The output directory contains:
 
 ```text
@@ -568,6 +802,12 @@ combined_reconstruction_residuals.png
 codebook_size_vs_mse_total.png
 codebook_size_vs_utilization_total.png
 codebook_size_vs_val_loss.png
+codebook_size_vs_marginal_entropy_bits_per_token.png
+codebook_size_vs_normalized_entropy.png
+codebook_size_vs_marginal_bits_per_event.png
+codebook_size_vs_marginal_bits_per_input_particle.png
+marginal_bits_per_input_particle_vs_reco_mse.png
+marginal_bits_per_event_vs_reco_mse.png
 ```
 
 The collector is adapted from the Phaedra prototype's multirun aggregation logic, but it does
@@ -577,8 +817,139 @@ split-quantizer codebook metadata, then consumes the local
 `saved_histograms/*.npz` and `saved_metrics/*.json` artifacts. It also falls back
 to Lightning CSV metrics for older runs.
 
-W&B sweeps and an Optuna sweeper are possible future additions, but there is no
-checked-in integration for them yet.
+### Native Optuna studies
+
+Optuna studies use the native runner rather than Hydra's sweeper plugin. A
+study owns a resumable SQLite database, one output directory per trial, and a
+report bundle with CSV/JSON, PNG, and interactive HTML plots:
+
+```bash
+CONDA_ENV="${CONDA_ENV:-../conda_condor_orbit_env}"
+conda run --no-capture-output -p "${CONDA_ENV}" python scripts/run_optuna_study.py \
+  --study-root "${LOG_DIR}/optuna/fsq_mu_16x3_lr" \
+  experiment=orbit_jet_puppi_ak8_ggHbb_minbias \
+  hparams_search=orbit_optuna_fsq_mu_16x3_lr \
+  logger=wandb.yaml \
+  data.num_workers=4
+```
+
+Re-run the same command to resume until the configuration's `target_trials`
+count is reached. Regenerate a report without training:
+
+```bash
+CONDA_ENV="${CONDA_ENV:-../conda_condor_orbit_env}"
+conda run --no-capture-output -p "${CONDA_ENV}" python scripts/report_optuna_study.py \
+  "${LOG_DIR}/optuna/fsq_mu_16x3_lr"
+```
+
+The report directory contains `trials.csv`, `best_trial.json`, static PNG
+figures, and an `index.html` linking to interactive Optuna plots. Promote the
+selected parameters into a normal experiment config before using the multirun
+collector for comparisons between studies.
+
+HTCondor jobs use this same environment through `scripts/condor_run_training.sh`.
+Before submitting a native study, ensure `../conda_condor_orbit_env` contains
+the locked Optuna and Plotly versions; the wrapper checks both imports before
+starting a trial.
+
+### Canonical ORBIT datasets
+
+Two additive experiment configs define the standard process mixtures without
+replacing any existing experiment:
+
+- `orbit_canonical_tt` balances the hadronic, leptonic, and semileptonic tt
+  processes.
+- `orbit_canonical_qcd_tt_vjets_vv` first balances QCD, tt, VJets, and VV, then
+  balances the processes within each group. VJets includes W/Z+jets and
+  `DYJetsToLL`; VV includes WW/WZ/ZZ hadronic, leptonic, and semileptonic
+  samples (including `WW_semileptonic`). Photon, gamma+V, triboson, and Higgs
+  samples are intentionally excluded from these four training groups.
+
+Both configs use fixed budgets of 200,000 training and 200,000 validation
+events. The loader splits every `<process>_train_val.txt` manifest
+deterministically at the file level, then applies the group/process quotas to
+each split. Tests are read only from separate `<process>_test.txt` manifests.
+Each named test suite contains 20,000 events:
+
+- `training_like` follows the balanced training mixture.
+- `tt_vs_gghbb` contains 10,000 tt events, balanced over the three tt decay
+  modes, and 10,000 `ggHbb` events.
+
+Create the required disjoint split manifests next to the raw production
+manifests before submitting a canonical run:
+
+```bash
+python scripts/split_orbit_canonical_manifests.py \
+  --manifest-dir /eos/home-y/yelberke/enhancing-ntp4jets/manifests/production_final
+```
+
+The original submit files remain available. Matching additive files end in
+`_canonical.sub` and default to the four-group experiment. For example:
+
+```bash
+condor_submit condor/orbit_vq_ste_scan.sub
+condor_submit condor/orbit_vq_ste_scan_canonical.sub
+condor_submit -append 'CANONICAL_EXPERIMENT=orbit_canonical_tt' \
+  condor/orbit_vq_ste_scan_canonical.sub
+```
+
+All canonical submit files share site settings in
+`condor/orbit_canonical_common.sub`. Their run, W&B, and log names include the
+canonical experiment name, so the two mixtures can be submitted side by side.
+
+
+### Downstream physics-fidelity benchmarks
+
+The additive downstream tools compare paired events before and after a tokenizer encode/decode path. Prepare manifests and export the five-class data with:
+
+```bash
+python scripts/prepare_orbit_downstream_manifests.py --canonical-manifest-dir /path/to/canonical_manifests --output-dir /path/to/downstream_manifests
+python scripts/export_orbit_downstream_events.py --run-dir /path/to/tokenizer_run --manifest-dir /path/to/downstream_manifests --output-dir /path/to/paired_events --device cuda
+```
+
+For an older tokenizer checkpoint without PID inputs, pass `--allow-no-pid`.
+This writes a kinematics-only paired dataset; both original and decoded events
+receive empty PID channels, so their classifier comparison remains matched.
+
+The export contains 200k training, 200k validation, and 20k test events balanced over QCD, tt, VJets, VV, and ggHbb, then over subprocesses. Run the five-seed original/decoded Transformer matrix with:
+
+```bash
+PYTHON_BIN=python ./scripts/run_orbit_classifier_matrix.sh /path/to/paired_events /path/to/classifier_results
+```
+
+For a small end-to-end Condor check of the `957029_5` checkpoint, submit:
+
+```bash
+mkdir -p /eos/user/y/yelberke/enhancing_ntp4jets_runs/condor_logs
+condor_submit condor/orbit_downstream_classifier_957029_5_smoke.sub
+```
+
+It exports 10k balanced events for each split, trains one epoch on the
+original representation, and tests the paired original and decoded versions
+of the same 10k test events.
+
+Evaluate truth-matched resolved AK4 and boosted AK8 Higgs mass fidelity with:
+
+```bash
+python scripts/evaluate_orbit_higgs_mass.py --run-dir /path/to/tokenizer_run --gghbb-test-manifest /path/to/downstream_manifests/ggHbb_test.txt --output-dir /path/to/higgs_mass_results --device cuda
+```
+
+The checkpoint configuration selects 128-particle or 500-particle export and
+Higgs evaluation automatically. For full-event canonical scans and the
+matching classifier matrix, use:
+
+```bash
+./scripts/submit_orbit_canonical_tt_full_event.sh
+./scripts/submit_orbit_canonical_qcd_tt_vjets_vv_full_event.sh
+PYTHON_BIN=python ./scripts/run_orbit_classifier_full_event_matrix.sh /path/to/paired_events /path/to/classifier_results
+python scripts/visualize_orbit_event.py /path/to/events.parquet 0 --mode full-event --output event_full.png
+```
+
+Full-event tokenizer and classifier training use batches of 16 with 16-step
+gradient accumulation. Their submit wrappers request 32 GB of host memory and
+the `nextweek` job flavour; the legacy submit wrappers are unchanged.
+
+Exports record stable event IDs plus checkpoint and manifest hashes, and refuse train/test overlap or non-empty output directories.
 
 ### HTCondor jobs
 
@@ -590,10 +961,17 @@ required on the cluster worker nodes:
 condor/orbit_jet_production_smoke.sub  # one tiny GPU smoke job
 condor/orbit_wandb_logging_smoke.sub   # 10-batch ggHbb/minbias W&B logging smoke
 condor/orbit_vq_codebook_scan.sub      # one GPU job per VQ codebook size
+condor/orbit_continuous_autoencoder_baseline.sub # no-quantization reconstruction ceiling
 condor/orbit_vq_rotation_scan.sub  # rotation-trick VQ diagnostic scan without k-means init
+condor/orbit_vq_rotation_512_guardrail_scan.sub # 512-code rotation-trick guardrail scan
+condor/orbit_faiss_kmeans_smoke.sub # small GPU FAISS fit/test integration check
+condor/orbit_faiss_kmeans_scan.sub  # GPU k-means baseline on the full VQ size grid
 condor/orbit_fsq_codebook_scan.sub     # one GPU job per FSQ split-quantizer setting
 condor/orbit_fsq_l1_codebook_scan.sub  # FSQ split-quantizer scan with L1 reconstruction loss
 condor/orbit_split_vq_mu_fsq_alpha_l1_scan.sub # STE VQ-mu/FSQ-alpha scan with L1 reconstruction loss
+condor/orbit_fsq_noaux_2epoch_scan.sub # 2-epoch FSQ diagnostic with auxiliary loss disabled
+condor/orbit_fsq_l1_noaux_2epoch_scan.sub # 2-epoch L1 FSQ diagnostic with auxiliary loss disabled
+condor/orbit_split_vq_mu_fsq_alpha_l1_noaux_2epoch_scan.sub # 2-epoch mixed VQ/FSQ diagnostic with FSQ alpha loss disabled
 scripts/condor_run_training.sh         # shared Condor executable
 ```
 
@@ -630,6 +1008,16 @@ conda run --no-capture-output -p "$CONDA_ENV" python gabbro/train.py ...
 
 Additional Hydra overrides can be appended to the `arguments` line in the
 submit file.
+
+### Multirun plotting
+
+The multirun comparison collector uses the CMS style and histogram rendering
+from `mplhep`. Install it in the shared Condor environment once before running
+`multirun_suite.sh` or `multirun_suite_selected_splits.sh`:
+
+```bash
+conda install -p /eos/home-y/yelberke/conda_condor_orbit_env -c conda-forge mplhep
+```
 
 ## What Changed
 
