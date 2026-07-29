@@ -23,6 +23,12 @@ SEQUENCE_SCHEMAS = {
         "mask_min_value": 0.05,
         "max_sequence_length": 128,
     },
+    "particle_full": {
+        "prefix": "L1T_PUPPIPart",
+        "mask_column": None,
+        "mask_min_value": 0.0,
+        "max_sequence_length": 500,
+    },
     "jet_ak4": {
         "prefix": "L1T_JetAK4",
         "mask_column": None,
@@ -48,6 +54,28 @@ SEQUENCE_SCHEMAS = {
         "max_sequence_length": 7,
     },
 }
+
+PID_CLASS_NAMES = (
+    "neutral_hadron",
+    "photon",
+    "negative_hadron",
+    "positive_hadron",
+    "electron",
+    "positron",
+    "muon",
+    "antimuon",
+)
+
+
+def map_pdg_charge_to_pid_class(pdg_id, charge):
+    """Map raw PDG IDs and charges to the eight ORBIT hardware PID classes."""
+    pid_class = ak.where(charge < 0, 2, ak.where(charge > 0, 3, 0))
+    pid_class = ak.where(abs(pdg_id) == 22, 1, pid_class)
+    pid_class = ak.where(pdg_id == 11, 4, pid_class)
+    pid_class = ak.where(pdg_id == -11, 5, pid_class)
+    pid_class = ak.where(pdg_id == 13, 6, pid_class)
+    pid_class = ak.where(pdg_id == -13, 7, pid_class)
+    return ak.values_astype(pid_class, np.int64)
 
 
 MANIFEST_SUFFIXES = {".txt", ".list", ".lst"}
@@ -104,7 +132,13 @@ def _dataset_files(paths) -> list[str]:
         return []
     files = []
     for path in paths:
-        files.extend(ds.dataset(path, format="parquet").files)
+        # Manifests normally expand to explicit parquet files. Passing every
+        # one back through pyarrow.dataset needlessly discovers it again; only
+        # directories and other dataset-like paths require Arrow discovery.
+        if Path(path).suffix.lower() in PARQUET_SUFFIXES:
+            files.append(str(path))
+        else:
+            files.extend(ds.dataset(path, format="parquet").files)
     return sorted(set(files))
 
 
@@ -193,10 +227,16 @@ class OrbitParquetDataset(IterableDataset):
         mask_column: Optional[str] = None,
         mask_min_value: Optional[float] = None,
         jet_type_label: int = 0,
+        process_label: int = 0,
+        test_suite_label: int = 0,
         min_pt: Optional[float] = None,
         event_filter_sequence_type: Optional[str] = None,
         event_filter_min_pt: Optional[float] = None,
         max_events: Optional[int] = None,
+        partition_max_events_across_workers: bool = False,
+        return_raw_features: bool = False,
+        return_event_metadata: bool = False,
+        pid_cfg: Optional[Mapping] = None,
     ):
         super().__init__()
         if sequence_type not in SEQUENCE_SCHEMAS:
@@ -219,6 +259,20 @@ class OrbitParquetDataset(IterableDataset):
         schema = SEQUENCE_SCHEMAS[sequence_type]
         self.preprocessor = OrbitPreprocessor(schema["prefix"])
         self.features = list(self.preprocessor.input_features)
+        pid_cfg = {} if pid_cfg is None else dict(pid_cfg)
+        self.pid_enabled = bool(pid_cfg.get("enabled", False))
+        self.pid_num_classes = int(pid_cfg.get("num_classes", len(PID_CLASS_NAMES)))
+        if self.pid_enabled and not sequence_type.startswith("particle"):
+            raise ValueError("PID features are only supported for particle sequence types")
+        if self.pid_enabled and self.pid_num_classes != len(PID_CLASS_NAMES):
+            raise ValueError(
+                f"ORBIT PID mapping has {len(PID_CLASS_NAMES)} classes, "
+                f"got num_classes={self.pid_num_classes}"
+            )
+        self.pid_column = f"{schema['prefix']}_PID" if self.pid_enabled else None
+        self.charge_column = f"{schema['prefix']}_Charge" if self.pid_enabled else None
+        if self.pid_enabled:
+            self.features.extend([self.pid_column, self.charge_column])
         self.mask_column = schema["mask_column"] if mask_column is None else mask_column
         self.mask_min_value = (
             schema["mask_min_value"] if mask_min_value is None else mask_min_value
@@ -232,16 +286,20 @@ class OrbitParquetDataset(IterableDataset):
             if self.event_filter_pt_column not in self.features:
                 self.features.append(self.event_filter_pt_column)
 
-        self.row_groups = []
-        for file_path in parquet_files:
-            parquet_file = pq.ParquetFile(file_path)
-            self.row_groups.extend(
-                (file_path, row_group_idx)
-                for row_group_idx in range(parquet_file.num_row_groups)
-            )
+        # Keep construction cheap.  In particular, do not open every parquet
+        # file here to enumerate row groups: canonical datasets can contain
+        # thousands of files while an event quota may consume only a handful.
+        # Row groups are discovered lazily by each iterator and file scanning
+        # stops as soon as max_events is reached.
+        self.parquet_files = parquet_files
 
         self.sequence_type = sequence_type
         self.output_features = self.preprocessor.output_features
+        self.raw_output_features = [
+            self.preprocessor.pt_column,
+            self.preprocessor.eta_column,
+            self.preprocessor.phi_column,
+        ]
         self.max_sequence_length = (
             schema["max_sequence_length"]
             if max_sequence_length is None
@@ -251,53 +309,98 @@ class OrbitParquetDataset(IterableDataset):
         self.shuffle_row_groups = shuffle_row_groups
         self.shuffle_seed = shuffle_seed
         self.jet_type_label = jet_type_label
+        self.process_label = process_label
+        self.test_suite_label = test_suite_label
         self.min_pt = min_pt
         self.event_filter_min_pt = event_filter_min_pt
-        if max_events is not None and max_events < 1:
-            raise ValueError("max_events must be positive")
+        if max_events is not None and max_events < 0:
+            raise ValueError("max_events must be non-negative")
         self.max_events = max_events
+        self.partition_max_events_across_workers = partition_max_events_across_workers
+        self.return_raw_features = return_raw_features
+        self.return_event_metadata = return_event_metadata
         self._iteration = 0
 
     def __iter__(self):
         yielded_events = 0
         try:
             worker_info = get_worker_info()
-            row_groups = list(self.row_groups)
+            parquet_files = list(self.parquet_files)
             if self.shuffle_row_groups:
                 rng = np.random.default_rng(self.shuffle_seed + self._iteration)
-                rng.shuffle(row_groups)
+                rng.shuffle(parquet_files)
                 self._iteration += 1
-            if worker_info is not None:
-                row_groups = row_groups[worker_info.id :: worker_info.num_workers]
+            iteration_max_events = self.max_events
+            if (
+                iteration_max_events is not None
+                and worker_info is not None
+                and self.partition_max_events_across_workers
+            ):
+                base, remainder = divmod(iteration_max_events, worker_info.num_workers)
+                iteration_max_events = base + int(worker_info.id < remainder)
         except Exception:
             _log_worker_exception("failed during dataset iteration setup")
             raise
 
-        for file_path, row_group_idx in row_groups:
+        row_group_position = 0
+        for file_path in parquet_files:
+            if iteration_max_events is not None and yielded_events >= iteration_max_events:
+                return
             batch_idx = None
+            row_group_idx = None
             try:
                 parquet_file = pq.ParquetFile(file_path)
-                batches = parquet_file.iter_batches(
-                    row_groups=[row_group_idx],
-                    columns=self.features,
-                    batch_size=self.batch_size,
-                    use_threads=True,
-                )
-                for batch_idx, batch in enumerate(batches):
-                    for converted in self._convert_batch(ak.from_arrow(batch)):
-                        if self.max_events is not None:
-                            remaining = self.max_events - yielded_events
-                            if remaining <= 0:
-                                return
-                            batch_events = converted["part_features"].shape[0]
-                            if batch_events > remaining:
-                                converted = {
-                                    key: value[:remaining]
-                                    for key, value in converted.items()
-                                }
-                                batch_events = remaining
-                        yielded_events += converted["part_features"].shape[0]
-                        yield converted
+                row_groups = []
+                file_row_offset = 0
+                for row_group_idx in range(parquet_file.num_row_groups):
+                    row_groups.append((row_group_idx, file_row_offset))
+                    file_row_offset += parquet_file.metadata.row_group(row_group_idx).num_rows
+                if self.shuffle_row_groups:
+                    rng.shuffle(row_groups)
+
+                for row_group_idx, row_group_row_offset in row_groups:
+                    if iteration_max_events is not None and yielded_events >= iteration_max_events:
+                        return
+                    assigned_to_worker = (
+                        worker_info is None
+                        or row_group_position % worker_info.num_workers == worker_info.id
+                    )
+                    row_group_position += 1
+                    if not assigned_to_worker:
+                        continue
+
+                    batches = parquet_file.iter_batches(
+                        row_groups=[row_group_idx],
+                        columns=self.features,
+                        batch_size=self.batch_size,
+                        use_threads=True,
+                    )
+                    batch_row_offset = 0
+                    for batch_idx, batch in enumerate(batches):
+                        batch_rows = np.arange(
+                            row_group_row_offset + batch_row_offset,
+                            row_group_row_offset + batch_row_offset + batch.num_rows,
+                            dtype=np.int64,
+                        )
+                        batch_row_offset += batch.num_rows
+                        for converted in self._convert_batch(
+                            ak.from_arrow(batch),
+                            source_file=file_path,
+                            source_rows=batch_rows,
+                        ):
+                            if iteration_max_events is not None:
+                                remaining = iteration_max_events - yielded_events
+                                if remaining <= 0:
+                                    return
+                                batch_events = converted["part_features"].shape[0]
+                                if batch_events > remaining:
+                                    converted = {
+                                        key: value[:remaining]
+                                        for key, value in converted.items()
+                                    }
+                                    batch_events = remaining
+                            yielded_events += converted["part_features"].shape[0]
+                            yield converted
             except Exception:
                 _log_worker_exception(
                     "failed while reading parquet "
@@ -309,7 +412,12 @@ class OrbitParquetDataset(IterableDataset):
                 )
                 raise
 
-    def _convert_batch(self, batch: ak.Array):
+    def _convert_batch(
+        self,
+        batch: ak.Array,
+        source_file: Optional[str] = None,
+        source_rows: Optional[np.ndarray] = None,
+    ):
         event_selector = ak.ones_like(ak.num(batch[self.preprocessor.pt_column]), dtype=bool)
         if self.event_filter_pt_column is not None:
             filter_pts = batch[self.event_filter_pt_column]
@@ -321,9 +429,20 @@ class OrbitParquetDataset(IterableDataset):
         sequence_mask = ak.ones_like(batch[self.preprocessor.pt_column], dtype=bool)
         if self.min_pt is not None:
             sequence_mask = sequence_mask & (batch[self.preprocessor.pt_column] >= self.min_pt)
-        batch = self.preprocessor.forward(batch)
         if self.mask_column is not None:
             sequence_mask = sequence_mask & (batch[self.mask_column] > self.mask_min_value)
+
+        raw_stacked = None
+        if self.return_raw_features:
+            raw_stacked = ak.concatenate(
+                [
+                    batch[field][sequence_mask][:, :, np.newaxis]
+                    for field in self.raw_output_features
+                ],
+                axis=-1,
+            )
+
+        batch = self.preprocessor.forward(batch)
 
         stacked = ak.concatenate(
             [batch[field][sequence_mask][:, :, np.newaxis] for field in self.output_features],
@@ -335,6 +454,14 @@ class OrbitParquetDataset(IterableDataset):
             return
 
         stacked = stacked[non_empty_events]
+        pid_classes = None
+        if self.pid_enabled:
+            pid_classes = map_pdg_charge_to_pid_class(
+                batch[self.pid_column],
+                batch[self.charge_column],
+            )[sequence_mask][non_empty_events]
+        if raw_stacked is not None:
+            raw_stacked = raw_stacked[non_empty_events][:, : self.max_sequence_length]
         event_lengths = event_lengths[non_empty_events]
         padded = ak.pad_none(stacked, self.max_sequence_length, axis=1, clip=True)
         filled = ak.fill_none(padded, [0.0] * len(self.output_features), axis=1)
@@ -352,11 +479,36 @@ class OrbitParquetDataset(IterableDataset):
             dtype=torch.long,
         )
 
-        yield {
+        converted = {
             "part_features": part_features,
             "part_mask": part_mask,
             "jet_type_labels": jet_type_labels,
+            "process_labels": torch.full(
+                (part_features.shape[0],), self.process_label, dtype=torch.long
+            ),
+            "test_suite_labels": torch.full(
+                (part_features.shape[0],), self.test_suite_label, dtype=torch.long
+            ),
         }
+        if pid_classes is not None:
+            padded_pid = ak.pad_none(pid_classes, self.max_sequence_length, axis=1, clip=True)
+            filled_pid = ak.fill_none(padded_pid, -1, axis=1)
+            converted["part_pid"] = torch.from_numpy(
+                ak.to_numpy(filled_pid).astype(np.int64, copy=False)
+            )
+        if raw_stacked is not None:
+            converted["raw_part_features"] = raw_stacked
+        if self.return_event_metadata:
+            if source_file is None or source_rows is None:
+                raise ValueError("Event metadata requested without source provenance")
+            selected_rows = np.asarray(source_rows)[ak.to_numpy(non_empty_events)]
+            converted["source_files"] = np.full(
+                part_features.shape[0], source_file, dtype=object
+            )
+            converted["source_rows"] = torch.from_numpy(
+                selected_rows.astype(np.int64, copy=False)
+            )
+        yield converted
 
 
 class WeightedClassDataset(IterableDataset):
@@ -441,6 +593,7 @@ class OrbitParquetDataModule(L.LightningDataModule):
         max_train_events_per_class: Optional[dict] = None,
         max_val_events_per_class: Optional[dict] = None,
         max_test_events_per_class: Optional[dict] = None,
+        pid_cfg: Optional[dict] = None,
         **kwargs,
     ):
         super().__init__()
@@ -605,14 +758,19 @@ class OrbitParquetDataModule(L.LightningDataModule):
             for class_name, label in self._class_to_label.items():
                 train_spec = self._class_specs[class_name]
                 test_spec = self._test_class_specs.get(class_name, train_spec)
+                train_enabled = (
+                    train_spec["max_train_events"] != 0 and train_spec["weight"] > 0
+                )
+                val_enabled = train_spec["max_val_events"] != 0
+                test_enabled = test_spec.get("max_test_events") != 0
                 rows.append(
                     split_row(
                         "train",
                         class_name,
                         label,
-                        self._train_files_per_class[class_name],
+                        self._train_files_per_class[class_name] if train_enabled else [],
                         train_spec,
-                        train_spec["max_train_events"],
+                        train_spec["max_train_events"] if train_enabled else 0,
                         self.batch_size_train,
                     )
                 )
@@ -621,9 +779,9 @@ class OrbitParquetDataModule(L.LightningDataModule):
                         "val",
                         class_name,
                         label,
-                        self._val_files_per_class[class_name],
+                        self._val_files_per_class[class_name] if val_enabled else [],
                         train_spec,
-                        train_spec["max_val_events"],
+                        train_spec["max_val_events"] if val_enabled else 0,
                         self.batch_size_val,
                     )
                 )
@@ -632,9 +790,13 @@ class OrbitParquetDataModule(L.LightningDataModule):
                         "test",
                         class_name,
                         label,
-                        self._test_files_per_class.get(class_name, []),
+                        (
+                            self._test_files_per_class.get(class_name, [])
+                            if test_enabled
+                            else []
+                        ),
                         test_spec,
-                        test_spec.get("max_test_events"),
+                        test_spec.get("max_test_events") if test_enabled else 0,
                         self.batch_size_test,
                     )
                 )
@@ -765,6 +927,15 @@ class OrbitParquetDataModule(L.LightningDataModule):
                     f"Unknown eval_sequence_type {eval_sequence_type!r} for class {name!r}. "
                     f"Expected one of {sorted(SEQUENCE_SCHEMAS)}"
                 )
+            for split, max_events in (
+                ("train", max_train_events),
+                ("val", max_val_events),
+                ("test", max_test_events),
+            ):
+                if max_events is not None and int(max_events) < 0:
+                    raise ValueError(
+                        f"max_{split}_events must be non-negative for class {name!r}"
+                    )
             specs[name] = {
                 "paths": paths,
                 "sequence_type": spec_sequence_type,
@@ -809,6 +980,7 @@ class OrbitParquetDataModule(L.LightningDataModule):
             event_filter_sequence_type=event_filter_sequence_type,
             event_filter_min_pt=event_filter_min_pt,
             max_events=max_events,
+            pid_cfg=self.hparams.get("pid_cfg"),
         )
 
     def _loader(self, dataset, persistent_workers: bool = True):
@@ -835,7 +1007,11 @@ class OrbitParquetDataModule(L.LightningDataModule):
                     max_events=self._class_specs[name]["max_train_events"],
                 )
                 for name, label in self._class_to_label.items()
+                if self._class_specs[name]["max_train_events"] != 0
+                and self._class_specs[name]["weight"] > 0
             }
+            if not datasets:
+                raise ValueError("At least one class must be enabled for training")
             return self._loader(
                 WeightedClassDataset(
                     datasets,
@@ -866,7 +1042,10 @@ class OrbitParquetDataModule(L.LightningDataModule):
                     max_events=self._class_specs[name]["max_val_events"],
                 )
                 for name, label in self._class_to_label.items()
+                if self._class_specs[name]["max_val_events"] != 0
             ]
+            if not datasets:
+                raise ValueError("At least one class must be enabled for validation")
             return self._loader(ChainDataset(datasets))
         return self._loader(
             self._dataset(
@@ -893,7 +1072,10 @@ class OrbitParquetDataModule(L.LightningDataModule):
                     max_events=self._test_class_specs[name]["max_test_events"],
                 )
                 for name, label in self._class_to_label.items()
+                if self._test_class_specs[name]["max_test_events"] != 0
             ]
+            if not datasets:
+                raise ValueError("At least one class must be enabled for testing")
             return self._loader(ChainDataset(datasets), persistent_workers=False)
         if not self.parquet_files_test:
             raise ValueError("Provide parquet_files_test from a separate test directory.")
@@ -905,3 +1087,352 @@ class OrbitParquetDataModule(L.LightningDataModule):
             ),
             persistent_workers=False,
         )
+
+
+def balanced_group_process_quotas(
+    process_specs: Mapping[str, Mapping], total_events: int
+) -> dict[str, int]:
+    """Split an event budget evenly by group and then by process.
+
+    Remainders are assigned deterministically in mapping/declaration order.
+    """
+    if total_events < 1:
+        raise ValueError("A balanced event budget must be positive")
+    groups: dict[str, list[str]] = {}
+    for process_name, spec in process_specs.items():
+        group_name = str(spec.get("group", process_name))
+        groups.setdefault(group_name, []).append(str(process_name))
+    if not groups:
+        raise ValueError("At least one process is required for balanced sampling")
+
+    quotas: dict[str, int] = {}
+    group_base, group_remainder = divmod(int(total_events), len(groups))
+    for group_index, process_names in enumerate(groups.values()):
+        group_budget = group_base + int(group_index < group_remainder)
+        process_base, process_remainder = divmod(group_budget, len(process_names))
+        for process_index, process_name in enumerate(process_names):
+            quotas[process_name] = process_base + int(process_index < process_remainder)
+    return quotas
+
+
+class CanonicalOrbitParquetDataModule(L.LightningDataModule):
+    """Group-balanced ORBIT loader with named, independently balanced test suites.
+
+    This additive interface is used by the canonical experiments. The legacy
+    :class:`OrbitParquetDataModule` remains unchanged for existing experiments.
+    """
+
+    def __init__(
+        self,
+        train_val_processes: Mapping[str, Mapping],
+        test_suites: Mapping[str, Mapping],
+        train_event_budget: int = 200_000,
+        val_event_budget: int = 200_000,
+        sequence_type: str = "particle",
+        max_sequence_length: Optional[int] = None,
+        batch_size: int | Mapping[str, int] = 32,
+        num_workers: int = 0,
+        train_fraction: float = 0.8,
+        split_seed: int = 42,
+        shuffle_train: bool = True,
+        shuffle_seed: int = 42,
+        mask_column: Optional[str] = None,
+        mask_min_value: Optional[float] = None,
+        min_pt: Optional[float] = None,
+        pid_cfg: Optional[dict] = None,
+        return_raw_features: bool = False,
+        return_event_metadata: bool = False,
+        **kwargs,
+    ):
+        super().__init__()
+        if sequence_type not in SEQUENCE_SCHEMAS:
+            raise ValueError(
+                f"Unknown sequence_type {sequence_type!r}. "
+                f"Expected one of {sorted(SEQUENCE_SCHEMAS)}"
+            )
+        if isinstance(batch_size, int):
+            self.batch_size_train = self.batch_size_val = self.batch_size_test = batch_size
+        else:
+            required = {"train", "val", "test"}
+            if not required.issubset(batch_size):
+                raise ValueError("batch_size mapping must contain train, val, and test")
+            self.batch_size_train = int(batch_size["train"])
+            self.batch_size_val = int(batch_size["val"])
+            self.batch_size_test = int(batch_size["test"])
+
+        self._train_specs = self._normalize_process_specs(
+            train_val_processes, sequence_type=sequence_type, min_pt=min_pt
+        )
+        if not self._train_specs:
+            raise ValueError("train_val_processes must contain at least one process")
+        self._test_suite_specs: dict[str, dict[str, dict]] = {}
+        self._test_suite_budgets: dict[str, int] = {}
+        for suite_name, suite_value in dict(test_suites or {}).items():
+            if not isinstance(suite_value, Mapping) or "processes" not in suite_value:
+                raise ValueError(
+                    f"Test suite {suite_name!r} must contain a processes mapping"
+                )
+            budget = int(suite_value.get("event_budget", 20_000))
+            self._test_suite_budgets[str(suite_name)] = budget
+            self._test_suite_specs[str(suite_name)] = self._normalize_process_specs(
+                suite_value["processes"], sequence_type=sequence_type, min_pt=min_pt
+            )
+        if not self._test_suite_specs:
+            raise ValueError("test_suites must contain at least one named suite")
+
+        all_specs = list(self._train_specs.values()) + [
+            spec for suite in self._test_suite_specs.values() for spec in suite.values()
+        ]
+        group_names = list(dict.fromkeys(spec["group"] for spec in all_specs))
+        process_names = list(
+            dict.fromkeys(
+                list(self._train_specs)
+                + [name for suite in self._test_suite_specs.values() for name in suite]
+            )
+        )
+        self._group_to_label = {name: index for index, name in enumerate(group_names)}
+        self._process_to_label = {name: index for index, name in enumerate(process_names)}
+        self._test_suite_to_label = {
+            name: index for index, name in enumerate(self._test_suite_specs)
+        }
+
+        self._train_quotas = balanced_group_process_quotas(
+            self._train_specs, int(train_event_budget)
+        )
+        self._val_quotas = balanced_group_process_quotas(
+            self._train_specs, int(val_event_budget)
+        )
+        self._test_quotas = {
+            suite_name: balanced_group_process_quotas(
+                specs, self._test_suite_budgets[suite_name]
+            )
+            for suite_name, specs in self._test_suite_specs.items()
+        }
+
+        self._train_files: dict[str, list[str]] = {}
+        self._val_files: dict[str, list[str]] = {}
+        for process_name, spec in self._train_specs.items():
+            train_files, val_files = deterministic_file_split(
+                spec["paths"], train_fraction=train_fraction, split_seed=split_seed
+            )
+            self._train_files[process_name] = train_files
+            self._val_files[process_name] = val_files
+        self._test_files = {
+            suite_name: {
+                process_name: _dataset_files(spec["paths"])
+                for process_name, spec in specs.items()
+            }
+            for suite_name, specs in self._test_suite_specs.items()
+        }
+
+        self._max_sequence_length = (
+            SEQUENCE_SCHEMAS[sequence_type]["max_sequence_length"]
+            if max_sequence_length is None
+            else int(max_sequence_length)
+        )
+        self.selected_features = OrbitPreprocessor(
+            SEQUENCE_SCHEMAS[sequence_type]["prefix"]
+        ).output_features
+        self.save_hyperparameters()
+        self.hparams["selected_features"] = self.selected_features
+        self.hparams["max_sequence_length"] = self._max_sequence_length
+        # Backward-compatible name consumed by existing callbacks.
+        self.hparams["class_to_label"] = dict(self._group_to_label)
+        self.hparams["group_to_label"] = dict(self._group_to_label)
+        self.hparams["process_to_label"] = dict(self._process_to_label)
+        self.hparams["process_to_group"] = {
+            name: spec["group"] for name, spec in self._train_specs.items()
+        }
+        self.hparams["test_suite_to_label"] = dict(self._test_suite_to_label)
+        self.hparams["class_specs"] = {
+            group: next(spec for spec in all_specs if spec["group"] == group)
+            for group in group_names
+        }
+
+    @staticmethod
+    def _normalize_process_specs(
+        raw_specs: Mapping[str, Mapping], sequence_type: str, min_pt: Optional[float]
+    ) -> dict[str, dict]:
+        specs = {}
+        for process_name, raw_spec in dict(raw_specs or {}).items():
+            if not isinstance(raw_spec, Mapping):
+                raw_spec = {"paths": raw_spec}
+            paths = raw_spec.get("paths", raw_spec.get("files", raw_spec.get("manifest")))
+            if paths is None:
+                raise ValueError(f"Process {process_name!r} is missing paths")
+            process_sequence_type = str(raw_spec.get("sequence_type", sequence_type))
+            if process_sequence_type not in SEQUENCE_SCHEMAS:
+                raise ValueError(
+                    f"Unknown sequence_type {process_sequence_type!r} "
+                    f"for process {process_name!r}"
+                )
+            eval_sequence_type = raw_spec.get("eval_sequence_type")
+            if eval_sequence_type is not None and eval_sequence_type not in SEQUENCE_SCHEMAS:
+                raise ValueError(
+                    f"Unknown eval_sequence_type {eval_sequence_type!r} "
+                    f"for process {process_name!r}"
+                )
+            specs[str(process_name)] = {
+                "paths": paths,
+                "group": str(raw_spec.get("group", process_name)),
+                "sequence_type": process_sequence_type,
+                "min_pt": raw_spec.get("min_pt", min_pt),
+                "eval_sequence_type": eval_sequence_type,
+                "eval_min_pt": raw_spec.get("eval_min_pt"),
+            }
+        return specs
+
+    @property
+    def test_suite_names(self) -> list[str]:
+        return list(self._test_suite_specs)
+
+    def _dataset(
+        self,
+        files,
+        spec: Mapping,
+        batch_size: int,
+        max_events: int,
+        *,
+        shuffle: bool,
+        process_name: str,
+        test_suite_name: Optional[str] = None,
+        apply_eval_filter: bool = False,
+    ) -> OrbitParquetDataset:
+        return OrbitParquetDataset(
+            parquet_files=files,
+            sequence_type=spec["sequence_type"],
+            max_sequence_length=self._max_sequence_length,
+            batch_size=batch_size,
+            shuffle_row_groups=shuffle,
+            shuffle_seed=self.hparams.shuffle_seed,
+            mask_column=self.hparams.mask_column,
+            mask_min_value=self.hparams.mask_min_value,
+            jet_type_label=self._group_to_label[spec["group"]],
+            process_label=self._process_to_label[process_name],
+            test_suite_label=(
+                0
+                if test_suite_name is None
+                else self._test_suite_to_label[test_suite_name]
+            ),
+            min_pt=spec["min_pt"],
+            event_filter_sequence_type=(
+                spec["eval_sequence_type"] if apply_eval_filter else None
+            ),
+            event_filter_min_pt=spec["eval_min_pt"] if apply_eval_filter else None,
+            max_events=max_events,
+            partition_max_events_across_workers=True,
+            return_raw_features=self.hparams.return_raw_features,
+            return_event_metadata=self.hparams.return_event_metadata,
+            pid_cfg=self.hparams.get("pid_cfg"),
+        )
+
+    def _loader(self, dataset, *, persistent_workers: bool = True) -> DataLoader:
+        kwargs = {
+            "batch_size": None,
+            "num_workers": self.hparams.num_workers,
+            "pin_memory": torch.cuda.is_available(),
+            "persistent_workers": persistent_workers and self.hparams.num_workers > 0,
+        }
+        if self.hparams.num_workers > 0:
+            kwargs["prefetch_factor"] = 4
+        return DataLoader(dataset, **kwargs)
+
+    def train_dataloader(self):
+        datasets = {
+            process_name: self._dataset(
+                self._train_files[process_name],
+                spec,
+                self.batch_size_train,
+                self._train_quotas[process_name],
+                shuffle=self.hparams.shuffle_train,
+                process_name=process_name,
+            )
+            for process_name, spec in self._train_specs.items()
+        }
+        group_sizes: dict[str, int] = {}
+        for spec in self._train_specs.values():
+            group_sizes[spec["group"]] = group_sizes.get(spec["group"], 0) + 1
+        weights = {
+            process_name: 1.0 / group_sizes[spec["group"]]
+            for process_name, spec in self._train_specs.items()
+        }
+        return self._loader(
+            WeightedClassDataset(datasets, weights=weights, seed=self.hparams.shuffle_seed)
+        )
+
+    def val_dataloader(self):
+        datasets = [
+            self._dataset(
+                self._val_files[process_name],
+                spec,
+                self.batch_size_val,
+                self._val_quotas[process_name],
+                shuffle=False,
+                process_name=process_name,
+                apply_eval_filter=True,
+            )
+            for process_name, spec in self._train_specs.items()
+        ]
+        return self._loader(ChainDataset(datasets))
+
+    def test_dataloader(self):
+        loaders = []
+        for suite_name, specs in self._test_suite_specs.items():
+            datasets = [
+                self._dataset(
+                    self._test_files[suite_name][process_name],
+                    spec,
+                    self.batch_size_test,
+                    self._test_quotas[suite_name][process_name],
+                    shuffle=False,
+                    process_name=process_name,
+                    test_suite_name=suite_name,
+                    apply_eval_filter=True,
+                )
+                for process_name, spec in specs.items()
+            ]
+            loaders.append(
+                self._loader(ChainDataset(datasets), persistent_workers=False)
+            )
+        return loaders
+
+    def data_split_summary(self) -> dict:
+        rows = []
+        for split, files_by_process, quotas in (
+            ("train", self._train_files, self._train_quotas),
+            ("val", self._val_files, self._val_quotas),
+        ):
+            for process_name, spec in self._train_specs.items():
+                rows.append(
+                    {
+                        "split": split,
+                        "suite": None,
+                        "group": spec["group"],
+                        "process": process_name,
+                        "label": self._group_to_label[spec["group"]],
+                        "file_count": len(files_by_process[process_name]),
+                        "event_count": quotas[process_name],
+                    }
+                )
+        for suite_name, specs in self._test_suite_specs.items():
+            for process_name, spec in specs.items():
+                rows.append(
+                    {
+                        "split": "test",
+                        "suite": suite_name,
+                        "group": spec["group"],
+                        "process": process_name,
+                        "label": self._group_to_label[spec["group"]],
+                        "file_count": len(self._test_files[suite_name][process_name]),
+                        "event_count": self._test_quotas[suite_name][process_name],
+                    }
+                )
+        return {
+            "mode": "canonical_group_balanced",
+            "train_fraction": float(self.hparams.train_fraction),
+            "split_seed": int(self.hparams.split_seed),
+            "group_to_label": dict(self._group_to_label),
+            "process_to_label": dict(self._process_to_label),
+            "test_suite_to_label": dict(self._test_suite_to_label),
+            "rows": rows,
+        }

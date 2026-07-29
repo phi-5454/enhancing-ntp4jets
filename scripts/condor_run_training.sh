@@ -13,6 +13,7 @@ Usage:
 
 MODE is one of:
   train    Run gabbro/train.py with the supplied Hydra overrides.
+  optuna   Run a resumable native Optuna study with the supplied Hydra overrides.
   collect  Run scripts/collect_orbit_multirun.py for OUTPUT_DIR/SUITE_ID.
 USAGE
   exit 2
@@ -37,7 +38,39 @@ RUN_ROOT="${OUTPUT_DIR}/${SUITE_ID}"
 CONDOR_LOG_DIR="${OUTPUT_DIR}/condor_logs"
 HYDRA_PROJECT_NAME="orbit-particle-ggHbb-minbias"
 
-mkdir -p "${RUN_ROOT}" "${CONDOR_LOG_DIR}"
+# Hydra's default run directory includes project_name. Canonical jobs override
+# it through their experiment config, so create that exact parent before many
+# Condor processes try to create it concurrently on EOS.
+for hydra_override in "$@"; do
+  case "${hydra_override}" in
+    experiment=orbit_canonical_tt)
+      HYDRA_PROJECT_NAME="orbit-canonical-tt"
+      ;;
+    experiment=orbit_canonical_tt_full_event)
+      HYDRA_PROJECT_NAME="orbit-canonical-tt-full-event"
+      ;;
+    experiment=orbit_canonical_qcd_tt_vjets_vv)
+      HYDRA_PROJECT_NAME="orbit-canonical-qcd-tt-vjets-vv"
+      ;;
+    experiment=orbit_canonical_qcd_tt_vjets_vv_full_event)
+      HYDRA_PROJECT_NAME="orbit-canonical-qcd-tt-vjets-vv-full-event"
+      ;;
+  esac
+done
+
+mkdir_retry() {
+  local attempt
+  for attempt in 1 2 3 4 5; do
+    if mkdir -p "$@"; then
+      return 0
+    fi
+    echo "mkdir -p failed on attempt ${attempt}/5 for: $*" >&2
+    sleep $((attempt * 10))
+  done
+  mkdir -p "$@"
+}
+
+mkdir_retry "${RUN_ROOT}" "${CONDOR_LOG_DIR}"
 
 # Batch workers may have read-only or slow home directories. Point Matplotlib
 # and W&B at the shared run directory unless the submit file explicitly set
@@ -46,7 +79,7 @@ export LOG_DIR="${RUN_ROOT}"
 export MPLCONFIGDIR="${MPLCONFIGDIR:-${RUN_ROOT}/matplotlib}"
 export WANDB_DIR="${WANDB_DIR:-${RUN_ROOT}/wandb}"
 export PYTHONDONTWRITEBYTECODE=1
-mkdir -p \
+mkdir_retry \
   "${MPLCONFIGDIR}" \
   "${WANDB_DIR}" \
   "${RUN_ROOT}/${HYDRA_PROJECT_NAME}/runs" \
@@ -72,7 +105,7 @@ if [ ! -d "${CONDA_ENV}" ]; then
 fi
 
 cd "${PROJECT_DIR}"
-export PYTHONPATH="${PROJECT_DIR}:${PYTHONPATH:-}"
+export PYTHONPATH="${PROJECT_DIR}/vqtorch:${PROJECT_DIR}:${PYTHONPATH:-}"
 
 # Echo the resolved runtime context into the Condor stdout log. This makes
 # failed jobs much easier to reproduce from the command line.
@@ -96,12 +129,27 @@ run_in_conda() {
 
 # Verify the exact Python that will run the job and fail before launching a long
 # training command if the environment is missing a core dependency.
-run_in_conda python -c 'import sys, pyrootutils; print(f"Python executable: {sys.executable}"); print(f"pyrootutils: {pyrootutils.__file__}")'
+run_in_conda python -c 'import sys, pyrootutils, vqtorch; print(f"Python executable: {sys.executable}"); print(f"pyrootutils: {pyrootutils.__file__}"); print(f"vqtorch: {vqtorch.__file__}")'
+
+if [ "${MODE}" = "optuna" ]; then
+  run_in_conda python -c 'import optuna, plotly; print(f"optuna: {optuna.__version__}"); print(f"plotly: {plotly.__version__}")'
+fi
+
+if [ "${REQUIRE_FAISS_GPU:-0}" = "1" ]; then
+  run_in_conda python -c 'import faiss; gpu_count = faiss.get_num_gpus(); print(f"faiss: {faiss.__version__}"); print(f"FAISS GPUs: {gpu_count}"); assert gpu_count > 0, "GPU-enabled FAISS did not detect a CUDA GPU"'
+fi
 
 case "${MODE}" in
   train)
-    # Hydra overrides are passed through unchanged.
     run_in_conda python gabbro/train.py "$@"
+    ;;
+  optuna)
+    STUDY_ROOT="${RUN_ROOT}/optuna/${JOB_INDEX}"
+    if [ "$#" -gt 1 ] && [ "$1" = "--study-root" ]; then
+      STUDY_ROOT="$2"
+      shift 2
+    fi
+    run_in_conda python scripts/run_optuna_study.py --study-root "${STUDY_ROOT}" "$@"
     ;;
   collect)
     # Optional collection helper. If a multirun path is provided as the first

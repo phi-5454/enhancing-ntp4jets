@@ -194,9 +194,24 @@ def reset_mpl_style():
 
 
 def set_mpl_style(darkmode=False):
-    """Set matplotlib rcParams to custom configuration."""
+    """Apply the CMS mplhep style with the project's visual overrides.
+
+    The project palette and the optional dark mode are deliberately applied
+    after the mplhep base style so existing validation and test figures keep
+    their established colours and sizing.
+    """
     reset_mpl_style()
+    try:
+        import mplhep as hep
+    except ImportError as exc:
+        raise ImportError(
+            "Physics plotting requires mplhep. Install the project dependencies or run "
+            "`conda install -p /eos/home-y/yelberke/conda_condor_orbit_env "
+            "-c conda-forge mplhep`."
+        ) from exc
+    hep.style.use(hep.style.CMS)
     rcParams.update(params_to_update if not darkmode else params_to_update_dark)
+    return hep
 
 
 def save(fig, saveas, transparent=True):

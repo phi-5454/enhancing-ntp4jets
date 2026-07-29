@@ -82,6 +82,7 @@ from gabbro.utils.utils import (
     get_gpu_properties,
     instantiate_callbacks,
     instantiate_loggers,
+    get_metric_value,
     log_hyperparameters,
     remove_empty_hydra_run_dir,
     task_wrapper,
@@ -107,10 +108,13 @@ def _log_data_split_summary(trainer: L.Trainer, datamodule) -> None:
     log.info("Resolved data split summary:")
     for row in rows:
         log.info(
-            "  split=%s class=%s label=%s files=%s events=%s batch_size=%s "
+            "  split=%s suite=%s class=%s group=%s process=%s label=%s files=%s events=%s batch_size=%s "
             "sequence=%s eval_sequence=%s eval_min_pt=%s weight=%s",
             row.get("split"),
+            row.get("suite"),
             row.get("class"),
+            row.get("group"),
+            row.get("process"),
             row.get("label"),
             row.get("file_count"),
             row.get("event_count"),
@@ -125,7 +129,19 @@ def _log_data_split_summary(trainer: L.Trainer, datamodule) -> None:
     totals: dict[str, int] = {}
     for row in rows:
         split = row["split"]
-        class_name = row["class"]
+        # Legacy data modules expose a class key. Canonical group-balanced
+        # modules instead identify each row by suite, group, and process.
+        # Keep every canonical test row distinct: tt appears in both test
+        # suites and must not overwrite metrics from the other suite.
+        class_name = row.get("class")
+        if class_name is None:
+            class_name = "/".join(
+                str(value)
+                for value in (row.get("suite"), row.get("group"), row.get("process"))
+                if value is not None
+            )
+        if not class_name:
+            class_name = "unlabelled"
         file_count = row.get("file_count")
         event_count = row.get("event_count")
         if file_count is not None:
@@ -139,7 +155,10 @@ def _log_data_split_summary(trainer: L.Trainer, datamodule) -> None:
 
     columns = [
         "split",
+        "suite",
         "class",
+        "group",
+        "process",
         "label",
         "file_count",
         "event_count",
@@ -170,6 +189,58 @@ def _log_data_split_summary(trainer: L.Trainer, datamodule) -> None:
                 )
             except Exception as exc:
                 log.warning(f"Failed to log data split table to W&B: {exc}")
+
+
+def _log_full_config_to_wandb(
+    trainer: L.Trainer,
+    cfg: DictConfig,
+    cfg_path: str | Path,
+    cfg_resolved_path: str | Path,
+) -> None:
+    """Upload complete Hydra configs to W&B without replacing existing hparams."""
+    if trainer.global_rank != 0 or not trainer.loggers:
+        return
+
+    cfg_path = Path(cfg_path)
+    cfg_resolved_path = Path(cfg_resolved_path)
+    for lightning_logger in trainer.loggers:
+        if not isinstance(lightning_logger, L.pytorch.loggers.WandbLogger):
+            continue
+        try:
+            import wandb
+
+            run = lightning_logger.experiment
+            config_payload = {
+                "full_config": OmegaConf.to_container(
+                    cfg,
+                    resolve=False,
+                    throw_on_missing=False,
+                ),
+                "full_config_resolved": OmegaConf.to_container(
+                    cfg,
+                    resolve=True,
+                    throw_on_missing=False,
+                ),
+                "full_config_files": {
+                    "config": str(cfg_path),
+                    "config_resolved": str(cfg_resolved_path),
+                },
+            }
+            run.config.update(config_payload, allow_val_change=True)
+
+            artifact = wandb.Artifact(
+                name=f"{run.id}-full-config",
+                type="config",
+                description="Complete unresolved and resolved Hydra configs for this run.",
+            )
+            if cfg_path.is_file():
+                artifact.add_file(str(cfg_path), name="config.yaml")
+            if cfg_resolved_path.is_file():
+                artifact.add_file(str(cfg_resolved_path), name="config_resolved.yaml")
+            run.log_artifact(artifact)
+            log.info("Uploaded full Hydra config to W&B config and artifact.")
+        except Exception as exc:
+            log.warning(f"Failed to upload full config to W&B: {exc}")
 
 
 def get_nodename_bigram():
@@ -355,6 +426,7 @@ def train(cfg: DictConfig) -> Tuple[dict, dict]:
         "load_weights_from": cfg.get("load_weights_from", None),
         "gpu_properties": get_gpu_properties(),
     }
+    metric_dict = {}
 
     log.info(f"Slurm job ID: {object_dict['slurm']['job_id']}")
 
@@ -376,6 +448,12 @@ def train(cfg: DictConfig) -> Tuple[dict, dict]:
             with open(cfg_resolved_file, "w") as f:
                 log.info(f"Saving resolved config to {cfg_resolved_file}")
                 OmegaConf.save(cfg, f, resolve=True)
+            _log_full_config_to_wandb(
+                trainer,
+                cfg,
+                cfg_backup_file,
+                cfg_resolved_file,
+            )
         # ---
 
         log.info("------------------")
@@ -393,13 +471,18 @@ def train(cfg: DictConfig) -> Tuple[dict, dict]:
             torch.save(model.state_dict(), untrained_model_checkpoint)
             log.info(f"Saved untrained model state dict to {untrained_model_checkpoint}")
         trainer.fit(model=model, datamodule=datamodule, ckpt_path=ckpt_path)
+        metric_dict.update(dict(trainer.callback_metrics))
 
     if cfg.get("test"):
         log.info("-----------------")
         log.info("Starting testing!")
         log.info("-----------------")
 
-        if cfg.get("ckpt_path_for_evaluation") is not None:
+        if cfg.get("test_without_checkpoint", False):
+            log.info("`test_without_checkpoint` is enabled; testing current model state.")
+            ckpt_path = None
+            process_rank = get_rank() if torch.distributed.is_initialized() else 0
+        elif cfg.get("ckpt_path_for_evaluation") is not None:
             # evaluate a specific checkpoint
             ckpt_path = cfg.get("ckpt_path_for_evaluation")
             process_rank = get_rank() if torch.distributed.is_initialized() else 0
@@ -506,7 +589,7 @@ def train(cfg: DictConfig) -> Tuple[dict, dict]:
         # ------------------------------------------------
 
         # update the default root dir for testing
-        ckpt_filename = Path(ckpt_path).name
+        ckpt_filename = Path(ckpt_path).name if ckpt_path else "current"
         cfg.trainer.default_root_dir = (
             Path(cfg.trainer.default_root_dir) / "evaluation" / ckpt_filename
         )
@@ -562,8 +645,9 @@ def train(cfg: DictConfig) -> Tuple[dict, dict]:
                 ckpt_path=ckpt_path,
                 weights_only=False,
             )
+        metric_dict.update(dict(trainer.callback_metrics))
 
-    return None
+    return metric_dict, object_dict
 
 
 @hydra.main(version_base="1.3", config_path="../configs", config_name="train.yaml")
@@ -637,9 +721,9 @@ def main(cfg: DictConfig) -> Optional[float]:
         # cfg.trainer.strategy = "auto"
 
     # train the model
-    train(cfg)
+    metric_dict, _ = train(cfg)
 
-    return None
+    return get_metric_value(metric_dict, cfg.get("optimized_metric"))
 
 
 if __name__ == "__main__":

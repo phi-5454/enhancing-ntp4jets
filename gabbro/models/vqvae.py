@@ -1,4 +1,7 @@
+import json
+import math
 import time
+from pathlib import Path
 from typing import Any, Dict, Tuple
 
 import awkward as ak
@@ -13,8 +16,10 @@ from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 from vqtorch.nn import VectorQuant
 
+from gabbro.models.latent_sequence import DirectPrefixLatentMasker, LatentSequenceCompressor
 from gabbro.models.quantizers import SplitQuantizer, build_quantizer
 from gabbro.models.transformer import MLP, NormformerStack, Transformer
+from gabbro.plotting.utils import set_mpl_style
 from gabbro.utils.arrays import (
     ak_pad,
     ak_select_and_preprocess,
@@ -27,6 +32,973 @@ from gabbro.utils.pylogger import get_pylogger
 vector.register_awkward()
 
 logger = get_pylogger(__name__)
+
+
+def _pid_recall_metrics(
+    target: torch.Tensor,
+    logits: torch.Tensor,
+    class_names: list[str] | tuple[str, ...],
+) -> dict[str, torch.Tensor]:
+    prediction = logits.argmax(dim=-1)
+    metrics = {}
+    recalls = []
+    for class_index, class_name in enumerate(class_names):
+        class_mask = target == class_index
+        if torch.any(class_mask):
+            recall = (prediction[class_mask] == class_index).float().mean()
+            recalls.append(recall)
+            metrics[f"pid_recall/{class_name}"] = recall.detach()
+    if recalls:
+        metrics["pid_macro_recall"] = torch.stack(recalls).mean().detach()
+    return metrics
+
+
+def _pid_confusion_counts(target: torch.Tensor, logits: torch.Tensor, num_classes: int) -> torch.Tensor:
+    """Return integer PID counts with truth on rows and prediction on columns."""
+    prediction = logits.argmax(dim=-1)
+    encoded = target.to(torch.int64) * num_classes + prediction.to(torch.int64)
+    return torch.bincount(encoded, minlength=num_classes**2).reshape(num_classes, num_classes)
+
+
+def _accumulate_pid_confusion(
+    module: L.LightningModule,
+    key: str,
+    counts: torch.Tensor,
+) -> None:
+    matrices = getattr(module, "_pid_confusion_matrices", None)
+    if matrices is None:
+        matrices = {}
+        module._pid_confusion_matrices = matrices
+    detached = counts.detach()
+    matrices[key] = detached if key not in matrices else matrices[key] + detached
+
+
+def _save_pid_confusion_artifacts(module: L.LightningModule, key: str) -> None:
+    """Save one compact PID confusion matrix instead of 64 scalar dashboard panels."""
+    counts = getattr(module, "_pid_confusion_matrices", {}).get(key)
+    if counts is None:
+        return
+    if getattr(module.trainer, "world_size", 1) > 1:
+        counts = module.all_gather(counts).sum(dim=0)
+    if not module.trainer.is_global_zero:
+        return
+
+    counts_np = counts.detach().cpu().numpy().astype(np.int64)
+    row_totals = counts_np.sum(axis=1, keepdims=True)
+    normalized = np.divide(
+        counts_np,
+        row_totals,
+        out=np.zeros_like(counts_np, dtype=np.float64),
+        where=row_totals > 0,
+    )
+    artifact_dir = Path(module.trainer.default_root_dir) / "artifacts"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    stem = f"pid_confusion_matrix_{key}"
+    json_path = artifact_dir / f"{stem}.json"
+    json_path.write_text(
+        json.dumps(
+            {
+                "truth_labels": list(module.pid_class_names),
+                "predicted_labels": list(module.pid_class_names),
+                "counts": counts_np.tolist(),
+                "row_normalized": normalized.tolist(),
+            },
+            indent=2,
+        )
+    )
+
+    set_mpl_style()
+    figure, axis = plt.subplots(figsize=(8.0, 6.8))
+    image = axis.imshow(normalized, vmin=0.0, vmax=1.0, cmap="Blues")
+    axis.set(
+        xticks=np.arange(len(module.pid_class_names)),
+        yticks=np.arange(len(module.pid_class_names)),
+        xticklabels=module.pid_class_names,
+        yticklabels=module.pid_class_names,
+        xlabel="Predicted PID",
+        ylabel="True PID",
+        title=f"PID confusion matrix ({key.replace('_', ' ')})",
+    )
+    plt.setp(axis.get_xticklabels(), rotation=45, ha="right", rotation_mode="anchor")
+    for row in range(counts_np.shape[0]):
+        for column in range(counts_np.shape[1]):
+            color = "white" if normalized[row, column] > 0.5 else "black"
+            axis.text(
+                column,
+                row,
+                f"{normalized[row, column]:.2f}\n({counts_np[row, column]})",
+                ha="center",
+                va="center",
+                fontsize=7,
+                color=color,
+            )
+    figure.colorbar(image, ax=axis, label="Fraction of true PID class")
+    figure.tight_layout()
+    image_path = artifact_dir / f"{stem}.png"
+    figure.savefig(image_path, dpi=180, bbox_inches="tight")
+    plt.close(figure)
+    logger.info("Saved PID confusion matrix counts to %s and plot to %s", json_path, image_path)
+
+    for lightning_logger in module.trainer.loggers:
+        if isinstance(lightning_logger, L.pytorch.loggers.CometLogger):
+            lightning_logger.experiment.log_image(
+                str(image_path), name=f"{key}/pid_confusion_matrix", step=module.global_step
+            )
+        elif isinstance(lightning_logger, L.pytorch.loggers.WandbLogger):
+            try:
+                import wandb
+
+                lightning_logger.experiment.log(
+                    {f"{key}_plots/pid_confusion_matrix": wandb.Image(str(image_path))},
+                    commit=False,
+                )
+            except Exception as exc:
+                logger.warning("Failed to log PID confusion matrix to W&B: %s", exc)
+
+
+class _BaselineVQLayer:
+    """Small compatibility object exposing codebook size to plotting callbacks."""
+
+    def __init__(self, num_codes: int):
+        self.num_codes = int(num_codes)
+
+
+class _BaselineModel:
+    """Small compatibility object matching the callback's model.vqlayer lookup."""
+
+    def __init__(self, num_codes: int):
+        self.vqlayer = _BaselineVQLayer(num_codes)
+        self.conditional_dim = 0
+
+
+class DumbQuantizationBaselineLightning(L.LightningModule):
+    """Test-only baseline that scalar-quantizes transformed ORBIT inputs."""
+
+    def __init__(
+        self,
+        q_levels: list[int],
+        binning: str = "uniform",
+        eta_range: tuple[float, float] = (-1.0, 1.0),
+        phi_range: tuple[float, float] = (-float(np.pi), float(np.pi)),
+        pt_range: tuple[float, float] | None = None,
+        pt_range_num_train_batches: int = 1000,
+        learned_bins_num_train_batches: int = 1000,
+        learned_bins_max_iters: int = 100,
+        learned_bins_tol: float = 1e-6,
+        max_validation_plot_batches: int | None = 1,
+        max_test_plot_batches: int | None = None,
+        pid_cfg: dict | None = None,
+        **_,
+    ):
+        super().__init__()
+        if len(q_levels) != 3:
+            raise ValueError(f"q_levels must have three entries for eta/phi/pT, got {q_levels}")
+        if any(int(level) < 2 for level in q_levels):
+            raise ValueError(f"All q_levels must be >= 2, got {q_levels}")
+        if binning not in ("uniform", "learned"):
+            raise ValueError(f"Unknown dumb-baseline binning={binning!r}.")
+        self.save_hyperparameters(logger=False)
+        self.q_levels = [int(level) for level in q_levels]
+        self.binning = binning
+        self.eta_range = tuple(float(value) for value in eta_range)
+        self.phi_range = tuple(float(value) for value in phi_range)
+        self.pt_range = None if pt_range is None else tuple(float(value) for value in pt_range)
+        self.pt_range_num_train_batches = int(pt_range_num_train_batches)
+        self.learned_bins_num_train_batches = int(learned_bins_num_train_batches)
+        self.learned_bins_max_iters = int(learned_bins_max_iters)
+        self.learned_bins_tol = float(learned_bins_tol)
+        self.max_validation_plot_batches = max_validation_plot_batches
+        self.max_test_plot_batches = max_test_plot_batches
+        pid_cfg = {} if pid_cfg is None else dict(pid_cfg)
+        self.pid_enabled = bool(pid_cfg.get("enabled", False))
+        self.pid_num_classes = int(pid_cfg.get("num_classes", 8))
+        self.pid_class_names = tuple(
+            pid_cfg.get("class_names")
+            or [f"class_{index}" for index in range(self.pid_num_classes)]
+        )
+        self.pid_loss_weight = float(pid_cfg.get("loss_weight", 1.0))
+        self.pid_feature_scale = float(pid_cfg.get("faiss_feature_scale", 1.0))
+        if self.pid_num_classes != 8:
+            raise ValueError("The ORBIT PID mapping requires exactly 8 classes")
+        if self.pid_feature_scale <= 0:
+            raise ValueError("pid_cfg.faiss_feature_scale must be positive")
+        self.learned_centers: dict[str, torch.Tensor] | None = None
+        self.model = _BaselineModel(
+            int(np.prod(self.q_levels)) * (self.pid_num_classes if self.pid_enabled else 1)
+        )
+        self.model.pid_enabled = self.pid_enabled
+        self.test_x_original = []
+        self.test_x_reco = []
+        self.test_mask = []
+        self.test_labels = []
+        self.test_suite_labels = []
+        self.test_code_idx = []
+
+    @staticmethod
+    def _should_store_loop_batch(batch_idx: int, max_batches: int | None) -> bool:
+        return max_batches is None or batch_idx < max_batches
+
+    @staticmethod
+    def _quantize_uniform(
+        values: torch.Tensor,
+        min_value: float,
+        max_value: float,
+        num_levels: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if max_value <= min_value:
+            raise ValueError(f"Invalid quantization range: [{min_value}, {max_value}]")
+        scaled = (values - min_value) / (max_value - min_value)
+        indices = torch.round(scaled * (num_levels - 1)).clamp(0, num_levels - 1).long()
+        quantized = min_value + indices.to(values.dtype) * (max_value - min_value) / (
+            num_levels - 1
+        )
+        return quantized, indices
+
+    @staticmethod
+    def _nearest_centers(
+        values: torch.Tensor,
+        centers: torch.Tensor,
+        *,
+        circular: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if circular:
+            distance = torch.atan2(
+                torch.sin(values.unsqueeze(-1) - centers),
+                torch.cos(values.unsqueeze(-1) - centers),
+            ).pow(2)
+        else:
+            distance = (values.unsqueeze(-1) - centers).pow(2)
+        indices = torch.argmin(distance, dim=-1)
+        quantized = centers.to(values.device, values.dtype)[indices]
+        return quantized, indices
+
+    @staticmethod
+    def _circular_difference(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        return torch.atan2(torch.sin(a - b), torch.cos(a - b))
+
+    def _collect_train_quantization_values(self) -> dict[str, torch.Tensor]:
+        if self.trainer is None or self.trainer.datamodule is None:
+            raise ValueError("Learned bins require an attached datamodule with train data.")
+
+        values = {"eta": [], "phi": [], "pt": []}
+        dataloader = self.trainer.datamodule.train_dataloader()
+        for batch_idx, batch in enumerate(dataloader):
+            if batch_idx >= self.learned_bins_num_train_batches:
+                break
+            x_particle = batch["part_features"]
+            mask = batch["part_mask"].bool()
+            if not torch.any(mask):
+                continue
+            values["eta"].append(x_particle[..., 0][mask].detach().cpu())
+            values["phi"].append(
+                torch.atan2(x_particle[..., 2], x_particle[..., 1])[mask].detach().cpu()
+            )
+            values["pt"].append(x_particle[..., 3][mask].detach().cpu())
+
+        collected = {}
+        for name, chunks in values.items():
+            if not chunks:
+                raise RuntimeError(f"Could not learn {name} bins: no valid train particles found.")
+            collected[name] = torch.cat(chunks).float()
+        return collected
+
+    def _learn_scalar_centers(self, values: torch.Tensor, num_levels: int) -> torch.Tensor:
+        values = values[torch.isfinite(values)]
+        if values.numel() == 0:
+            raise RuntimeError("Cannot learn scalar centers from an empty finite sample.")
+        if torch.max(values) <= torch.min(values):
+            return torch.full((num_levels,), float(values[0]), dtype=torch.float32)
+
+        quantiles = torch.linspace(0.0, 1.0, num_levels, dtype=torch.float32)
+        centers = torch.quantile(values, quantiles).float()
+        for _ in range(self.learned_bins_max_iters):
+            _, indices = self._nearest_centers(values, centers)
+            new_centers = centers.clone()
+            for idx in range(num_levels):
+                assigned = values[indices == idx]
+                if assigned.numel() > 0:
+                    new_centers[idx] = assigned.mean()
+            new_centers, _ = torch.sort(new_centers)
+            if torch.max(torch.abs(new_centers - centers)) < self.learned_bins_tol:
+                centers = new_centers
+                break
+            centers = new_centers
+        return centers
+
+    def _learn_circular_centers(self, values: torch.Tensor, num_levels: int) -> torch.Tensor:
+        values = values[torch.isfinite(values)]
+        if values.numel() == 0:
+            raise RuntimeError("Cannot learn circular centers from an empty finite sample.")
+
+        centers = torch.linspace(
+            self.phi_range[0],
+            self.phi_range[1],
+            num_levels + 1,
+            dtype=torch.float32,
+        )[:-1]
+        for _ in range(self.learned_bins_max_iters):
+            _, indices = self._nearest_centers(values, centers, circular=True)
+            new_centers = centers.clone()
+            for idx in range(num_levels):
+                assigned = values[indices == idx]
+                if assigned.numel() > 0:
+                    sin_mean = torch.mean(torch.sin(assigned))
+                    cos_mean = torch.mean(torch.cos(assigned))
+                    new_centers[idx] = torch.atan2(sin_mean, cos_mean)
+            new_centers, _ = torch.sort(new_centers)
+            delta = self._circular_difference(new_centers, centers)
+            if torch.max(torch.abs(delta)) < self.learned_bins_tol:
+                centers = new_centers
+                break
+            centers = new_centers
+        return centers
+
+    def _fit_learned_bins(self) -> None:
+        if self.learned_centers is not None:
+            return
+        values = self._collect_train_quantization_values()
+        self.learned_centers = {
+            "eta": self._learn_scalar_centers(values["eta"], self.q_levels[0]),
+            "phi": self._learn_circular_centers(values["phi"], self.q_levels[1]),
+            "pt": self._learn_scalar_centers(values["pt"], self.q_levels[2]),
+        }
+        self.pt_range = (
+            float(torch.min(values["pt"]).item()),
+            float(torch.max(values["pt"]).item()),
+        )
+        logger.info(
+            "Fitted learned dumb-baseline bins from %d particles.",
+            values["eta"].numel(),
+        )
+
+    def _estimate_pt_range(self) -> tuple[float, float]:
+        if self.pt_range is not None:
+            return self.pt_range
+        if self.trainer is None or self.trainer.datamodule is None:
+            raise ValueError("pt_range was not provided and no datamodule is attached.")
+
+        min_pt = None
+        max_pt = None
+        dataloader = self.trainer.datamodule.train_dataloader()
+        for batch_idx, batch in enumerate(dataloader):
+            if batch_idx >= self.pt_range_num_train_batches:
+                break
+            x_particle = batch["part_features"]
+            mask = batch["part_mask"].bool()
+            if not torch.any(mask):
+                continue
+            pt_values = x_particle[..., 3][mask]
+            batch_min = float(torch.min(pt_values).item())
+            batch_max = float(torch.max(pt_values).item())
+            min_pt = batch_min if min_pt is None else min(min_pt, batch_min)
+            max_pt = batch_max if max_pt is None else max(max_pt, batch_max)
+
+        if min_pt is None or max_pt is None:
+            raise RuntimeError("Could not estimate pT range: no valid train particles found.")
+        if max_pt <= min_pt:
+            max_pt = min_pt + 1e-6
+        self.pt_range = (float(min_pt), float(max_pt))
+        return self.pt_range
+
+    def _quantize_batch(
+        self,
+        x_particle: torch.Tensor,
+        mask: torch.Tensor,
+        pid_particle: torch.Tensor | None = None,
+    ):
+        eta = x_particle[..., 0]
+        phi = torch.atan2(x_particle[..., 2], x_particle[..., 1])
+        pt = x_particle[..., 3]
+
+        if self.binning == "learned":
+            self._fit_learned_bins()
+            centers = {
+                name: value.to(x_particle.device, x_particle.dtype)
+                for name, value in self.learned_centers.items()
+            }
+            eta_q, eta_idx = self._nearest_centers(eta, centers["eta"])
+            phi_q, phi_idx = self._nearest_centers(phi, centers["phi"], circular=True)
+            pt_q, pt_idx = self._nearest_centers(pt, centers["pt"])
+        else:
+            eta_q, eta_idx = self._quantize_uniform(
+                eta,
+                self.eta_range[0],
+                self.eta_range[1],
+                self.q_levels[0],
+            )
+            phi_q, phi_idx = self._quantize_uniform(
+                phi,
+                self.phi_range[0],
+                self.phi_range[1],
+                self.q_levels[1],
+            )
+            pt_min, pt_max = self._estimate_pt_range()
+            pt_q, pt_idx = self._quantize_uniform(pt, pt_min, pt_max, self.q_levels[2])
+
+        x_reco = torch.stack(
+            [
+                eta_q,
+                torch.cos(phi_q),
+                torch.sin(phi_q),
+                pt_q,
+            ],
+            dim=-1,
+        )
+        x_reco = x_reco * mask.unsqueeze(-1)
+        code_idx = eta_idx + self.q_levels[0] * (
+            phi_idx + self.q_levels[1] * pt_idx
+        )
+        pid_logits = None
+        if self.pid_enabled:
+            if pid_particle is None:
+                raise ValueError("PID-enabled baseline requires a part_pid tensor")
+            code_idx = code_idx * self.pid_num_classes + pid_particle.clamp_min(0)
+            pid_logits = x_particle.new_full(
+                (*pid_particle.shape, self.pid_num_classes),
+                -20.0,
+            )
+            pid_logits.scatter_(-1, pid_particle.clamp_min(0).unsqueeze(-1), 20.0)
+            pid_logits = pid_logits * mask.unsqueeze(-1)
+        return x_reco, code_idx, pid_logits
+
+    def model_step(self, batch, return_x=False):
+        x_particle = batch["part_features"]
+        mask_particle = batch["part_mask"]
+        labels = batch["jet_type_labels"]
+        pid_particle = batch.get("part_pid")
+        x_particle_reco, code_idx, pid_logits = self._quantize_batch(
+            x_particle,
+            mask_particle,
+            pid_particle,
+        )
+
+        valid_mask = mask_particle.unsqueeze(-1)
+        reco_delta = (x_particle_reco - x_particle) * valid_mask
+        n_valid_particles = torch.sum(mask_particle).clamp_min(1)
+        n_valid_values = (n_valid_particles * x_particle.shape[-1]).clamp_min(1)
+        reco_l2 = torch.sum(reco_delta**2) / n_valid_particles
+        reco_l1 = torch.sum(torch.abs(reco_delta)) / n_valid_particles
+        reco_l2_per_value = torch.sum(reco_delta**2) / n_valid_values
+        reco_l1_per_value = torch.sum(torch.abs(reco_delta)) / n_valid_values
+        pid_loss = reco_l2.new_zeros(())
+        pid_accuracy = reco_l2.new_zeros(())
+        if self.pid_enabled:
+            valid_pid = pid_particle[mask_particle.bool()]
+            valid_logits = pid_logits[mask_particle.bool()]
+            pid_loss = F.cross_entropy(valid_logits, valid_pid)
+            pid_accuracy = (valid_logits.argmax(dim=-1) == valid_pid).float().mean()
+        loss = reco_l2 + self.pid_loss_weight * pid_loss
+        metrics = {
+            "loss_total": loss.detach(),
+            "loss_reco": reco_l2.detach(),
+            "loss_reco_l2": reco_l2.detach(),
+            "loss_reco_l1": reco_l1.detach(),
+            "loss_reco_l2_per_value": reco_l2_per_value.detach(),
+            "loss_reco_l1_per_value": reco_l1_per_value.detach(),
+            "loss_quantizer": torch.zeros_like(reco_l2).detach(),
+            "loss_quantizer_weighted": torch.zeros_like(reco_l2).detach(),
+            "loss_pid": pid_loss.detach(),
+            "loss_pid_weighted": (self.pid_loss_weight * pid_loss).detach(),
+            "pid_accuracy": pid_accuracy.detach(),
+        }
+        if self.pid_enabled:
+            metrics.update(_pid_recall_metrics(valid_pid, valid_logits, self.pid_class_names))
+            metrics["pid_confusion_matrix"] = _pid_confusion_counts(
+                valid_pid, valid_logits, self.pid_num_classes
+            )
+        if return_x:
+            return (
+                loss,
+                metrics,
+                x_particle,
+                x_particle_reco,
+                mask_particle,
+                labels,
+                code_idx,
+            )
+        return loss, metrics
+
+    def _log_step_metrics(
+        self,
+        prefix: str,
+        metrics: dict[str, torch.Tensor],
+        *,
+        on_step: bool,
+        on_epoch: bool,
+        prog_bar: bool = False,
+        pid_confusion_key: str | None = None,
+    ) -> None:
+        for name, value in metrics.items():
+            if name == "pid_confusion_matrix":
+                if pid_confusion_key is not None:
+                    _accumulate_pid_confusion(self, pid_confusion_key, value)
+                continue
+            self.log(
+                f"{prefix}/{name}",
+                value,
+                on_step=on_step,
+                on_epoch=on_epoch,
+                prog_bar=prog_bar and name == "loss_total",
+            )
+
+    def on_test_start(self) -> None:
+        if self.binning == "learned":
+            self._fit_learned_bins()
+        pt_min, pt_max = self._estimate_pt_range()
+        self.log(
+            "baseline/binning_is_learned",
+            float(self.binning == "learned"),
+            on_step=False,
+            on_epoch=True,
+        )
+        self.log("baseline/pt_min", pt_min, on_step=False, on_epoch=True)
+        self.log("baseline/pt_max", pt_max, on_step=False, on_epoch=True)
+        self.log("baseline/num_codes", self.model.vqlayer.num_codes, on_step=False, on_epoch=True)
+
+    def on_test_epoch_start(self) -> None:
+        logger.info("`on_test_epoch_start` called for dumb quantization baseline.")
+        self.test_x_original = []
+        self.test_x_reco = []
+        self.test_mask = []
+        self.test_labels = []
+        self.test_suite_labels = []
+        self.test_code_idx = []
+        self._pid_confusion_matrices = {}
+        self._clear_concat_outputs("test")
+
+    def on_test_epoch_end(self) -> None:
+        for key in getattr(self, "_pid_confusion_matrices", {}):
+            _save_pid_confusion_artifacts(self, key)
+
+    def _clear_concat_outputs(self, prefix: str) -> None:
+        for name in [
+            "x_original", "x_reco", "mask", "labels", "suite_labels", "code_idx", "code_mask"
+        ]:
+            attr = f"{prefix}_{name}_concat"
+            if hasattr(self, attr):
+                delattr(self, attr)
+
+    def concat_validation_loop_predictions(self) -> None:
+        """Compatibility hook for OrbitPlottingCallback."""
+        if not getattr(self, "val_x_original", None):
+            logger.info("No stored validation batches available for plotting/evaluation.")
+            return
+        self.val_x_original_concat = np.concatenate(self.val_x_original)
+        self.val_x_reco_concat = np.concatenate(self.val_x_reco)
+        self.val_mask_concat = np.concatenate(self.val_mask)
+        self.val_labels_concat = np.concatenate(self.val_labels)
+        self.val_code_idx_concat = np.concatenate(self.val_code_idx)
+
+    def concat_test_loop_predictions(self) -> None:
+        """Compatibility hook for OrbitPlottingCallback."""
+        if not self.test_x_original:
+            logger.info("No stored test batches available for plotting/evaluation.")
+            return
+        self.test_x_original_concat = np.concatenate(self.test_x_original)
+        self.test_x_reco_concat = np.concatenate(self.test_x_reco)
+        self.test_mask_concat = np.concatenate(self.test_mask)
+        self.test_labels_concat = np.concatenate(self.test_labels)
+        self.test_suite_labels_concat = np.concatenate(self.test_suite_labels)
+        self.test_code_idx_concat = np.concatenate(self.test_code_idx)
+
+    def test_step(
+        self,
+        batch: Tuple[torch.Tensor, torch.Tensor],
+        batch_idx: int,
+        dataloader_idx: int = 0,
+    ) -> None:
+        loss, metrics, x_original, x_reco, mask, labels, code_idx = self.model_step(
+            batch,
+            return_x=True,
+        )
+        if self._should_store_loop_batch(batch_idx, self.max_test_plot_batches):
+            self.test_x_original.append(x_original.detach().cpu().numpy())
+            self.test_x_reco.append(x_reco.detach().cpu().numpy())
+            self.test_mask.append(mask.detach().cpu().numpy())
+            self.test_labels.append(labels.detach().cpu().numpy())
+            suite_labels = batch.get("test_suite_labels")
+            if suite_labels is None:
+                suite_labels = torch.full_like(labels, dataloader_idx)
+            self.test_suite_labels.append(suite_labels.detach().cpu().numpy())
+            self.test_code_idx.append(code_idx.detach().cpu().numpy())
+        self.log("test_loss", loss.item(), on_step=False, on_epoch=True, prog_bar=True)
+        self._log_step_metrics(
+            "test_metrics",
+            metrics,
+            on_step=False,
+            on_epoch=True,
+            pid_confusion_key=f"test_suite_{dataloader_idx}",
+        )
+
+    def on_test_end(self):
+        logger.info("`on_test_end` called for dumb quantization baseline.")
+        self.concat_test_loop_predictions()
+
+
+class FaissKMeansBaselineLightning(DumbQuantizationBaselineLightning):
+    """Test-only baseline using a GPU FAISS centroid dictionary per particle."""
+
+    def __init__(
+        self,
+        num_codes: int,
+        fit_max_particles: int = 1_000_000,
+        fit_max_batches: int = 1000,
+        niter: int = 25,
+        nredo: int = 1,
+        seed: int = 12345,
+        use_gpu: bool = True,
+        save_codebook: bool = True,
+        upload_codebook_to_wandb: bool = True,
+        max_validation_plot_batches: int | None = 0,
+        max_test_plot_batches: int | None = None,
+        pid_cfg: dict | None = None,
+        **_,
+    ):
+        if int(num_codes) < 2:
+            raise ValueError(f"num_codes must be >= 2, got {num_codes}")
+        if int(fit_max_particles) < int(num_codes):
+            raise ValueError(
+                "fit_max_particles must be at least num_codes, got "
+                f"{fit_max_particles} and {num_codes}"
+            )
+        if int(fit_max_batches) < 1:
+            raise ValueError("fit_max_batches must be positive")
+        if int(niter) < 1 or int(nredo) < 1:
+            raise ValueError("niter and nredo must be positive")
+
+        # Reuse the established test-loop storage and metric implementation.
+        # Uniform scalar quantization is fully replaced by _quantize_batch.
+        super().__init__(
+            q_levels=[2, 2, 2],
+            binning="uniform",
+            pt_range=(0.0, 1.0),
+            max_validation_plot_batches=max_validation_plot_batches,
+            max_test_plot_batches=max_test_plot_batches,
+            pid_cfg=pid_cfg,
+        )
+        self.save_hyperparameters(logger=False)
+        self.num_codes = int(num_codes)
+        self.fit_max_particles = int(fit_max_particles)
+        self.fit_max_batches = int(fit_max_batches)
+        self.niter = int(niter)
+        self.nredo = int(nredo)
+        self.seed = int(seed)
+        self.use_gpu = bool(use_gpu)
+        self.save_codebook = bool(save_codebook)
+        self.upload_codebook_to_wandb = bool(upload_codebook_to_wandb)
+        self.q_levels = None
+        self.model = _BaselineModel(self.num_codes)
+        self.centroids: np.ndarray | None = None
+        self._faiss_index = None
+        self._fit_metadata: dict[str, Any] = {}
+
+    @staticmethod
+    def _class_fit_quotas(datamodule, total_particles: int) -> dict[int, tuple[str, int]]:
+        class_to_label = dict(
+            getattr(datamodule.hparams, "class_to_label", None)
+            or getattr(datamodule, "_class_to_label", None)
+            or {"all": 0}
+        )
+        class_specs = getattr(datamodule, "_class_specs", {})
+        weighted_classes = []
+        for class_name, label in sorted(class_to_label.items()):
+            spec = class_specs.get(class_name, {})
+            weight = float(spec.get("weight", 1.0))
+            if weight > 0 and spec.get("max_train_events") != 0:
+                weighted_classes.append((class_name, int(label), weight))
+        if not weighted_classes:
+            raise RuntimeError("No positively weighted training classes are available for fitting")
+
+        total_weight = sum(weight for _, _, weight in weighted_classes)
+        exact = [total_particles * weight / total_weight for _, _, weight in weighted_classes]
+        quotas = [int(math.floor(value)) for value in exact]
+        remainder = total_particles - sum(quotas)
+        fractional_order = sorted(
+            range(len(exact)),
+            key=lambda index: (exact[index] - quotas[index], -index),
+            reverse=True,
+        )
+        for index in fractional_order[:remainder]:
+            quotas[index] += 1
+        return {
+            label: (class_name, quota)
+            for (class_name, label, _), quota in zip(weighted_classes, quotas)
+        }
+
+    def _collect_fit_particles(self) -> tuple[np.ndarray, dict[str, int]]:
+        if self.trainer is None or self.trainer.datamodule is None:
+            raise ValueError("FAISS fitting requires an attached datamodule with train data")
+
+        quotas = self._class_fit_quotas(
+            self.trainer.datamodule,
+            self.fit_max_particles,
+        )
+        chunks: dict[int, list[np.ndarray]] = {label: [] for label in quotas}
+        counts = {label: 0 for label in quotas}
+        dataloader = self.trainer.datamodule.train_dataloader()
+        batches_seen = 0
+        for batch_idx, batch in enumerate(dataloader):
+            if batch_idx >= self.fit_max_batches:
+                break
+            batches_seen += 1
+            features = batch["part_features"]
+            mask = batch["part_mask"].bool()
+            if self.pid_enabled:
+                pid = batch["part_pid"]
+                pid_one_hot = F.one_hot(
+                    pid.clamp_min(0),
+                    self.pid_num_classes,
+                ).to(features.dtype)
+                features = torch.cat(
+                    [features, self.pid_feature_scale * pid_one_hot],
+                    dim=-1,
+                )
+            labels = batch["jet_type_labels"].long()
+            for label, (_, quota) in quotas.items():
+                needed = quota - counts[label]
+                if needed <= 0:
+                    continue
+                class_mask = mask & (labels == label).unsqueeze(1)
+                values = features[class_mask]
+                values = values[torch.all(torch.isfinite(values), dim=-1)]
+                if values.numel() == 0:
+                    continue
+                values_np = values[:needed].detach().cpu().numpy().astype(np.float32, copy=False)
+                chunks[label].append(values_np)
+                counts[label] += len(values_np)
+            if all(counts[label] >= quota for label, (_, quota) in quotas.items()):
+                break
+
+        sample_chunks = [chunk for label_chunks in chunks.values() for chunk in label_chunks]
+        if not sample_chunks:
+            raise RuntimeError(
+                "No finite valid training particles were available for FAISS fitting"
+            )
+        sample = np.ascontiguousarray(np.concatenate(sample_chunks), dtype=np.float32)
+        if len(sample) < self.num_codes:
+            raise RuntimeError(
+                f"FAISS needs at least {self.num_codes} fit particles, found {len(sample)}"
+            )
+
+        class_counts = {
+            quotas[label][0]: int(counts[label])
+            for label in sorted(quotas)
+        }
+        for label, (class_name, quota) in quotas.items():
+            if counts[label] < quota:
+                logger.warning(
+                    "FAISS fit quota for %s was not filled: %d/%d particles after %d batches.",
+                    class_name,
+                    counts[label],
+                    quota,
+                    batches_seen,
+                )
+        self._fit_metadata.update(
+            {
+                "fit_batches_seen": batches_seen,
+                "fit_particles_total": int(len(sample)),
+                "fit_particles_per_class": class_counts,
+                "fit_particle_targets_per_class": {
+                    class_name: int(quota)
+                    for _, (class_name, quota) in sorted(quotas.items())
+                },
+            }
+        )
+        return sample, class_counts
+
+    def _fit_faiss(self) -> None:
+        if self._faiss_index is not None:
+            return
+        try:
+            import faiss
+        except ImportError as exc:
+            raise RuntimeError(
+                "FAISS k-means baseline requires a GPU-enabled faiss installation"
+            ) from exc
+
+        gpu_count = int(faiss.get_num_gpus())
+        if self.use_gpu and gpu_count < 1:
+            raise RuntimeError("use_gpu=true but FAISS did not detect any CUDA GPUs")
+
+        sample, class_counts = self._collect_fit_particles()
+        max_points_per_centroid = max(1, math.ceil(len(sample) / self.num_codes))
+        logger.info(
+            "Fitting FAISS k-means with K=%d on %d particles (%s).",
+            self.num_codes,
+            len(sample),
+            class_counts,
+        )
+        start = time.perf_counter()
+        kmeans = faiss.Kmeans(
+            d=sample.shape[1],
+            k=self.num_codes,
+            niter=self.niter,
+            nredo=self.nredo,
+            seed=self.seed,
+            verbose=True,
+            gpu=self.use_gpu,
+            spherical=False,
+            min_points_per_centroid=1,
+            max_points_per_centroid=max_points_per_centroid,
+        )
+        kmeans.train(sample)
+        fit_seconds = time.perf_counter() - start
+        centroids = np.asarray(kmeans.centroids, dtype=np.float32).reshape(
+            self.num_codes,
+            sample.shape[1],
+        )
+        if not np.all(np.isfinite(centroids)):
+            raise RuntimeError("FAISS produced non-finite centroids")
+
+        objective = float(kmeans.obj[-1]) if len(kmeans.obj) else None
+        phi_radius = np.sqrt(centroids[:, 1] ** 2 + centroids[:, 2] ** 2)
+        self.centroids = np.ascontiguousarray(centroids)
+        self._faiss_index = kmeans.index
+        self._fit_metadata.update(
+            {
+                "num_codes": self.num_codes,
+                "feature_dim": int(sample.shape[1]),
+                "niter": self.niter,
+                "nredo": self.nredo,
+                "seed": self.seed,
+                "use_gpu": self.use_gpu,
+                "faiss_gpu_count": gpu_count,
+                "max_points_per_centroid": max_points_per_centroid,
+                "fit_seconds": fit_seconds,
+                "final_objective": objective,
+                "phi_radius_mean": float(np.mean(phi_radius)),
+                "phi_radius_min": float(np.min(phi_radius)),
+                "phi_radius_max": float(np.max(phi_radius)),
+            }
+        )
+        logger.info(
+            "Finished FAISS k-means in %.1f seconds; final objective=%s.",
+            fit_seconds,
+            objective,
+        )
+        self._save_codebook_artifacts()
+
+    def _save_codebook_artifacts(self) -> None:
+        if not self.save_codebook or self.centroids is None or not self.trainer.is_global_zero:
+            return
+        artifact_dir = Path(self.trainer.default_root_dir) / "artifacts"
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        centroids_path = artifact_dir / "faiss_kmeans_centroids.npz"
+        metadata_path = artifact_dir / "faiss_kmeans_metadata.json"
+        np.savez_compressed(centroids_path, centroids=self.centroids)
+        metadata_path.write_text(json.dumps(self._fit_metadata, indent=2, sort_keys=True))
+        logger.info("Saved FAISS centroid dictionary to %s", centroids_path)
+
+        if not self.upload_codebook_to_wandb:
+            return
+        for lightning_logger in self.trainer.loggers:
+            if not isinstance(lightning_logger, L.pytorch.loggers.WandbLogger):
+                continue
+            try:
+                import wandb
+
+                run = lightning_logger.experiment
+                artifact = wandb.Artifact(
+                    name=f"{run.id}-faiss-kmeans-{self.num_codes}",
+                    type="codebook",
+                    description="GPU FAISS k-means particle centroid dictionary.",
+                    metadata=self._fit_metadata,
+                )
+                artifact.add_file(str(centroids_path), name=centroids_path.name)
+                artifact.add_file(str(metadata_path), name=metadata_path.name)
+                run.log_artifact(artifact)
+                logger.info("Uploaded FAISS centroid dictionary as a W&B artifact.")
+            except Exception as exc:
+                logger.warning("Failed to upload FAISS codebook artifact to W&B: %s", exc)
+
+    def _quantize_batch(
+        self,
+        x_particle: torch.Tensor,
+        mask: torch.Tensor,
+        pid_particle: torch.Tensor | None = None,
+    ):
+        self._fit_faiss()
+        valid_mask = mask.bool()
+        x_reco = torch.zeros_like(x_particle)
+        code_idx = torch.zeros(mask.shape, dtype=torch.long, device=mask.device)
+        if not torch.any(valid_mask):
+            return x_reco, code_idx
+
+        search_features = x_particle
+        if self.pid_enabled:
+            if pid_particle is None:
+                raise ValueError("PID-enabled FAISS baseline requires a part_pid tensor")
+            pid_one_hot = F.one_hot(
+                pid_particle.clamp_min(0),
+                self.pid_num_classes,
+            ).to(x_particle.dtype)
+            search_features = torch.cat(
+                [x_particle, self.pid_feature_scale * pid_one_hot],
+                dim=-1,
+            )
+        valid = np.ascontiguousarray(
+            search_features[valid_mask].detach().float().cpu().numpy(),
+            dtype=np.float32,
+        )
+        _, indices = self._faiss_index.search(valid, 1)
+        indices = indices[:, 0].astype(np.int64, copy=False)
+        centroid_tensor = torch.as_tensor(
+            self.centroids,
+            dtype=x_particle.dtype,
+            device=x_particle.device,
+        )
+        index_tensor = torch.as_tensor(indices, dtype=torch.long, device=x_particle.device)
+        selected_centroids = centroid_tensor[index_tensor]
+        x_reco[valid_mask] = selected_centroids[:, : x_particle.shape[-1]]
+        code_idx[valid_mask] = index_tensor
+        pid_logits = None
+        if self.pid_enabled:
+            pid_values = (
+                selected_centroids[:, x_particle.shape[-1] :] / self.pid_feature_scale
+            ).clamp_min(0.0)
+            pid_probabilities = pid_values / pid_values.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+            pid_logits = x_particle.new_zeros(
+                (*mask.shape, self.pid_num_classes)
+            )
+            pid_logits[valid_mask] = torch.log(pid_probabilities.clamp_min(1e-8))
+        return x_reco, code_idx, pid_logits
+
+    def on_test_start(self) -> None:
+        self._fit_faiss()
+        numeric_metrics = {
+            "baseline/num_codes": self.num_codes,
+            "baseline/faiss_fit_seconds": self._fit_metadata["fit_seconds"],
+            "baseline/faiss_gpu_count": self._fit_metadata["faiss_gpu_count"],
+            "baseline/fit_particles_total": self._fit_metadata["fit_particles_total"],
+            "baseline/phi_radius_mean": self._fit_metadata["phi_radius_mean"],
+            "baseline/phi_radius_min": self._fit_metadata["phi_radius_min"],
+            "baseline/phi_radius_max": self._fit_metadata["phi_radius_max"],
+        }
+        if self._fit_metadata["final_objective"] is not None:
+            numeric_metrics["baseline/faiss_final_objective"] = self._fit_metadata[
+                "final_objective"
+            ]
+        for class_name, count in self._fit_metadata["fit_particles_per_class"].items():
+            numeric_metrics[f"baseline/fit_particles/{class_name}"] = count
+            numeric_metrics[f"baseline/fit_fraction/{class_name}"] = (
+                count / self._fit_metadata["fit_particles_total"]
+            )
+        for name, value in numeric_metrics.items():
+            self.log(name, float(value), on_step=False, on_epoch=True)
+
+    def on_test_epoch_start(self) -> None:
+        logger.info("`on_test_epoch_start` called for FAISS k-means baseline.")
+        self.test_x_original = []
+        self.test_x_reco = []
+        self.test_mask = []
+        self.test_labels = []
+        self.test_suite_labels = []
+        self.test_code_idx = []
+        self._clear_concat_outputs("test")
+
+    def on_test_end(self):
+        logger.info("`on_test_end` called for FAISS k-means baseline.")
+        self.concat_test_loop_predictions()
 
 
 class VQVAEMLP(torch.nn.Module):
@@ -166,7 +1138,10 @@ class VQVAETransformer(torch.nn.Module):
         old_transformer_implementation: bool = False,
         in_out_proj_cfg: Dict[str, Any] = None,
         latent_proj_cfg: Dict[str, Any] = None,
+        latent_sequence_compression: dict | None = None,
+        quantization_enabled: bool = True,
         transformer_cfg: dict = None,
+        pid_cfg: dict | None = None,
         **kwargs,
     ):
         super().__init__()
@@ -184,6 +1159,16 @@ class VQVAETransformer(torch.nn.Module):
         else:
             raise ValueError("Either input_features_dict or input_dim must be provided.")
 
+        pid_cfg = {} if pid_cfg is None else dict(pid_cfg)
+        self.pid_enabled = bool(pid_cfg.get("enabled", False))
+        self.pid_num_classes = int(pid_cfg.get("num_classes", 8))
+        self.pid_class_names = tuple(
+            pid_cfg.get("class_names")
+            or [f"class_{index}" for index in range(self.pid_num_classes)]
+        )
+        if self.pid_num_classes < 2:
+            raise ValueError("pid_cfg.num_classes must be at least 2")
+
         self.conditional_dim = conditional_dim
         self.latent_dim = latent_dim
         self.hidden_dim = hidden_dim
@@ -192,6 +1177,8 @@ class VQVAETransformer(torch.nn.Module):
         self.causal_decoder = causal_decoder
         self.max_sequence_len = max_sequence_len
         self.old_transformer_implementation = old_transformer_implementation
+        self.latent_sequence_compression_cfg = latent_sequence_compression
+        self.quantization_enabled = bool(quantization_enabled)
 
         if transformer_cfg is None:  # old config from when this was not configurable
             transformer_cfg = {
@@ -213,11 +1200,18 @@ class VQVAETransformer(torch.nn.Module):
         # Model components:
         if in_out_proj_cfg is None:
             self.input_projection = nn.Linear(
-                self.input_dim + self.conditional_dim, self.hidden_dim
+                self.input_dim
+                + (self.pid_num_classes if self.pid_enabled else 0)
+                + self.conditional_dim,
+                self.hidden_dim,
             )
         else:
             self.input_projection = MLP(
-                input_dim=self.input_dim + self.conditional_dim,
+                input_dim=(
+                    self.input_dim
+                    + (self.pid_num_classes if self.pid_enabled else 0)
+                    + self.conditional_dim
+                ),
                 hidden_dims=in_out_proj_cfg.get("hidden_dims"),
                 output_dim=self.hidden_dim,
                 activation=in_out_proj_cfg.get("activation", "GELU"),
@@ -250,11 +1244,42 @@ class VQVAETransformer(torch.nn.Module):
                 activation=latent_proj_cfg.get("activation", "GELU"),
             )
 
-        self.vqlayer = build_quantizer(
-            feature_size=self.latent_dim,
-            vq_kwargs=vq_kwargs,
-            split_quantizer_cfg=split_quantizer_cfg,
+        self.vqlayer = (
+            build_quantizer(
+                feature_size=self.latent_dim,
+                vq_kwargs=vq_kwargs,
+                split_quantizer_cfg=split_quantizer_cfg,
+            )
+            if self.quantization_enabled
+            else None
         )
+        self.latent_sequence_compressor = None
+        if latent_sequence_compression and latent_sequence_compression.get("enabled", False):
+            mode = latent_sequence_compression.get("mode", "learned_cross_attention")
+            if mode == "learned_cross_attention":
+                self.latent_sequence_compressor = LatentSequenceCompressor(
+                    latent_dim=self.latent_dim,
+                    max_sequence_len=self.max_sequence_len,
+                    ratio=float(latent_sequence_compression.get("ratio", 1.0)),
+                    min_tokens=int(latent_sequence_compression.get("min_tokens", 1)),
+                    rounding=latent_sequence_compression.get("rounding", "ceil"),
+                    num_heads=int(latent_sequence_compression.get("num_heads", self.num_heads)),
+                    dropout_rate=float(latent_sequence_compression.get("dropout_rate", 0.0)),
+                    query_residual=bool(latent_sequence_compression.get("query_residual", True)),
+                )
+            elif mode == "direct_prefix_masking":
+                self.latent_sequence_compressor = DirectPrefixLatentMasker(
+                    latent_dim=self.latent_dim,
+                    max_sequence_len=self.max_sequence_len,
+                    ratio=float(latent_sequence_compression.get("ratio", 1.0)),
+                    min_tokens=int(latent_sequence_compression.get("min_tokens", 1)),
+                    rounding=latent_sequence_compression.get("rounding", "ceil"),
+                )
+            else:
+                raise ValueError(
+                    "latent_sequence_compression.mode must be 'learned_cross_attention' "
+                    f"or 'direct_prefix_masking', got {mode!r}"
+                )
 
         if latent_proj_cfg is None:
             self.latent_projection_out = nn.Linear(
@@ -290,9 +1315,21 @@ class VQVAETransformer(torch.nn.Module):
                 output_dim=self.input_dim,
                 activation=in_out_proj_cfg.get("activation", "GELU"),
             )
+        self.pid_output_projection = (
+            nn.Linear(hidden_dim, self.pid_num_classes) if self.pid_enabled else None
+        )
 
-    def encode(self, x, mask, x_conditional=None):
+    def encode(self, x, mask, x_conditional=None, pid=None):
         """Encode input to latent embeddings."""
+        if self.pid_enabled:
+            if pid is None:
+                raise ValueError("PID-enabled model requires a part_pid tensor")
+            if pid.shape != mask.shape:
+                raise ValueError(
+                    f"part_pid and mask must have the same shape, got {pid.shape} and {mask.shape}"
+                )
+            pid_one_hot = F.one_hot(pid.clamp(min=0), self.pid_num_classes).to(x.dtype)
+            x = torch.cat([x, pid_one_hot], dim=-1) * mask.unsqueeze(-1)
         if x_conditional is not None:
             # x_conditional is of shape (B, C)
             # x is of shape (B, S, F)
@@ -310,13 +1347,63 @@ class VQVAETransformer(torch.nn.Module):
 
     def quantize(self, z_embed, mask=None):
         """Vector quantize the latent embeddings."""
+        if not self.quantization_enabled:
+            if mask is None:
+                mask = torch.ones(z_embed.shape[:2], dtype=torch.bool, device=z_embed.device)
+            return z_embed, {
+                "z": z_embed,
+                "z_q": z_embed,
+                "q": torch.full(
+                    mask.shape,
+                    -1,
+                    device=z_embed.device,
+                    dtype=torch.long,
+                ),
+                "loss": z_embed.new_zeros(()),
+                "quantization_bypassed": True,
+            }
         if isinstance(self.vqlayer, SplitQuantizer):
             z, vq_out = self.vqlayer(z_embed, mask=mask)
-        else:
-            z, vq_out = self.vqlayer(z_embed)
-        return z, vq_out
+            return z, vq_out
+        if mask is None:
+            return self.vqlayer(z_embed)
 
-    def decode(self, z, mask, x_conditional=None):
+        mask_bool = mask.bool()
+        z_q = torch.zeros_like(z_embed)
+        z_vq = torch.zeros_like(z_embed)
+        z_q_vq = torch.zeros_like(z_embed)
+
+        if not mask_bool.any():
+            q = torch.zeros(mask_bool.shape, device=z_embed.device, dtype=torch.long)
+            return z_q, {"z": z_vq, "z_q": z_q_vq, "q": q}
+
+        z_valid = z_embed[mask_bool]
+        z_q_valid, vq_out_valid = self.vqlayer(z_valid)
+        z_vq_valid = vq_out_valid.get("z", z_valid)
+        z_q_vq_valid = vq_out_valid.get("z_q", z_q_valid)
+        if z_vq_valid.shape == (*z_valid.shape[:-1], 1, z_valid.shape[-1]):
+            z_vq_valid = z_vq_valid.squeeze(-2)
+        if z_q_vq_valid.shape == (*z_q_valid.shape[:-1], 1, z_q_valid.shape[-1]):
+            z_q_vq_valid = z_q_vq_valid.squeeze(-2)
+        z_q[mask_bool] = z_q_valid
+        z_vq[mask_bool] = z_vq_valid
+        z_q_vq[mask_bool] = z_q_vq_valid
+
+        q_valid = vq_out_valid["q"].long()
+        if q_valid.ndim > 1 and q_valid.shape[-1] == 1:
+            q_valid = q_valid.squeeze(-1)
+        q = torch.zeros(
+            (*mask_bool.shape, *q_valid.shape[1:]),
+            device=z_embed.device,
+            dtype=q_valid.dtype,
+        )
+        q[mask_bool] = q_valid
+
+        vq_out = dict(vq_out_valid)
+        vq_out.update({"z": z_vq, "z_q": z_q_vq, "q": q})
+        return z_q, vq_out
+
+    def decode(self, z, mask, x_conditional=None, return_pid_logits: bool = False):
         """Decode quantized latents to reconstructed output."""
         if x_conditional is not None:
             z = torch.cat([z, x_conditional], dim=-1) * mask.unsqueeze(-1)
@@ -334,14 +1421,47 @@ class VQVAETransformer(torch.nn.Module):
             x_reco = self.decoder(x_reco, mask=mask, attn_mask=attn_mask)
         else:
             x_reco = self.decoder_normformer(x_reco, mask)
-        x_reco = self.output_projection(x_reco) * mask.unsqueeze(-1)
+        decoded = x_reco
+        x_reco = self.output_projection(decoded) * mask.unsqueeze(-1)
+        if return_pid_logits:
+            if self.pid_output_projection is None:
+                raise ValueError("PID logits requested from a PID-disabled model")
+            pid_logits = self.pid_output_projection(decoded) * mask.unsqueeze(-1)
+            return x_reco, pid_logits
         return x_reco
 
-    def forward(self, x, mask, x_conditional=None):
+    def forward(self, x, mask, x_conditional=None, pid=None):
         """Forward pass through encode, quantize, and decode."""
-        z_embed, x_conditional_repeated = self.encode(x, mask, x_conditional)
-        z, vq_out = self.quantize(z_embed, mask=mask)
-        x_reco = self.decode(z, mask, x_conditional_repeated)
+        z_embed, x_conditional_repeated = self.encode(x, mask, x_conditional, pid=pid)
+        if self.latent_sequence_compressor is not None:
+            z_to_quantize, latent_mask = self.latent_sequence_compressor.compress(
+                z_embed,
+                mask,
+            )
+            z_quantized, vq_out = self.quantize(z_to_quantize, mask=latent_mask)
+            vq_out["latent_mask"] = latent_mask
+            vq_out["particle_mask"] = mask
+            z = self.latent_sequence_compressor.expand(
+                z_quantized,
+                latent_mask,
+                target_len=x.shape[1],
+                particle_mask=mask,
+            )
+        else:
+            z, vq_out = self.quantize(z_embed, mask=mask)
+            vq_out["latent_mask"] = mask
+            vq_out["particle_mask"] = mask
+        decoded = self.decode(
+            z,
+            mask,
+            x_conditional_repeated,
+            return_pid_logits=self.pid_enabled,
+        )
+        if self.pid_enabled:
+            x_reco, pid_logits = decoded
+            vq_out["pid_logits"] = pid_logits
+        else:
+            x_reco = decoded
         return x_reco, vq_out
 
 
@@ -387,8 +1507,34 @@ class VQVAELightning(L.LightningModule):
     def _should_store_loop_batch(batch_idx: int, max_batches: int | None) -> bool:
         return max_batches is None or batch_idx < max_batches
 
+    @staticmethod
+    def _class_balanced_plot_selector(
+        labels: torch.Tensor,
+        stored_batches_per_class: dict[int, int],
+        max_batches_per_class: int | None,
+    ) -> torch.Tensor:
+        """Select up to ``max_batches_per_class`` validation batches per class."""
+        if max_batches_per_class is None:
+            return torch.ones_like(labels, dtype=torch.bool)
+
+        selector = torch.zeros_like(labels, dtype=torch.bool)
+        if max_batches_per_class <= 0:
+            return selector
+
+        for label_tensor in torch.unique(labels):
+            label = int(label_tensor.item())
+            if stored_batches_per_class.get(label, 0) >= max_batches_per_class:
+                continue
+            class_selector = labels == label_tensor
+            if torch.any(class_selector):
+                selector |= class_selector
+                stored_batches_per_class[label] = stored_batches_per_class.get(label, 0) + 1
+        return selector
+
     def _clear_concat_outputs(self, prefix: str) -> None:
-        for name in ["x_original", "x_reco", "mask", "labels", "code_idx"]:
+        for name in [
+            "x_original", "x_reco", "mask", "labels", "suite_labels", "code_idx", "code_mask"
+        ]:
             attr = f"{prefix}_{name}_concat"
             if hasattr(self, attr):
                 delattr(self, attr)
@@ -398,9 +1544,13 @@ class VQVAELightning(L.LightningModule):
         x_particle,
         mask_particle,
         x_conditional=None,
+        pid_particle=None,
     ):
         x_particle_reco, vq_out = self.model(
-            x_particle, mask=mask_particle, x_conditional=x_conditional
+            x_particle,
+            mask=mask_particle,
+            x_conditional=x_conditional,
+            pid=pid_particle,
         )
         return x_particle_reco, vq_out
 
@@ -412,12 +1562,14 @@ class VQVAELightning(L.LightningModule):
         x_jet = batch.get("jet_features", None)
         mask_particle = batch["part_mask"]
         labels = batch["jet_type_labels"]
+        pid_particle = batch.get("part_pid")
 
         # print(f"conditional_dim = {self.model.conditional_dim}")
         x_particle_reco, vq_out = self.forward(
             x_particle=x_particle,
             mask_particle=mask_particle,
             x_conditional=x_jet if self.model.conditional_dim > 0 else None,
+            pid_particle=pid_particle,
         )
 
         valid_mask = mask_particle.unsqueeze(-1)
@@ -440,8 +1592,12 @@ class VQVAELightning(L.LightningModule):
                 f"Unknown reconstruction_loss={reconstruction_loss!r}. "
                 "Expected 'l1' or 'l2'."
             )
+        quantization_bypassed = bool(vq_out.get("quantization_bypassed", False))
         is_split_quantizer = "branch_loss" in vq_out
-        if is_split_quantizer:
+        quantizer_mask = vq_out.get("latent_mask", mask_particle).to(device=x_particle.device)
+        if quantization_bypassed:
+            quantizer_loss = reco_loss.new_zeros(())
+        elif is_split_quantizer:
             quantizer_loss = vq_out["loss"].mean()
         else:
             quantizer_loss_per_token = (
@@ -450,12 +1606,32 @@ class VQVAELightning(L.LightningModule):
                 + self.model.vqlayer.beta
                 * (vq_out["z"].detach() - vq_out["z_q"]).pow(2).mean(dim=-1)
             )
+            quantizer_loss_mask = quantizer_mask
+            while quantizer_loss_mask.ndim < quantizer_loss_per_token.ndim:
+                quantizer_loss_mask = quantizer_loss_mask.unsqueeze(-1)
             quantizer_loss = (
-                quantizer_loss_per_token * mask_particle
-            ).sum() / mask_particle.sum().clamp_min(1)
-        quantizer_loss_weighted = quantizer_loss if is_split_quantizer else alpha * quantizer_loss
+                quantizer_loss_per_token * quantizer_loss_mask
+            ).sum() / quantizer_loss_mask.sum().clamp_min(1)
+        quantizer_loss_weighted = (
+            quantizer_loss
+            if is_split_quantizer or quantization_bypassed
+            else alpha * quantizer_loss
+        )
         code_idx = vq_out["q"]
-        loss = reco_loss + quantizer_loss_weighted
+        pid_loss = reco_loss.new_zeros(())
+        pid_accuracy = reco_loss.new_zeros(())
+        if self.model.pid_enabled:
+            if pid_particle is None:
+                raise ValueError("PID-enabled model received a batch without part_pid")
+            valid_pid = pid_particle[mask_particle.bool()]
+            pid_logits = vq_out["pid_logits"][mask_particle.bool()]
+            pid_loss = F.cross_entropy(pid_logits, valid_pid)
+            pid_accuracy = (pid_logits.argmax(dim=-1) == valid_pid).float().mean()
+        pid_loss_weight = float(
+            (self.hparams["model_kwargs"].get("pid_cfg") or {}).get("loss_weight", 1.0)
+        )
+        pid_loss_weighted = pid_loss_weight * pid_loss
+        loss = reco_loss + pid_loss_weighted + quantizer_loss_weighted
         metrics = {
             "loss_total": loss.detach(),
             "loss_reco": reco_loss.detach(),
@@ -465,16 +1641,125 @@ class VQVAELightning(L.LightningModule):
             "loss_reco_l1_per_value": reco_l1_per_value.detach(),
             "loss_quantizer": quantizer_loss.detach(),
             "loss_quantizer_weighted": quantizer_loss_weighted.detach(),
+            "loss_pid": pid_loss.detach(),
+            "loss_pid_weighted": pid_loss_weighted.detach(),
+            "pid_accuracy": pid_accuracy.detach(),
+            "quantizer/enabled": x_particle.new_tensor(float(not quantization_bypassed)),
         }
+        if self.model.pid_enabled:
+            metrics.update(
+                _pid_recall_metrics(valid_pid, pid_logits, self.model.pid_class_names)
+            )
+            metrics["pid_confusion_matrix"] = _pid_confusion_counts(
+                valid_pid, pid_logits, self.model.pid_num_classes
+            )
+        particle_token_count = mask_particle.to(dtype=torch.float32).sum()
+        latent_token_count = quantizer_mask.to(dtype=torch.float32).sum()
+        latent_sequence_compressor = getattr(self.model, "latent_sequence_compressor", None)
+        configured_ratio = (
+            latent_sequence_compressor.ratio if latent_sequence_compressor is not None else 1.0
+        )
+        metrics.update(
+            {
+                "latent_sequence/enabled": x_particle.new_tensor(
+                    float(latent_sequence_compressor is not None)
+                ),
+                "latent_sequence/configured_ratio": x_particle.new_tensor(configured_ratio),
+                "latent_sequence/query_residual_enabled": x_particle.new_tensor(
+                    float(
+                        latent_sequence_compressor is not None
+                        and getattr(latent_sequence_compressor, "query_residual", False)
+                    )
+                ),
+                "latent_sequence/direct_prefix_masking_enabled": x_particle.new_tensor(
+                    float(
+                        latent_sequence_compressor is not None
+                        and getattr(latent_sequence_compressor, "mode", None)
+                        == "direct_prefix_masking"
+                    )
+                ),
+                "latent_sequence/mean_particle_tokens": (
+                    mask_particle.to(dtype=torch.float32).sum(dim=1).mean().detach()
+                ),
+                "latent_sequence/mean_latent_tokens": (
+                    quantizer_mask.to(dtype=torch.float32).sum(dim=1).mean().detach()
+                ),
+                "latent_sequence/effective_token_ratio": (
+                    latent_token_count / particle_token_count.clamp_min(1.0)
+                ).detach(),
+            }
+        )
+        if not is_split_quantizer and not quantization_bypassed:
+            z_norm = vq_out["z"].norm(dim=-1)
+            z_q_norm = vq_out["z_q"].norm(dim=-1)
+            norm_ratio = z_q_norm / z_norm.clamp_min(1e-6)
+            norm_mask = quantizer_mask.to(dtype=z_norm.dtype)
+            while norm_mask.ndim < z_norm.ndim:
+                norm_mask = norm_mask.unsqueeze(-1)
+            norm_mask = norm_mask.expand_as(z_norm)
+            norm_denom = norm_mask.sum().clamp_min(1.0)
+            norm_ratio_masked = torch.where(
+                norm_mask > 0,
+                norm_ratio,
+                torch.zeros_like(norm_ratio),
+            )
+            metrics.update(
+                {
+                    "vq_latent_mean_norm": (
+                        z_norm * norm_mask
+                    ).sum().detach()
+                    / norm_denom,
+                    "vq_quantized_mean_norm": (
+                        z_q_norm * norm_mask
+                    ).sum().detach()
+                    / norm_denom,
+                    "vq_norm_ratio_mean": (
+                        norm_ratio * norm_mask
+                    ).sum().detach()
+                    / norm_denom,
+                    "vq_norm_ratio_max": norm_ratio_masked.max().detach(),
+                }
+            )
         for branch, branch_loss in vq_out.get("branch_loss", {}).items():
             metrics[f"loss_quantizer_{branch}"] = branch_loss.detach()
         for branch, branch_loss in vq_out.get("branch_loss_weighted", {}).items():
             metrics[f"loss_quantizer_{branch}_weighted"] = branch_loss.detach()
+        metrics.update(self._vq_codebook_norm_metrics())
 
         if return_x:
-            return loss, metrics, x_particle, x_particle_reco, mask_particle, labels, code_idx
+            return (
+                loss,
+                metrics,
+                x_particle,
+                x_particle_reco,
+                mask_particle,
+                labels,
+                code_idx,
+                quantizer_mask,
+            )
 
         return loss, metrics
+
+    def _vq_codebook_norm_metrics(self) -> dict[str, torch.Tensor]:
+        """Return mean entry norms for learned VQ codebooks, skipping FSQ branches."""
+        vqlayer = self.model.vqlayer
+        metrics = {}
+
+        def mean_codebook_norm(vq_layer: VectorQuant) -> torch.Tensor:
+            codebook = vq_layer.get_codebook()
+            return codebook.norm(dim=-1).mean().detach()
+
+        if isinstance(vqlayer, VectorQuant):
+            metrics["vq_codebook_mean_norm"] = mean_codebook_norm(vqlayer)
+            return metrics
+
+        if isinstance(vqlayer, SplitQuantizer):
+            for branch, quantizer in vqlayer.quantizers.items():
+                branch_vq = getattr(quantizer, "vq", None)
+                if isinstance(branch_vq, VectorQuant):
+                    metrics[f"vq_codebook_mean_norm_{branch}"] = mean_codebook_norm(branch_vq)
+
+        return metrics
 
     def _log_step_metrics(
         self,
@@ -484,8 +1769,13 @@ class VQVAELightning(L.LightningModule):
         on_step: bool,
         on_epoch: bool,
         prog_bar: bool = False,
+        pid_confusion_key: str | None = None,
     ) -> None:
         for name, value in metrics.items():
+            if name == "pid_confusion_matrix":
+                if pid_confusion_key is not None:
+                    _accumulate_pid_confusion(self, pid_confusion_key, value)
+                continue
             self.log(
                 f"{prefix}/{name}",
                 value,
@@ -552,23 +1842,34 @@ class VQVAELightning(L.LightningModule):
         self.val_mask = []
         self.val_labels = []
         self.val_code_idx = []
+        self.val_code_mask = []
+        self._validation_plot_batches_per_class = {}
+        self._pid_confusion_matrices = {}
         self._clear_concat_outputs("val")
 
+    def on_validation_epoch_end(self) -> None:
+        for key in getattr(self, "_pid_confusion_matrices", {}):
+            _save_pid_confusion_artifacts(self, key)
+
     def validation_step(self, batch: Tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> None:
-        loss, metrics, x_original, x_reco, mask, labels, code_idx = self.model_step(
+        loss, metrics, x_original, x_reco, mask, labels, code_idx, code_mask = self.model_step(
             batch,
             return_x=True,
         )
 
-        # Keep only a small validation sample for expensive plotting/physics evaluation.
-        if self._should_store_loop_batch(
-            batch_idx, self.hparams.get("max_validation_plot_batches")
-        ):
-            self.val_x_original.append(x_original.detach().cpu().numpy())
-            self.val_x_reco.append(x_reco.detach().cpu().numpy())
-            self.val_mask.append(mask.detach().cpu().numpy())
-            self.val_labels.append(labels.detach().cpu().numpy())
-            self.val_code_idx.append(code_idx.detach().cpu().numpy())
+        # Keep a small sample from every class for expensive plotting/physics evaluation.
+        plot_selector = self._class_balanced_plot_selector(
+            labels,
+            self._validation_plot_batches_per_class,
+            self.hparams.get("max_validation_plot_batches"),
+        )
+        if torch.any(plot_selector):
+            self.val_x_original.append(x_original[plot_selector].detach().cpu().numpy())
+            self.val_x_reco.append(x_reco[plot_selector].detach().cpu().numpy())
+            self.val_mask.append(mask[plot_selector].detach().cpu().numpy())
+            self.val_labels.append(labels[plot_selector].detach().cpu().numpy())
+            self.val_code_idx.append(code_idx[plot_selector].detach().cpu().numpy())
+            self.val_code_mask.append(code_mask[plot_selector].detach().cpu().numpy())
 
         self.log("val_loss", loss.item(), on_step=False, on_epoch=True, prog_bar=True)
         self._log_step_metrics(
@@ -576,6 +1877,7 @@ class VQVAELightning(L.LightningModule):
             metrics,
             on_step=False,
             on_epoch=True,
+            pid_confusion_key="val",
         )
 
         return loss
@@ -586,11 +1888,23 @@ class VQVAELightning(L.LightningModule):
         self.test_x_reco = []
         self.test_mask = []
         self.test_labels = []
+        self.test_suite_labels = []
         self.test_code_idx = []
+        self.test_code_mask = []
+        self._pid_confusion_matrices = {}
         self._clear_concat_outputs("test")
 
-    def test_step(self, batch: Tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> None:
-        loss, metrics, x_original, x_reco, mask, labels, code_idx = self.model_step(
+    def on_test_epoch_end(self) -> None:
+        for key in getattr(self, "_pid_confusion_matrices", {}):
+            _save_pid_confusion_artifacts(self, key)
+
+    def test_step(
+        self,
+        batch: Tuple[torch.Tensor, torch.Tensor],
+        batch_idx: int,
+        dataloader_idx: int = 0,
+    ) -> None:
+        loss, metrics, x_original, x_reco, mask, labels, code_idx, code_mask = self.model_step(
             batch,
             return_x=True,
         )
@@ -600,7 +1914,12 @@ class VQVAELightning(L.LightningModule):
             self.test_x_reco.append(x_reco.detach().cpu().numpy())
             self.test_mask.append(mask.detach().cpu().numpy())
             self.test_labels.append(labels.detach().cpu().numpy())
+            suite_labels = batch.get("test_suite_labels")
+            if suite_labels is None:
+                suite_labels = torch.full_like(labels, dataloader_idx)
+            self.test_suite_labels.append(suite_labels.detach().cpu().numpy())
             self.test_code_idx.append(code_idx.detach().cpu().numpy())
+            self.test_code_mask.append(code_mask.detach().cpu().numpy())
 
         self.log("test_loss", loss.item(), on_step=False, on_epoch=True, prog_bar=True)
         self._log_step_metrics(
@@ -608,6 +1927,7 @@ class VQVAELightning(L.LightningModule):
             metrics,
             on_step=False,
             on_epoch=True,
+            pid_confusion_key=f"test_suite_{dataloader_idx}",
         )
 
     def tokenize_ak_array(
@@ -971,6 +2291,7 @@ class VQVAELightning(L.LightningModule):
         self.val_mask_concat = np.concatenate(self.val_mask)
         self.val_labels_concat = np.concatenate(self.val_labels)
         self.val_code_idx_concat = np.concatenate(self.val_code_idx)
+        self.val_code_mask_concat = np.concatenate(self.val_code_mask)
 
     def on_validation_end(self) -> None:
         """Lightning hook that is called when a validation loop ends."""
@@ -989,7 +2310,9 @@ class VQVAELightning(L.LightningModule):
         self.test_x_reco_concat = np.concatenate(self.test_x_reco)
         self.test_mask_concat = np.concatenate(self.test_mask)
         self.test_labels_concat = np.concatenate(self.test_labels)
+        self.test_suite_labels_concat = np.concatenate(self.test_suite_labels)
         self.test_code_idx_concat = np.concatenate(self.test_code_idx)
+        self.test_code_mask_concat = np.concatenate(self.test_code_mask)
 
     def configure_optimizers(self) -> Dict[str, Any]:
         """Configures optimizers and learning-rate schedulers to be used for training."""

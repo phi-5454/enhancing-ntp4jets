@@ -1,4 +1,4 @@
-import torch
+:import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -7,6 +7,7 @@ import vqtorch
 from vqtorch.norms import with_codebook_normalization
 from .vq_base import _VQBaseLayer
 from .affine import AffineTransform
+from .rotation import rotation_trick
 
 
 class VectorQuant(_VQBaseLayer):
@@ -41,6 +42,10 @@ class VectorQuant(_VQBaseLayer):
 			inplace_optimizer: torch.optim.Optimizer = None,
 			**kwargs,
 			):
+        
+		self.rotation_tr = kwargs.pop("rotation_tr", False)
+		self.rotation_scale_min = kwargs.pop("rotation_scale_min", None)
+		self.rotation_scale_max = kwargs.pop("rotation_scale_max", None)
 
 		super().__init__(feature_size, num_codes, **kwargs)
 		self.loss_fn, self.dist_fn = get_dist_fns('euclidean')
@@ -78,6 +83,25 @@ class VectorQuant(_VQBaseLayer):
 		else:
 			z_q = z + (z_q - z).detach()
 		return z_q
+	
+
+	def rot_trick(self, z, z_q):
+
+		z_q_rt = rotation_trick(
+			z,
+			z_q,
+			scale_min=self.rotation_scale_min,
+			scale_max=self.rotation_scale_max,
+		)
+
+		if self.nu > 0:
+			z_q_rt = (
+				z_q_rt
+				+ (self.nu * z_q)
+				+ (-self.nu * z_q).detach()
+		)
+		
+		return z_q_rt
 
 
 	def compute_loss(self, z_e, z_q):
@@ -173,8 +197,12 @@ class VectorQuant(_VQBaseLayer):
 			'loss': self.compute_loss(z, z_q).mean(),
 			'perplexity': perplexity,
 			}
-
-		z_q = self.straight_through_approximation(z, z_q)
+        
+		if self.rotation_tr:
+			z_q = self.rot_trick(z,z_q)
+		else:
+			z_q = self.straight_through_approximation(z, z_q)
+		
 		z_q = self.to_original_format(z_q)
 
 		return z_q, to_return
