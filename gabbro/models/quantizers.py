@@ -30,7 +30,8 @@ class FSQ(nn.Module):
         z_scaled = z_bounded * half_width
         z_rounded = torch.round(z_scaled)
         z_hat = z_rounded / half_width.clamp(min=1)
-        z_decoded = z + (z_hat - z).detach()
+        # Straight-through gradients follow the bounded FSQ path, not raw z.
+        z_decoded = z_bounded + (z_hat - z_bounded).detach()
 
         per_dim_codes = (z_rounded + half_width).long().clamp_min(0)
         strides = torch.cumprod(
@@ -206,6 +207,25 @@ class SplitQuantizer(nn.Module):
             branch: self._branch_dim(branch, cfg, default_quantizer)
             for branch in self.branch_order
         }
+        self.active_branches = [
+            branch for branch, dim in self.branch_dims.items() if dim > 0
+        ]
+        self.bypass_single_branch_projection = bool(
+            cfg.get("bypass_single_branch_projection", False)
+        )
+        if self.bypass_single_branch_projection:
+            if len(self.active_branches) != 1:
+                raise ValueError(
+                    "bypass_single_branch_projection requires exactly one active branch; "
+                    f"got {self.active_branches}."
+                )
+            active_branch = self.active_branches[0]
+            if self.branch_dims[active_branch] != feature_size:
+                raise ValueError(
+                    "bypass_single_branch_projection requires the active branch dimension "
+                    f"to match the latent dimension: branch {active_branch!r} has "
+                    f"dim={self.branch_dims[active_branch]}, latent dim={feature_size}."
+                )
         configured_loss_weights = cfg.get("branch_loss_weights", {}) or {}
         self.branch_loss_weights = {
             branch: float(configured_loss_weights.get(branch, 1.0))
@@ -214,8 +234,16 @@ class SplitQuantizer(nn.Module):
         if sum(self.branch_dims.values()) <= 0:
             raise ValueError("At least one split quantizer branch must have positive dimension")
 
-        self.phi = SplitPhi(feature_size, self.branch_dims, projection_cfg)
-        self.psi = SplitPsi(self.branch_dims, feature_size, projection_cfg)
+        self.phi = (
+            None
+            if self.bypass_single_branch_projection
+            else SplitPhi(feature_size, self.branch_dims, projection_cfg)
+        )
+        self.psi = (
+            None
+            if self.bypass_single_branch_projection
+            else SplitPsi(self.branch_dims, feature_size, projection_cfg)
+        )
         self.quantizers = nn.ModuleDict(
             {
                 branch: self._build_branch_quantizer(branch, cfg, default_quantizer)
@@ -309,6 +337,11 @@ class SplitQuantizer(nn.Module):
             for branch, codes in branch_codes.items()
             if branch in self.quantizers
         }
+        if self.bypass_single_branch_projection:
+            z_q = quantized_branches[self.active_branches[0]]
+            if mask is not None:
+                z_q = z_q * mask.unsqueeze(-1)
+            return z_q
         return self.psi(quantized_branches, mask)
 
     def forward(
@@ -316,7 +349,10 @@ class SplitQuantizer(nn.Module):
         z: torch.Tensor,
         mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
-        branch_latents = self.phi(z, mask)
+        if self.bypass_single_branch_projection:
+            branch_latents = {self.active_branches[0]: z}
+        else:
+            branch_latents = self.phi(z, mask)
         quantized_branches = {}
         branch_codes = {}
         branch_losses = {}
@@ -327,7 +363,10 @@ class SplitQuantizer(nn.Module):
         def reduce_loss(loss: torch.Tensor) -> torch.Tensor:
             if mask_values is None:
                 return loss.mean()
-            return (loss * mask_values).sum() / mask_values.sum().clamp_min(1.0)
+            loss_mask = mask_values
+            while loss_mask.ndim < loss.ndim:
+                loss_mask = loss_mask.unsqueeze(-1)
+            return (loss * loss_mask).sum() / loss_mask.sum().clamp_min(1.0)
 
         for branch, quantizer in self.quantizers.items():
             branch_input = branch_latents[branch]
@@ -344,7 +383,10 @@ class SplitQuantizer(nn.Module):
                 branch_loss * self.branch_loss_weights.get(branch, 1.0)
             )
 
-        z_q = self.psi(quantized_branches, mask)
+        if self.bypass_single_branch_projection:
+            z_q = quantized_branches[self.active_branches[0]]
+        else:
+            z_q = self.psi(quantized_branches, mask)
         loss = sum(branch_weighted_losses.values())
         return z_q, {
             "z_q": z_q,
