@@ -21,8 +21,14 @@ class TokenExportCallback(L.Callback):
         self.export_test = export_test
 
     def _export(self, trainer: L.Trainer, pl_module: L.LightningModule, stage: str) -> None:
+        if not getattr(pl_module.model, "quantization_enabled", True):
+            logger.info(f"Quantization is bypassed; skipping token export for {stage}.")
+            return
         code_idx_attr = f"{stage}_code_idx_concat"
-        mask_attr = f"{stage}_mask_concat"
+        code_mask_attr = f"{stage}_code_mask_concat"
+        mask_attr = (
+            code_mask_attr if hasattr(pl_module, code_mask_attr) else f"{stage}_mask_concat"
+        )
         labels_attr = f"{stage}_labels_concat"
 
         if not hasattr(pl_module, code_idx_attr):
