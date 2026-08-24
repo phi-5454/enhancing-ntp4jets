@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import re
 from collections import Counter
 from pathlib import Path
@@ -35,6 +36,34 @@ from gabbro.plotting.orbit import (
     plot_multirun_metric,
     plot_multirun_residual_histograms,
 )
+
+
+def _load_explicit_env_file() -> None:
+    """Load ``GABBRO_ENV_FILE`` exactly like the training entrypoint does."""
+    env_file = os.environ.get("GABBRO_ENV_FILE")
+    if not env_file:
+        return
+    env_path = Path(os.path.expandvars(os.path.expanduser(env_file)))
+    if not env_path.is_file():
+        raise FileNotFoundError(f"GABBRO_ENV_FILE does not exist: {env_path}")
+    for raw_line in env_path.read_text().splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key, value = key.strip(), value.strip()
+        if not key:
+            continue
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        os.environ[key] = os.path.expandvars(value)
+
+
+_load_explicit_env_file()
 
 
 def _load_config(path: Path) -> Any:
@@ -217,7 +246,10 @@ def _serializable_record(record: dict[str, Any]) -> dict[str, Any]:
     return serialized
 
 
-def _artifact_prefix(stage: str, group: str) -> str:
+def _artifact_prefix(stage: str, group: str, suite: str | None = None) -> str:
+    """Return the callback artifact stem for legacy or named test suites."""
+    if suite is not None:
+        return f"{stage}_{suite}_{group}_orbit"
     return f"{stage}_orbit" if group == "all" else f"{stage}_{group}_orbit"
 
 
@@ -249,11 +281,12 @@ def _collect_record(
     run_dir: Path,
     stage: str,
     group: str,
+    suite: str | None = None,
     label_override: str | None = None,
     family_override: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, np.ndarray] | None]:
     cfg = _load_config(run_dir / ".hydra" / "config.yaml")
-    artifact_prefix = _artifact_prefix(stage, group)
+    artifact_prefix = _artifact_prefix(stage, group, suite)
     histogram_path = _latest_artifact_file(
         run_dir,
         "saved_histograms",
@@ -281,10 +314,13 @@ def _collect_record(
         "artifact_dir": histogram_path.parents[1] if histogram_path else None,
         "stage": stage,
         "group": group,
+        "suite": suite,
         "plot_family": family_override or (
             "FAISS k-means" if metadata["quantizer_family"] == "kmeans" else None
         ),
         "seed": int(_cfg_get(cfg, "seed", 0)),
+        "wandb_project": _select(cfg, "logger.wandb.project"),
+        "wandb_group": _select(cfg, "logger.wandb.group"),
         **metadata,
         **metrics,
     }
@@ -563,6 +599,7 @@ def _save_figures(
             figures["combined_reconstruction_features"] = plot_multirun_feature_histograms(
                 histogram_runs,
                 feature_names,
+                figsize_per_axis=(7.0, 5.2),
             )
         common_residual_features = set(_histogram_residual_features(histogram_runs[0]["histograms"]))
         for run in histogram_runs[1:]:
@@ -581,19 +618,57 @@ def _save_figures(
         plt.close(figure)
 
 
+def _first_nonempty(records: list[dict[str, Any]], key: str) -> str | None:
+    for record in records:
+        value = record.get(key)
+        if value:
+            return str(value)
+    return None
+
+
+def _wandb_upload_settings(args, records: list[dict[str, Any]], output_dir: Path) -> dict[str, str | None] | None:
+    """Return a dedicated comparison-run identity when W&B credentials are available."""
+    if args.no_wandb or not os.environ.get("WANDB_API_KEY"):
+        return None
+    return {
+        "project": args.wandb_project
+        or os.environ.get("WANDB_PROJECT")
+        or _first_nonempty(records, "wandb_project")
+        or "orbit-tokenizer",
+        "name": args.wandb_name or f"orbit-multirun-{output_dir.name}",
+        "group": args.wandb_group or os.environ.get("WANDB_GROUP") or "orbit-multirun-comparisons",
+        "entity": args.wandb_entity or os.environ.get("WANDB_ENTITY"),
+    }
+
+
 def _upload_to_wandb(
     output_dir: Path,
     project: str,
     name: str | None,
     group: str | None,
     entity: str | None,
+    records: list[dict[str, Any]],
+    stage: str,
+    comparison_group: str,
 ) -> None:
     try:
         import wandb
     except ImportError as exc:
         raise SystemExit("W&B upload requested, but wandb is not installed.") from exc
 
-    run = wandb.init(project=project, name=name, group=group, entity=entity, job_type="comparison")
+    run = wandb.init(
+        project=project,
+        name=name,
+        group=group,
+        entity=entity,
+        job_type="multirun-comparison",
+        config={
+            "stage": stage,
+            "artifact_group": comparison_group,
+            "compared_run_count": len(records),
+            "compared_runs": [str(record["run_dir"]) for record in records],
+        },
+    )
     try:
         payload = {}
         for image_path in sorted(output_dir.glob("*.png")):
@@ -601,6 +676,18 @@ def _upload_to_wandb(
         for artifact_path in (output_dir / "manifest.json", output_dir / "summary.csv"):
             if artifact_path.exists():
                 run.save(str(artifact_path), base_path=str(output_dir))
+        artifact = wandb.Artifact(
+            name=f"orbit-multirun-{output_dir.name}-{run.id}",
+            type="orbit-multirun-comparison",
+            metadata={"stage": stage, "group": comparison_group, "run_count": len(records)},
+        )
+        for path in sorted(output_dir.glob("*.png")) + [
+            output_dir / "manifest.json",
+            output_dir / "summary.csv",
+        ]:
+            if path.is_file():
+                artifact.add_file(str(path), name=path.name)
+        run.log_artifact(artifact)
         if payload:
             run.log(payload)
     finally:
@@ -643,12 +730,17 @@ def main() -> None:
         ),
     )
     parser.add_argument("--stage", choices=("val", "test"), default="val")
+    parser.add_argument(
+        "--suite",
+        help="Named test suite to compare, e.g. training_like or tt_vs_gghbb.",
+    )
     parser.add_argument("--group", default="all")
     parser.add_argument("--output-dir", type=Path)
-    parser.add_argument("--wandb-project", help="Upload generated comparison outputs to W&B.")
-    parser.add_argument("--wandb-name", help="W&B comparison run name.")
-    parser.add_argument("--wandb-group", help="W&B comparison run group.")
-    parser.add_argument("--wandb-entity", help="W&B entity/team.")
+    parser.add_argument("--no-wandb", action="store_true", help="Keep comparison outputs local.")
+    parser.add_argument("--wandb-project", help="Override the dedicated W&B comparison project.")
+    parser.add_argument("--wandb-name", help="Override the W&B comparison run name.")
+    parser.add_argument("--wandb-group", help="Override the W&B comparison run group.")
+    parser.add_argument("--wandb-entity", help="Override the W&B entity/team.")
     parser.add_argument(
         "--original-bits-per-input-particle",
         type=float,
@@ -666,6 +758,8 @@ def main() -> None:
         parser.error("--original-bits-per-input-particle must be positive")
     if args.continuous_autoencoder_mse is not None and args.continuous_autoencoder_mse <= 0:
         parser.error("--continuous-autoencoder-mse must be positive")
+    if args.suite is not None and args.stage != "test":
+        parser.error("--suite can only be used with --stage test")
 
     if args.multirun_dir is not None:
         run_specs = [
@@ -690,6 +784,7 @@ def main() -> None:
             run_dir,
             args.stage,
             args.group,
+            args.suite,
             label_override,
             family_override,
         )
@@ -716,14 +811,20 @@ def main() -> None:
         original_bits_per_input_particle=args.original_bits_per_input_particle,
         continuous_autoencoder_mse=args.continuous_autoencoder_mse,
     )
-    if args.wandb_project:
+    wandb_settings = _wandb_upload_settings(args, records, output_dir)
+    if wandb_settings is not None:
         _upload_to_wandb(
             output_dir,
-            project=args.wandb_project,
-            name=args.wandb_name,
-            group=args.wandb_group,
-            entity=args.wandb_entity,
+            project=wandb_settings["project"],
+            name=wandb_settings["name"],
+            group=wandb_settings["group"],
+            entity=wandb_settings["entity"],
+            records=records,
+            stage=args.stage,
+            comparison_group=args.group,
         )
+    elif not args.no_wandb:
+        print("W&B credentials were not found; kept comparison outputs local.")
     print(f"Collected {len(records)} runs into {output_dir}")
 
 

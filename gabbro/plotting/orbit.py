@@ -1622,10 +1622,11 @@ def plot_multirun_feature_histograms(
     runs: list[dict],
     feature_names: list[str],
     title: str = "Reconstruction comparison",
+    figsize_per_axis: tuple[float, float] = (5.0, 3.6),
 ):
     """Overlay reconstructed feature histograms from several runs."""
     hep = _multirun_mplhep()
-    fig, axes = _grid(len(feature_names))
+    fig, axes = _grid(len(feature_names), figsize_per_axis=figsize_per_axis)
     _set_suptitle(fig, title, fontsize=16)
     reference = runs[0]["histograms"]
     for i, feature_name in enumerate(feature_names):

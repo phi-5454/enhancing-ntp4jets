@@ -1,5 +1,7 @@
 """Tests for entropy and rate-distortion multirun outputs."""
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
@@ -7,6 +9,8 @@ pytest.importorskip("mplhep")
 
 from scripts.collect_orbit_multirun import _save_figures
 from scripts.collect_orbit_multirun import _quantizer_metadata
+from scripts.collect_orbit_multirun import _wandb_upload_settings
+from scripts.collect_orbit_multirun import _artifact_prefix
 from gabbro.plotting.orbit import plot_multirun_metric
 
 
@@ -57,6 +61,11 @@ def test_faiss_kmeans_multirun_metadata():
     assert metadata["total_codebook_size"] == 8192
 
 
+def test_named_test_suite_artifact_prefix():
+    assert _artifact_prefix("test", "all", "training_like") == "test_training_like_all_orbit"
+    assert _artifact_prefix("test", "tt", "tt_vs_gghbb") == "test_tt_vs_gghbb_tt_orbit"
+
+
 def test_multirun_metric_reference_lines():
     figure = plot_multirun_metric(
         [{"label": "FSQ", "rate": 4.0, "mse": 0.1}],
@@ -80,3 +89,27 @@ def test_multirun_metric_reference_lines():
     assert np.all(
         np.asarray(labelled_lines["Continuous autoencoder"].get_ydata()) == 0.01
     )
+
+
+def test_multirun_wandb_upload_uses_detected_credentials(monkeypatch, tmp_path):
+    args = SimpleNamespace(
+        no_wandb=False,
+        wandb_project=None,
+        wandb_name=None,
+        wandb_group=None,
+        wandb_entity=None,
+    )
+    records = [{"wandb_project": "orbit-tokenizer", "run_dir": tmp_path / "run"}]
+    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+    assert _wandb_upload_settings(args, records, tmp_path / "comparison") is None
+
+    monkeypatch.setenv("WANDB_API_KEY", "test-key")
+    monkeypatch.setenv("WANDB_ENTITY", "test-entity")
+    settings = _wandb_upload_settings(args, records, tmp_path / "comparison")
+
+    assert settings == {
+        "project": "orbit-tokenizer",
+        "name": "orbit-multirun-comparison",
+        "group": "orbit-multirun-comparisons",
+        "entity": "test-entity",
+    }
