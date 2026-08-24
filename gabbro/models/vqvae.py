@@ -84,6 +84,12 @@ def _save_pid_confusion_artifacts(module: L.LightningModule, key: str) -> None:
         return
 
     counts_np = counts.detach().cpu().numpy().astype(np.int64)
+    pid_class_names = tuple(
+        getattr(module, "pid_class_names", None)
+        or getattr(getattr(module, "model", None), "pid_class_names", ())
+    )
+    if len(pid_class_names) != counts_np.shape[0]:
+        pid_class_names = tuple(f"class_{index}" for index in range(counts_np.shape[0]))
     row_totals = counts_np.sum(axis=1, keepdims=True)
     normalized = np.divide(
         counts_np,
@@ -98,8 +104,8 @@ def _save_pid_confusion_artifacts(module: L.LightningModule, key: str) -> None:
     json_path.write_text(
         json.dumps(
             {
-                "truth_labels": list(module.pid_class_names),
-                "predicted_labels": list(module.pid_class_names),
+                "truth_labels": list(pid_class_names),
+                "predicted_labels": list(pid_class_names),
                 "counts": counts_np.tolist(),
                 "row_normalized": normalized.tolist(),
             },
@@ -111,10 +117,10 @@ def _save_pid_confusion_artifacts(module: L.LightningModule, key: str) -> None:
     figure, axis = plt.subplots(figsize=(8.0, 6.8))
     image = axis.imshow(normalized, vmin=0.0, vmax=1.0, cmap="Blues")
     axis.set(
-        xticks=np.arange(len(module.pid_class_names)),
-        yticks=np.arange(len(module.pid_class_names)),
-        xticklabels=module.pid_class_names,
-        yticklabels=module.pid_class_names,
+        xticks=np.arange(len(pid_class_names)),
+        yticks=np.arange(len(pid_class_names)),
+        xticklabels=pid_class_names,
+        yticklabels=pid_class_names,
         xlabel="Predicted PID",
         ylabel="True PID",
         title=f"PID confusion matrix ({key.replace('_', ' ')})",
