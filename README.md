@@ -719,6 +719,8 @@ Use `--stage test` to select test artifacts instead of validation artifacts. By
 default, the script creates `comparisons/<stage>/all/` inside the multirun
 directory. Use `--group <class>` to collect class-specific artifacts, for
 example `--stage test --group ggHbb` or `--stage test --group minbias`.
+Canonical runs have multiple named test suites; select one explicitly, for
+example `--stage test --suite training_like --group all`.
 To compare arbitrary run output directories instead of a Hydra multirun
 directory, pass them explicitly:
 
@@ -757,7 +759,11 @@ uv run --locked python scripts/collect_orbit_multirun.py \
   --output-dir /path/to/comparison
 ```
 
-Generated comparison plots can also be uploaded to W&B:
+When `WANDB_API_KEY` is available—either in the shell, repository `.env`, or
+the same `GABBRO_ENV_FILE` used by training—the collector automatically creates
+its own W&B comparison run. It uploads the plots plus `manifest.json` and
+`summary.csv`; the W&B project defaults to the compared runs' project. Override
+the comparison identity when needed:
 
 ```bash
 uv run --locked python scripts/collect_orbit_multirun.py \
@@ -770,6 +776,8 @@ uv run --locked python scripts/collect_orbit_multirun.py \
   --wandb-name fsq_vs_vq_test_comparison \
   --wandb-group orbit_multirun_comparisons
 ```
+
+Use `--no-wandb` for a local-only comparison.
 
 The particle rate-distortion plot includes a vertical reference at 43
 bits/input particle, representing the original particle encoding. To also show
@@ -933,6 +941,43 @@ Evaluate truth-matched resolved AK4 and boosted AK8 Higgs mass fidelity with:
 ```bash
 python scripts/evaluate_orbit_higgs_mass.py --run-dir /path/to/tokenizer_run --gghbb-test-manifest /path/to/downstream_manifests/ggHbb_test.txt --output-dir /path/to/higgs_mass_results --device cuda
 ```
+
+To compare several checkpoints, use the same labelled `--run RUN_DIR LABEL`
+form as the multirun collector. The output contains each run's individual
+artifacts under `runs/<label>/`, plus decoded outline overlays and a combined
+metrics JSON at the output root:
+
+```bash
+python scripts/evaluate_orbit_higgs_mass.py \
+  --run /path/to/vq_run "VQ (1024)" \
+  --run /path/to/fsq_run "FSQ" \
+  --gghbb-test-manifest /path/to/downstream_manifests/ggHbb_test.txt \
+  --output-dir /path/to/higgs_mass_comparison --device cuda
+```
+
+Both mass evaluators sync their PNG plots to W&B by default (project
+`orbit-tokenizer`). They also upload an `orbit-downstream-evaluation` artifact
+containing every metrics JSON and compact histogram `.npz` input: `bins`, the
+original spectrum, and each decoded spectrum with its label. Use
+`--wandb-name`, `--wandb-group`, and `--wandb-entity` to name the benchmark run,
+or `--no-wandb` to retain only local outputs.
+
+For PID-enabled tokenizers, evaluate the dimuon mass response on truth-selected
+DY (Z\to\mu^+\mu^-\) events with:
+
+```bash
+python scripts/evaluate_orbit_z_mumu_mass.py --run-dir /path/to/tokenizer_run --dyjets-test-manifest /path/to/downstream_manifests/DYJetsToLL_13TeV-madgraphMLM-pythia8_test.txt --output-dir /path/to/z_mumu_mass_results --device cuda
+```
+
+The Z evaluator accepts the same repeatable `--run RUN_DIR LABEL` interface;
+it writes `z_mumu_mass_multirun.png` and
+`z_mumu_mass_multirun_metrics.json` alongside per-run outputs.
+
+It independently Hungarian-matches original and decoded PID-labelled muons to
+the direct generator-level Z daughters, requires the correct muon charge class
+and $\Delta R < 0.2$, then compares the matched-pair masses. Both mass
+benchmarks save and log empirical means and standard deviations and include
+them in the plot legends alongside the existing fitted peak diagnostics.
 
 The checkpoint configuration selects 128-particle or 500-particle export and
 Higgs evaluation automatically. For full-event canonical scans and the

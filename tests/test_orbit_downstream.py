@@ -96,3 +96,111 @@ def test_higgs_candidates_are_stable_for_perfect_reconstruction():
     assert boosted is not None
     assert resolved == namespace["resolved_candidate"](particles.copy(), b, bbar)
     assert boosted == namespace["boosted_candidate"](particles.copy(), higgs, b, bbar)
+
+
+def test_higgs_multirun_plot_overlays_decoded_outlines(tmp_path):
+    namespace = runpy.run_path("scripts/evaluate_orbit_higgs_mass.py")
+    rows = [
+        {"resolved_original": 120.0, "resolved_decoded": 118.0, "boosted_original": 125.0, "boosted_decoded": 123.0},
+        {"resolved_original": 130.0, "resolved_decoded": 128.0, "boosted_original": 135.0, "boosted_decoded": 133.0},
+    ]
+    namespace["plot_multirun_masses"](
+        [("reference", rows, {}), ("comparison", rows, {})], "resolved", tmp_path
+    )
+    assert (tmp_path / "higgs_mass_resolved_multirun.png").is_file()
+
+
+def test_z_truth_selector_requires_direct_opposite_sign_muon_daughters():
+    namespace = runpy.run_path("scripts/evaluate_orbit_z_mumu_mass.py")
+    truth = ak.Record(
+        {
+            "Gen_Part_PT": [100.0, 125.0, 45.0, 42.0],
+            "Gen_Part_Eta": [0.0, 0.2, 0.3, -0.3],
+            "Gen_Part_Phi": [0.0, 0.4, 0.5, -0.5],
+            "Gen_Part_Mass": [91.0, 91.2, 0.105, 0.105],
+            "Gen_Part_PID": [23, 23, 13, -13],
+            "Gen_Part_D1": [-1, 2, -1, -1],
+            "Gen_Part_D2": [-1, 3, -1, -1],
+        }
+    )
+    z = namespace["decaying_z_to_mumu"](truth)
+    assert z["z"][2] == 125.0
+    assert z["muon"][2] == 45.0
+    assert z["antimuon"][2] == 42.0
+    non_dimuon_truth = ak.Record(
+        {
+            "Gen_Part_PT": [100.0, 45.0, 42.0],
+            "Gen_Part_Eta": [0.0, 0.3, -0.3],
+            "Gen_Part_Phi": [0.0, 0.5, -0.5],
+            "Gen_Part_Mass": [91.0, 0.105, 0.105],
+            "Gen_Part_PID": [23, 11, -11],
+            "Gen_Part_D1": [1, -1, -1],
+            "Gen_Part_D2": [2, -1, -1],
+        }
+    )
+    assert namespace["decaying_z_to_mumu"](non_dimuon_truth) is None
+
+
+def test_z_dimuon_candidate_matches_direct_truth_daughters_with_hungarian_assignment():
+    namespace = runpy.run_path("scripts/evaluate_orbit_z_mumu_mass.py")
+    particles = np.array(
+        [
+            [0.10, 0.10, 18.0],
+            [0.20, 0.20, 52.0],
+            [-0.30, -2.90, 47.0],
+            [-0.20, -2.80, 20.0],
+        ]
+    )
+    pid = np.array([6, 6, 7, 7])
+    candidate = namespace["truth_matched_dimuon_candidate"](
+        particles,
+        pid,
+        truth_muon=np.array([0.20, 0.20, 50.0, 0.105]),
+        truth_antimuon=np.array([-0.30, -2.90, 45.0, 0.105]),
+    )
+    assert candidate["muon_index"] == 1
+    assert candidate["antimuon_index"] == 2
+    assert candidate["muon_dr"] == 0.0
+    assert candidate["antimuon_dr"] == 0.0
+    assert candidate["mass"] > 0
+
+
+def test_z_dimuon_candidate_requires_pid_and_delta_r_match():
+    namespace = runpy.run_path("scripts/evaluate_orbit_z_mumu_mass.py")
+    particles = np.array([[0.01, 0.01, 45.0], [-0.01, -0.01, 44.0]])
+    truth_muon = np.array([0.0, 0.0, 45.0, 0.105])
+    truth_antimuon = np.array([0.0, 0.0, 44.0, 0.105])
+    matcher = namespace["truth_matched_dimuon_candidate"]
+    assert matcher(particles, np.array([3, 7]), truth_muon, truth_antimuon) is None
+    assert matcher(
+        np.array([[0.4, 0.0, 45.0], [0.0, 0.4, 44.0]]),
+        np.array([6, 7]),
+        truth_muon,
+        truth_antimuon,
+    ) is None
+
+
+def test_z_multirun_plot_overlays_decoded_outlines(tmp_path):
+    namespace = runpy.run_path("scripts/evaluate_orbit_z_mumu_mass.py")
+    rows = [
+        {"original_mass": 90.0, "decoded_mass": 89.0},
+        {"original_mass": 92.0, "decoded_mass": 93.0},
+    ]
+    namespace["plot_multirun_masses"](
+        [("reference", rows, {}), ("comparison", rows, {})], tmp_path
+    )
+    assert (tmp_path / "z_mumu_mass_multirun.png").is_file()
+
+
+def test_mass_benchmarks_report_empirical_distribution_moments():
+    for script in (
+        "scripts/evaluate_orbit_higgs_mass.py",
+        "scripts/evaluate_orbit_z_mumu_mass.py",
+    ):
+        namespace = runpy.run_path(script)
+        moments = namespace["distribution_moments"]([80.0, 100.0, np.nan])
+        assert moments == {"events": 2, "mean": 90.0, "std": 10.0}
+        label = namespace["distribution_label"]("Decoded", [80.0, 100.0])
+        assert "Decoded" in label
+        assert "90.0" in label
+        assert "10.0" in label

@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Evaluate truth-matched resolved and boosted Higgs mass fidelity on ggHbb."""
+"""Evaluate PID-aware Z→μ⁺μ⁻ mass fidelity on DYJetsToLL events."""
 
 from __future__ import annotations
 
@@ -50,7 +50,6 @@ for import_root in (VQTORCH_ROOT, PROJECT_ROOT):
     sys.path.insert(0, value)
 
 import awkward as ak
-import fastjet
 import matplotlib.pyplot as plt
 import numpy as np
 import pyarrow.parquet as pq
@@ -65,6 +64,11 @@ from gabbro.data.orbit_parquet import SEQUENCE_SCHEMAS, OrbitParquetDataset
 from gabbro.plotting.utils import set_mpl_style
 
 
+MUON_PID = 6
+ANTIMUON_PID = 7
+MUON_MASS_GEV = 0.1056583755
+Z_MASS_GEV = 91.1876
+MUON_MATCH_DR = 0.2
 TRUTH_COLUMNS = [
     "Gen_Part_PT",
     "Gen_Part_Eta",
@@ -87,7 +91,7 @@ def parse_args():
         metavar="RUN_SPEC",
         help="Repeatable comparison entry: --run RUN_DIR or --run RUN_DIR LABEL.",
     )
-    parser.add_argument("--gghbb-test-manifest", required=True, type=Path)
+    parser.add_argument("--dyjets-test-manifest", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--events", type=int, default=10_000)
     parser.add_argument("--batch-size", type=int)
@@ -130,7 +134,7 @@ def output_component(label: str) -> str:
     return value
 
 
-def load_model(run_dir: Path, device):
+def load_model(run_dir: Path, device: torch.device):
     config_path = run_dir / "config_resolved.yaml"
     if not config_path.is_file():
         config_path = run_dir / ".hydra" / "config.yaml"
@@ -138,6 +142,8 @@ def load_model(run_dir: Path, device):
     if not config_path.is_file():
         raise FileNotFoundError(f"No resolved or Hydra config found under {run_dir}")
     cfg = OmegaConf.load(config_path)
+    if not bool(cfg.get("pid", {}).get("enabled", False)):
+        raise ValueError("Z→μ⁺μ⁻ evaluation requires a PID-enabled checkpoint")
     model = instantiate(cfg.model)
     if checkpoint.is_file():
         state = torch.load(checkpoint, map_location="cpu", weights_only=False)  # nosec
@@ -146,8 +152,7 @@ def load_model(run_dir: Path, device):
     elif not hasattr(model, "_fit_faiss"):
         raise FileNotFoundError(checkpoint)
     else:
-        # Test-only baselines (for example FAISS k-means) fit at evaluation
-        # time and deliberately do not create a training checkpoint.
+        # Test-only baselines fit their representation on demand.
         checkpoint_path = None
     return model.to(device).eval(), cfg, checkpoint_path
 
@@ -156,41 +161,33 @@ def checkpoint_data_settings(cfg) -> tuple[str, int, str | None, float]:
     sequence_type = str(cfg.data.get("sequence_type", "particle"))
     if sequence_type not in SEQUENCE_SCHEMAS:
         raise ValueError(f"Unsupported checkpoint sequence type: {sequence_type!r}")
-    configured_length = cfg.data.get("max_sequence_length")
-    max_sequence_length = (
-        int(configured_length)
-        if configured_length is not None
-        else int(SEQUENCE_SCHEMAS[sequence_type]["max_sequence_length"])
-    )
     schema = SEQUENCE_SCHEMAS[sequence_type]
-    configured_mask_column = cfg.data.get("mask_column")
-    mask_column = (
-        schema["mask_column"]
-        if configured_mask_column is None
-        else str(configured_mask_column)
+    max_sequence_length = int(
+        cfg.data.get("max_sequence_length") or schema["max_sequence_length"]
     )
-    configured_mask_minimum = cfg.data.get("mask_min_value")
-    mask_min_value = (
-        float(schema["mask_min_value"])
-        if configured_mask_minimum is None
-        else float(configured_mask_minimum)
-    )
-    return sequence_type, max_sequence_length, mask_column, mask_min_value
+    mask_column = cfg.data.get("mask_column")
+    if mask_column is None:
+        mask_column = schema["mask_column"]
+    mask_min_value = cfg.data.get("mask_min_value")
+    if mask_min_value is None:
+        mask_min_value = schema["mask_min_value"]
+    return sequence_type, max_sequence_length, mask_column, float(mask_min_value)
 
 
-def decode_batch(model, batch, device):
+def decode_batch(model, batch, device: torch.device):
     features = batch["part_features"].to(device)
     mask = batch["part_mask"].to(device)
-    pid = batch.get("part_pid")
-    if pid is not None:
-        pid = pid.to(device)
+    pid = batch["part_pid"].to(device)
     with torch.inference_mode():
         if hasattr(model, "_quantize_batch"):
-            reconstructed, _, _ = model._quantize_batch(features, mask, pid)
+            reconstructed, _, pid_logits = model._quantize_batch(features, mask, pid)
         else:
-            reconstructed, _ = model.forward(features, mask, pid_particle=pid)
+            reconstructed, outputs = model.forward(features, mask, pid_particle=pid)
+            pid_logits = outputs.get("pid_logits")
+    if pid_logits is None:
+        raise ValueError("PID-enabled checkpoint did not return decoded PID logits")
     values = reconstructed.detach().cpu().numpy()
-    return np.stack(
+    physical = np.stack(
         [
             values[..., 0] * 3.0,
             np.arctan2(values[..., 2], values[..., 1]),
@@ -198,6 +195,7 @@ def decode_batch(model, batch, device):
         ],
         axis=-1,
     )
+    return physical, pid_logits.argmax(dim=-1).detach().cpu().numpy()
 
 
 def prepare_test_time_baseline(model, cfg, output_dir: Path):
@@ -244,13 +242,14 @@ class TruthReader:
         return self._cache[row_index - offsets[row_group]]
 
 
-def decaying_higgs(truth):
+def decaying_z_to_mumu(truth):
+    """Return the last generator Z and direct μ⁻/μ⁺ daughters, if present."""
     pids = np.asarray(ak.to_numpy(truth.Gen_Part_PID), dtype=np.int64)
     d1s = np.asarray(ak.to_numpy(truth.Gen_Part_D1), dtype=np.int64)
     d2s = np.asarray(ak.to_numpy(truth.Gen_Part_D2), dtype=np.int64)
-    for higgs_index in np.flatnonzero(np.abs(pids) == 25)[::-1]:
-        d1, d2 = int(d1s[higgs_index]), int(d2s[higgs_index])
-        if 0 <= d1 < len(pids) and 0 <= d2 < len(pids) and {int(pids[d1]), int(pids[d2])} == {5, -5}:
+    for z_index in np.flatnonzero(pids == 23)[::-1]:
+        d1, d2 = int(d1s[z_index]), int(d2s[z_index])
+        if 0 <= d1 < len(pids) and 0 <= d2 < len(pids) and {int(pids[d1]), int(pids[d2])} == {13, -13}:
             def particle(index):
                 return np.array(
                     [
@@ -261,42 +260,20 @@ def decaying_higgs(truth):
                     ]
                 )
 
-            return particle(higgs_index), particle(d1), particle(d2)
+            muon_index = d1 if int(pids[d1]) == 13 else d2
+            antimuon_index = d1 if int(pids[d1]) == -13 else d2
+            return {
+                "z": particle(z_index),
+                "muon": particle(muon_index),
+                "antimuon": particle(antimuon_index),
+            }
     return None
 
 
-def delta_r(eta_a, phi_a, eta_b, phi_b):
-    delta_phi = np.remainder(phi_a - phi_b + np.pi, 2 * np.pi) - np.pi
-    return np.hypot(eta_a - eta_b, delta_phi)
-
-
-def cluster_jets(particles: np.ndarray, radius: float, min_pt: float):
-    if not len(particles):
-        return np.empty((0, 4))
-    momenta = ak.zip(
-        {
-            "pt": [particles[:, 2]],
-            "eta": [particles[:, 0]],
-            "phi": [particles[:, 1]],
-            "mass": [np.zeros(len(particles))],
-        },
-        with_name="Momentum4D",
-    )
-    jets = fastjet.ClusterSequence(
-        momenta, fastjet.JetDefinition(fastjet.antikt_algorithm, radius)
-    ).inclusive_jets(min_pt=min_pt)[0]
-    if not len(jets):
-        return np.empty((0, 4))
-    values = np.stack(
-        [ak.to_numpy(jets.eta), ak.to_numpy(jets.phi), ak.to_numpy(jets.pt), ak.to_numpy(jets.mass)],
-        axis=-1,
-    )
-    return values[np.abs(values[:, 0]) < 2.5]
-
-
-def combine_mass(first, second):
-    def components(jet):
-        eta, phi, pt, mass = jet
+def invariant_mass(first: np.ndarray, second: np.ndarray, mass: float = MUON_MASS_GEV) -> float:
+    """Combine [eta, phi, pt] particles using a fixed on-shell mass."""
+    def components(particle):
+        eta, phi, pt = particle
         px, py = pt * np.cos(phi), pt * np.sin(phi)
         pz = pt * np.sinh(eta)
         energy = np.sqrt(px * px + py * py + pz * pz + mass * mass)
@@ -306,63 +283,72 @@ def combine_mass(first, second):
     return float(np.sqrt(max(total[0] ** 2 - np.dot(total[1:], total[1:]), 0.0)))
 
 
-def resolved_candidate(particles, b, bbar):
-    jets = cluster_jets(particles, radius=0.4, min_pt=30.0)
-    if len(jets) < 2:
+def delta_r(eta_a, phi_a, eta_b, phi_b):
+    delta_phi = np.remainder(phi_a - phi_b + np.pi, 2 * np.pi) - np.pi
+    return np.hypot(eta_a - eta_b, delta_phi)
+
+
+def truth_matched_dimuon_candidate(
+    particles: np.ndarray,
+    pid: np.ndarray,
+    truth_muon: np.ndarray,
+    truth_antimuon: np.ndarray,
+    match_dr: float = MUON_MATCH_DR,
+):
+    """Build a PID-constrained dimuon candidate matched to direct truth daughters."""
+    particles = np.asarray(particles, dtype=float)
+    pid = np.asarray(pid, dtype=np.int64)
+    if len(particles) != len(pid):
+        raise ValueError("particles and pid must have the same length")
+    if len(particles) < 2:
         return None
     distances = np.array(
-        [[delta_r(parton[0], parton[1], jet[0], jet[1]) for jet in jets] for parton in (b, bbar)]
+        [
+            [delta_r(truth[0], truth[1], particle[0], particle[1]) for particle in particles]
+            for truth in (truth_muon, truth_antimuon)
+        ]
     )
-    parton_indices, jet_indices = linear_sum_assignment(distances)
-    if len(jet_indices) != 2 or np.any(distances[parton_indices, jet_indices] >= 0.2):
+    truth_indices, particle_indices = linear_sum_assignment(distances)
+    if len(particle_indices) != 2:
         return None
-    return combine_mass(jets[jet_indices[0]], jets[jet_indices[1]])
+    matched_indices = dict(zip(truth_indices, particle_indices, strict=True))
+    muon_index, antimuon_index = matched_indices[0], matched_indices[1]
+    muon_dr, antimuon_dr = distances[0, muon_index], distances[1, antimuon_index]
+    if muon_dr >= match_dr or antimuon_dr >= match_dr:
+        return None
+    if pid[muon_index] != MUON_PID or pid[antimuon_index] != ANTIMUON_PID:
+        return None
+    return {
+        "mass": invariant_mass(particles[muon_index], particles[antimuon_index]),
+        "muon": particles[muon_index],
+        "antimuon": particles[antimuon_index],
+        "muon_index": muon_index,
+        "antimuon_index": antimuon_index,
+        "muon_dr": float(muon_dr),
+        "antimuon_dr": float(antimuon_dr),
+        "muon_pid": int(pid[muon_index]),
+        "antimuon_pid": int(pid[antimuon_index]),
+    }
 
 
-def boosted_candidate(particles, higgs, b, bbar):
-    jets = cluster_jets(particles, radius=0.8, min_pt=250.0)
-    if not len(jets):
-        return None
-    distances = np.array([delta_r(higgs[0], higgs[1], jet[0], jet[1]) for jet in jets])
-    jet = jets[int(np.argmin(distances))]
-    if np.min(distances) >= 0.4:
-        return None
-    if delta_r(b[0], b[1], jet[0], jet[1]) >= 0.8:
-        return None
-    if delta_r(bbar[0], bbar[1], jet[0], jet[1]) >= 0.8:
-        return None
-    return float(jet[3])
-
-
-def double_crystal_ball(x, norm, mean, sigma, alpha_l, n_l, alpha_r, n_r):
-    t = (x - mean) / sigma
-    result = np.exp(-0.5 * t**2)
-    left = t < -alpha_l
-    right = t > alpha_r
-    a_l = (n_l / alpha_l) ** n_l * np.exp(-0.5 * alpha_l**2)
-    b_l = n_l / alpha_l - alpha_l
-    a_r = (n_r / alpha_r) ** n_r * np.exp(-0.5 * alpha_r**2)
-    b_r = n_r / alpha_r - alpha_r
-    result[left] = a_l * (b_l - t[left]) ** (-n_l)
-    result[right] = a_r * (b_r + t[right]) ** (-n_r)
-    return norm * result
+def gaussian(x, norm, mean, sigma):
+    return norm * np.exp(-0.5 * ((x - mean) / sigma) ** 2)
 
 
 def fit_mass(values):
     values = np.asarray(values, dtype=np.float64)
-    values = values[(values >= 40.0) & (values <= 200.0)]
-    counts, edges = np.histogram(values, bins=np.arange(40.0, 202.0, 2.0))
+    values = values[(values >= 60.0) & (values <= 120.0)]
+    counts, edges = np.histogram(values, bins=np.arange(60.0, 121.0, 1.0))
     centers = 0.5 * (edges[:-1] + edges[1:])
     if len(values) < 50:
         return {"success": False, "events": int(len(values)), "mean": None, "sigma": None}
-    initial = [max(counts.max(), 1), np.median(values), max(np.std(values), 5.0), 1.5, 3, 1.5, 3]
     try:
         parameters, _ = curve_fit(
-            double_crystal_ball,
+            gaussian,
             centers,
             counts,
-            p0=initial,
-            bounds=([0, 80, 1, 0.2, 1.01, 0.2, 1.01], [np.inf, 170, 80, 8, 30, 8, 30]),
+            p0=[max(counts.max(), 1), np.median(values), max(np.std(values), 1.0)],
+            bounds=([0.0, 80.0, 0.1], [np.inf, 102.0, 20.0]),
             maxfev=50_000,
         )
         return {
@@ -378,11 +364,7 @@ def fit_mass(values):
 
 def bootstrap_fit(values, replicas):
     if len(values) < 50 or replicas < 1:
-        return {
-            "successful_replicas": 0,
-            "mean_uncertainty": None,
-            "sigma_uncertainty": None,
-        }
+        return {"successful_replicas": 0, "mean_uncertainty": None, "sigma_uncertainty": None}
     rng = np.random.default_rng(12345)
     fits = [fit_mass(rng.choice(values, size=len(values), replace=True)) for _ in range(replicas)]
     means = [fit["mean"] for fit in fits if fit["success"]]
@@ -412,104 +394,88 @@ def distribution_label(label, values):
     return f"{label} ($\\mu$={moments['mean']:.1f}, $\\sigma$={moments['std']:.1f} GeV)"
 
 
-def summarize_topology(rows, topology, replicas):
-    original = np.array([row[f"{topology}_original"] for row in rows], dtype=float)
-    decoded = np.array([row[f"{topology}_decoded"] for row in rows], dtype=float)
+def summarize(rows, replicas):
+    original = np.asarray([row["original_mass"] for row in rows], dtype=float)
+    decoded = np.asarray([row["decoded_mass"] for row in rows], dtype=float)
     common = np.isfinite(original) & np.isfinite(decoded)
     original_common, decoded_common = original[common], decoded[common]
     original_fit, decoded_fit = fit_mass(original_common), fit_mass(decoded_common)
-    if len(original_common):
-        paired_mean = float(np.mean(decoded_common - original_common))
-        paired_std = float(np.std(decoded_common - original_common))
-        original_width = float(np.diff(np.quantile(original_common, [0.16, 0.84]))[0] / 2)
-        decoded_width = float(np.diff(np.quantile(decoded_common, [0.16, 0.84]))[0] / 2)
-    else:
-        paired_mean = paired_std = original_width = decoded_width = None
     summary = {
         "events": len(rows),
         "original_efficiency": float(np.mean(np.isfinite(original))),
         "decoded_efficiency": float(np.mean(np.isfinite(decoded))),
+        "original_matching_efficiency": float(np.mean(np.isfinite(original))),
+        "decoded_matching_efficiency": float(np.mean(np.isfinite(decoded))),
         "common_events": int(common.sum()),
+        "common_matched_events": int(common.sum()),
         "original_distribution": distribution_moments(original_common),
         "decoded_distribution": distribution_moments(decoded_common),
         "original_fit": original_fit | bootstrap_fit(original_common, replicas),
         "decoded_fit": decoded_fit | bootstrap_fit(decoded_common, replicas),
-        "paired_mass_difference_mean": paired_mean,
-        "paired_mass_difference_std": paired_std,
-        "original_central68_half_width": original_width,
-        "decoded_central68_half_width": decoded_width,
+        "paired_mass_difference_mean": None,
+        "paired_mass_difference_std": None,
+        "original_central68_half_width": None,
+        "decoded_central68_half_width": None,
+        "fit_peak_shift": None,
+        "fit_width_ratio": None,
     }
+    if len(original_common):
+        summary["paired_mass_difference_mean"] = float(np.mean(decoded_common - original_common))
+        summary["paired_mass_difference_std"] = float(np.std(decoded_common - original_common))
+        summary["original_central68_half_width"] = float(
+            np.diff(np.quantile(original_common, [0.16, 0.84]))[0] / 2
+        )
+        summary["decoded_central68_half_width"] = float(
+            np.diff(np.quantile(decoded_common, [0.16, 0.84]))[0] / 2
+        )
     if original_fit["success"] and decoded_fit["success"]:
         summary["fit_peak_shift"] = decoded_fit["mean"] - original_fit["mean"]
         summary["fit_width_ratio"] = decoded_fit["sigma"] / original_fit["sigma"]
-    else:
-        summary["fit_peak_shift"] = None
-        summary["fit_width_ratio"] = None
-    pt = np.asarray([row["truth_higgs_pt"] for row in rows], dtype=float)
-    summary["truth_higgs_pt_bins"] = {}
-    for low, high in zip((0, 250, 350, 500, 750), (250, 350, 500, 750, np.inf)):
-        selected = (pt >= low) & (pt < high)
-        selected_common = selected & common
-        name = f"{low:g}_{high:g}" if np.isfinite(high) else f"{low:g}_inf"
-        summary["truth_higgs_pt_bins"][name] = {
-            "events": int(selected.sum()),
-            "original_efficiency": float(np.mean(np.isfinite(original[selected])))
-            if np.any(selected)
-            else None,
-            "decoded_efficiency": float(np.mean(np.isfinite(decoded[selected])))
-            if np.any(selected)
-            else None,
-            "common_events": int(selected_common.sum()),
-            "paired_mass_difference_mean": float(
-                np.mean(decoded[selected_common] - original[selected_common])
-            )
-            if np.any(selected_common)
-            else None,
-        }
     return summary
 
 
-def plot_masses(rows, topology, output_dir):
+def plot_masses(rows, output_dir: Path):
     set_mpl_style()
-    original = np.array([row[f"{topology}_original"] for row in rows], dtype=float)
-    decoded = np.array([row[f"{topology}_decoded"] for row in rows], dtype=float)
+    original = np.asarray([row["original_mass"] for row in rows], dtype=float)
+    decoded = np.asarray([row["decoded_mass"] for row in rows], dtype=float)
     common = np.isfinite(original) & np.isfinite(decoded)
     figure, axis = plt.subplots(figsize=(7, 5))
-    bins = np.arange(40, 202, 2)
+    bins = np.arange(60.0, 121.0, 1.0)
     axis.hist(
         original[common],
         bins=bins,
         histtype="step",
         density=True,
-        label=distribution_label("Original", original[common]),
+        label=distribution_label("Original, truth-matched", original[common]),
     )
     axis.hist(
         decoded[common],
         bins=bins,
         histtype="step",
         density=True,
-        label=distribution_label("Decoded", decoded[common]),
+        label=distribution_label("Decoded, truth-matched", decoded[common]),
     )
-    axis.set(xlabel="Higgs candidate mass [GeV]", ylabel="Normalized events", title=topology)
+    axis.axvline(Z_MASS_GEV, color="black", linestyle="--", linewidth=1, label=r"$m_Z$")
+    axis.set(xlabel=r"Truth-matched $Z\to\mu^+\mu^-$ mass [GeV]", ylabel="Normalized events")
     axis.legend(prop={"size": 8})
     figure.tight_layout()
-    figure.savefig(output_dir / f"higgs_mass_{topology}.png", dpi=180)
+    figure.savefig(output_dir / "z_mumu_mass.png", dpi=180)
     plt.close(figure)
     np.savez_compressed(
-        output_dir / f"higgs_mass_{topology}_histograms.npz",
+        output_dir / "z_mumu_mass_histograms.npz",
         bins=bins,
         original=original[common],
         decoded=decoded[common],
     )
 
 
-def plot_multirun_masses(results, topology, output_dir):
-    """Overlay each decoded distribution and one common original reference."""
+def plot_multirun_masses(results, output_dir: Path):
+    """Overlay decoded dimuon spectra and a single original reference."""
     set_mpl_style()
     figure, axis = plt.subplots(figsize=(7, 5))
-    bins = np.arange(40, 202, 2)
+    bins = np.arange(60.0, 121.0, 1.0)
     first_label, first_rows, _ = results[0]
-    original = np.asarray([row[f"{topology}_original"] for row in first_rows], dtype=float)
+    original = np.asarray([row["original_mass"] for row in first_rows], dtype=float)
     original = original[np.isfinite(original)]
     plot_data = {"bins": bins, "original": original, "original_label": np.asarray(first_label)}
     if len(original):
@@ -521,10 +487,10 @@ def plot_multirun_masses(results, topology, output_dir):
             color="black",
             linestyle="--",
             linewidth=1.5,
-            label=distribution_label(f"Original ({first_label})", original),
+            label=distribution_label(f"Original, truth-matched ({first_label})", original),
         )
     for index, (label, rows, _) in enumerate(results):
-        decoded = np.asarray([row[f"{topology}_decoded"] for row in rows], dtype=float)
+        decoded = np.asarray([row["decoded_mass"] for row in rows], dtype=float)
         decoded = decoded[np.isfinite(decoded)]
         if len(decoded):
             axis.hist(
@@ -533,20 +499,17 @@ def plot_multirun_masses(results, topology, output_dir):
                 histtype="step",
                 density=True,
                 linewidth=1.7,
-                label=distribution_label(label, decoded),
+                label=distribution_label(f"{label}, truth-matched", decoded),
             )
         plot_data[f"decoded_{index}"] = decoded
         plot_data[f"decoded_{index}_label"] = np.asarray(label)
-    axis.set(
-        xlabel="Higgs candidate mass [GeV]",
-        ylabel="Normalized events",
-        title=f"{topology} — decoded comparison",
-    )
+    axis.axvline(Z_MASS_GEV, color="black", linestyle=":", linewidth=1, label=r"$m_Z$")
+    axis.set(xlabel=r"Truth-matched $Z\to\mu^+\mu^-$ mass [GeV]", ylabel="Normalized events")
     axis.legend(prop={"size": 8})
     figure.tight_layout()
-    figure.savefig(output_dir / f"higgs_mass_{topology}_multirun.png", dpi=180)
+    figure.savefig(output_dir / "z_mumu_mass_multirun.png", dpi=180)
     plt.close(figure)
-    np.savez_compressed(output_dir / f"higgs_mass_{topology}_multirun_histograms.npz", **plot_data)
+    np.savez_compressed(output_dir / "z_mumu_mass_multirun_histograms.npz", **plot_data)
 
 
 def upload_to_wandb(args, output_dir: Path, multirun: bool, results):
@@ -560,15 +523,15 @@ def upload_to_wandb(args, output_dir: Path, multirun: bool, results):
 
     run = wandb.init(
         project=args.wandb_project,
-        name=args.wandb_name or f"higgs-mass-{output_dir.name}",
-        group=args.wandb_group or "orbit-higgs-mass",
+        name=args.wandb_name or f"z-mumu-mass-{output_dir.name}",
+        group=args.wandb_group or "orbit-z-mumu-mass",
         entity=args.wandb_entity,
         job_type="multirun-comparison" if multirun else "evaluation",
         config={"events": args.events, "bootstrap_replicas": args.bootstrap_replicas},
     )
     try:
         images = {
-            f"higgs_mass/{path.stem}": wandb.Image(str(path))
+            f"z_mumu_mass/{path.stem}": wandb.Image(str(path))
             for path in sorted(output_dir.rglob("*.png"))
         }
         if images:
@@ -576,19 +539,18 @@ def upload_to_wandb(args, output_dir: Path, multirun: bool, results):
         scalar_metrics = {}
         for label, _, summary in results:
             run_label = output_component(label)
-            for topology in ("resolved", "boosted"):
-                for representation in ("original", "decoded"):
-                    moments = summary[topology][f"{representation}_distribution"]
-                    for statistic in ("mean", "std"):
-                        value = moments[statistic]
-                        if value is not None:
-                            scalar_metrics[
-                                f"mass_moments/{run_label}/{topology}/{representation}_{statistic}"
-                            ] = value
+            for representation in ("original", "decoded"):
+                moments = summary["z_mumu"][f"{representation}_distribution"]
+                for statistic in ("mean", "std"):
+                    value = moments[statistic]
+                    if value is not None:
+                        scalar_metrics[
+                            f"mass_moments/{run_label}/{representation}_{statistic}"
+                        ] = value
         if scalar_metrics:
             run.log(scalar_metrics)
         artifact = wandb.Artifact(
-            name=f"higgs-mass-{output_component(output_dir.name)}-{run.id}",
+            name=f"z-mumu-mass-{output_component(output_dir.name)}-{run.id}",
             type="orbit-downstream-evaluation",
             metadata={"multirun": multirun, "events_per_run": args.events},
         )
@@ -599,16 +561,49 @@ def upload_to_wandb(args, output_dir: Path, multirun: bool, results):
         wandb.finish()
 
 
+def candidate_row(prefix: str, candidate):
+    if candidate is None:
+        return {
+            f"{prefix}_mass": float("nan"),
+            f"{prefix}_muon_pt": float("nan"),
+            f"{prefix}_muon_eta": float("nan"),
+            f"{prefix}_muon_phi": float("nan"),
+            f"{prefix}_muon_pid": float("nan"),
+            f"{prefix}_muon_index": float("nan"),
+            f"{prefix}_muon_dr": float("nan"),
+            f"{prefix}_antimuon_pt": float("nan"),
+            f"{prefix}_antimuon_eta": float("nan"),
+            f"{prefix}_antimuon_phi": float("nan"),
+            f"{prefix}_antimuon_pid": float("nan"),
+            f"{prefix}_antimuon_index": float("nan"),
+            f"{prefix}_antimuon_dr": float("nan"),
+        }
+    muon, antimuon = candidate["muon"], candidate["antimuon"]
+    return {
+        f"{prefix}_mass": candidate["mass"],
+        f"{prefix}_muon_pt": float(muon[2]),
+        f"{prefix}_muon_eta": float(muon[0]),
+        f"{prefix}_muon_phi": float(muon[1]),
+        f"{prefix}_muon_pid": candidate["muon_pid"],
+        f"{prefix}_muon_index": candidate["muon_index"],
+        f"{prefix}_muon_dr": candidate["muon_dr"],
+        f"{prefix}_antimuon_pt": float(antimuon[2]),
+        f"{prefix}_antimuon_eta": float(antimuon[0]),
+        f"{prefix}_antimuon_phi": float(antimuon[1]),
+        f"{prefix}_antimuon_pid": candidate["antimuon_pid"],
+        f"{prefix}_antimuon_index": candidate["antimuon_index"],
+        f"{prefix}_antimuon_dr": candidate["antimuon_dr"],
+    }
+
+
 def evaluate_run(args, run_dir: Path, output_dir: Path):
     device = torch.device(args.device)
     model, cfg, checkpoint = load_model(run_dir, device)
-    sequence_type, max_sequence_length, mask_column, mask_min_value = (
-        checkpoint_data_settings(cfg)
-    )
+    sequence_type, max_sequence_length, mask_column, mask_min_value = checkpoint_data_settings(cfg)
     batch_size = args.batch_size or (16 if max_sequence_length > 128 else 256)
     prepare_test_time_baseline(model, cfg, output_dir)
     dataset = OrbitParquetDataset(
-        args.gghbb_test_manifest,
+        args.dyjets_test_manifest,
         sequence_type=sequence_type,
         batch_size=batch_size,
         max_sequence_length=max_sequence_length,
@@ -618,45 +613,53 @@ def evaluate_run(args, run_dir: Path, output_dir: Path):
         return_event_metadata=True,
         pid_cfg=cfg.get("pid"),
     )
+
     truth_reader = TruthReader()
     rows = []
-    with tqdm(total=args.events, desc="Evaluating ggHbb", unit="event") as progress:
+    with tqdm(total=args.events, desc="Evaluating Z→μ⁺μ⁻", unit="event") as progress:
         for batch in dataset:
-            decoded = decode_batch(model, batch, device)
+            decoded, decoded_pid = decode_batch(model, batch, device)
             mask = batch["part_mask"].numpy().astype(bool)
+            original_pid = batch["part_pid"].numpy()
             for index in range(mask.shape[0]):
                 source_file = str(batch["source_files"][index])
                 source_row = int(batch["source_rows"][index])
-                truth = decaying_higgs(truth_reader.row(source_file, source_row))
+                truth = decaying_z_to_mumu(truth_reader.row(source_file, source_row))
                 if truth is None:
                     continue
-                higgs, b, bbar = truth
                 raw = np.asarray(ak.to_numpy(batch["raw_part_features"][index]), dtype=float)
-                original = raw[:, [1, 2, 0]]
-                decoded_event = decoded[index, mask[index]]
-                rows.append(
-                    {
-                        "source_file": source_file,
-                        "source_row": source_row,
-                        "truth_higgs_pt": float(higgs[2]),
-                        "resolved_original": resolved_candidate(original, b, bbar),
-                        "resolved_decoded": resolved_candidate(decoded_event, b, bbar),
-                        "boosted_original": boosted_candidate(original, higgs, b, bbar),
-                        "boosted_decoded": boosted_candidate(decoded_event, higgs, b, bbar),
-                    }
+                valid = mask[index]
+                # Raw features remain ragged, whereas ``part_mask`` is padded to the
+                # model sequence length. Both retain the leading selected particles.
+                particle_count = min(len(raw), int(valid.sum()))
+                original = raw[:particle_count, [1, 2, 0]]
+                original_pid_event = original_pid[index, valid][:particle_count]
+                decoded_event = decoded[index, valid][:particle_count]
+                decoded_pid_event = decoded_pid[index, valid][:particle_count]
+                original_candidate = truth_matched_dimuon_candidate(
+                    original, original_pid_event, truth["muon"], truth["antimuon"]
                 )
+                decoded_candidate = truth_matched_dimuon_candidate(
+                    decoded_event, decoded_pid_event, truth["muon"], truth["antimuon"]
+                )
+                row = {
+                    "source_file": source_file,
+                    "source_row": source_row,
+                    "truth_z_pt": float(truth["z"][2]),
+                    "truth_z_mass": float(truth["z"][3]),
+                }
+                row.update(candidate_row("original", original_candidate))
+                row.update(candidate_row("decoded", decoded_candidate))
+                rows.append(row)
                 progress.update(1)
                 if len(rows) == args.events:
                     break
             if len(rows) == args.events:
                 break
     if len(rows) != args.events:
-        raise RuntimeError(f"Expected {args.events} truth-selected events, got {len(rows)}")
-    for row in rows:
-        for key in ("resolved_original", "resolved_decoded", "boosted_original", "boosted_decoded"):
-            if row[key] is None:
-                row[key] = float("nan")
-    with (output_dir / "higgs_candidates.csv").open("w", newline="") as output:
+        raise RuntimeError(f"Expected {args.events} truth-selected Z→μ⁺μ⁻ events, got {len(rows)}")
+
+    with (output_dir / "z_mumu_candidates.csv").open("w", newline="") as output:
         writer = csv.DictWriter(output, fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
@@ -665,22 +668,20 @@ def evaluate_run(args, run_dir: Path, output_dir: Path):
         "events": args.events,
         "sequence_type": sequence_type,
         "max_sequence_length": max_sequence_length,
-        "particle_selection": {
-            "mask_column": mask_column,
-            "mask_min_value": mask_min_value,
-            "weighted_pt": False,
+        "particle_selection": {"mask_column": mask_column, "mask_min_value": mask_min_value},
+        "candidate_selection": {
+            "truth_requirement": "generator Z with direct muon and antimuon daughters",
+            "original_pid_classes": [MUON_PID, ANTIMUON_PID],
+            "decoded_pid_classes": [MUON_PID, ANTIMUON_PID],
+            "pair": "Hungarian assignment to direct generator daughters",
+            "match_dr": MUON_MATCH_DR,
+            "pid_constraint": "matched μ⁻/μ⁺ must retain the corresponding PID class",
+            "muon_mass_gev": MUON_MASS_GEV,
         },
-        "clustering": {
-            "algorithm": "antikt",
-            "resolved": {"radius": 0.4, "min_pt": 30.0, "max_abs_eta": 2.5, "match_dr": 0.2},
-            "boosted": {"radius": 0.8, "min_pt": 250.0, "max_abs_eta": 2.5, "match_dr": 0.4},
-        },
-        "resolved": summarize_topology(rows, "resolved", args.bootstrap_replicas),
-        "boosted": summarize_topology(rows, "boosted", args.bootstrap_replicas),
+        "z_mumu": summarize(rows, args.bootstrap_replicas),
     }
-    (output_dir / "higgs_mass_metrics.json").write_text(json.dumps(summary, indent=2))
-    plot_masses(rows, "resolved", output_dir)
-    plot_masses(rows, "boosted", output_dir)
+    (output_dir / "z_mumu_mass_metrics.json").write_text(json.dumps(summary, indent=2))
+    plot_masses(rows, output_dir)
     return rows, summary
 
 
@@ -702,22 +703,21 @@ def main():
         run_output_dir.mkdir(parents=True, exist_ok=True)
         rows, summary = evaluate_run(args, run_dir, run_output_dir)
         results.append((label, rows, summary))
-        print(f"Wrote Higgs mass evaluation for {label!r} to {run_output_dir}")
+        print(f"Wrote Z→μ⁺μ⁻ mass evaluation for {label!r} to {run_output_dir}")
     if multirun:
-        for topology in ("resolved", "boosted"):
-            plot_multirun_masses(results, topology, args.output_dir)
+        plot_multirun_masses(results, args.output_dir)
         comparison = {
-            "gghbb_test_manifest": str(args.gghbb_test_manifest.resolve()),
+            "dyjets_test_manifest": str(args.dyjets_test_manifest.resolve()),
             "events_per_run": args.events,
             "runs": [
                 {"label": label, "run_dir": str(run_dir), "metrics": summary}
                 for (run_dir, label), (_, _, summary) in zip(runs, results, strict=True)
             ],
         }
-        (args.output_dir / "higgs_mass_multirun_metrics.json").write_text(
+        (args.output_dir / "z_mumu_mass_multirun_metrics.json").write_text(
             json.dumps(comparison, indent=2)
         )
-        print(f"Wrote Higgs multi-run comparison to {args.output_dir}")
+        print(f"Wrote Z→μ⁺μ⁻ multi-run comparison to {args.output_dir}")
     upload_to_wandb(args, args.output_dir, multirun, results)
 
 
