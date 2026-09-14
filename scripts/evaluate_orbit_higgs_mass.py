@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Evaluate truth-matched resolved and boosted Higgs mass fidelity on ggHbb."""
+"""Evaluate truth-free or legacy truth-matched Higgs mass fidelity on ggHbb."""
 
 from __future__ import annotations
 
@@ -55,6 +55,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pyarrow.parquet as pq
 import torch
+import vector
 from hydra.utils import instantiate
 from omegaconf import OmegaConf
 from scipy.optimize import curve_fit
@@ -62,7 +63,20 @@ from scipy.optimize import linear_sum_assignment
 from tqdm.auto import tqdm
 
 from gabbro.data.orbit_parquet import SEQUENCE_SCHEMAS, OrbitParquetDataset
+from gabbro.plotting.orbit import (
+    HISTOGRAM_FILL_ALPHA,
+    HISTOGRAM_LINEWIDTH,
+    ORIGINAL_COLOR,
+    PRESENTATION_LEGEND_FONTSIZE,
+    RECONSTRUCTED_COLOR,
+    multirun_color,
+)
 from gabbro.plotting.utils import set_mpl_style
+
+
+vector.register_awkward()
+
+HIGGS_MASS_PLOT_BINS = np.arange(40.0, 205.0, 5.0)
 
 
 TRUTH_COLUMNS = [
@@ -92,11 +106,40 @@ def parse_args():
     parser.add_argument("--events", type=int, default=10_000)
     parser.add_argument("--batch-size", type=int)
     parser.add_argument("--bootstrap-replicas", type=int, default=200)
+    parser.add_argument(
+        "--candidate-mode",
+        choices=("leading_pt", "hungarian", "truth"),
+        default="leading_pt",
+        help="Candidate definition; the first two modes never access generator truth.",
+    )
+    parser.add_argument(
+        "--max-abs-eta",
+        type=float,
+        help="Optional post-clustering |eta| acceptance, applied to both representations.",
+    )
+    parser.add_argument(
+        "--max-match-dr",
+        type=float,
+        help="Optional Hungarian-match rejection threshold (hungarian/truth modes only).",
+    )
+    parser.add_argument(
+        "--apply-current-cuts",
+        action="store_true",
+        help="Enable the applicable standard cuts: |eta| < 2.5 and match delta-R < 0.2.",
+    )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--wandb-project", default="orbit-tokenizer")
     parser.add_argument("--wandb-name")
     parser.add_argument("--wandb-group")
     parser.add_argument("--wandb-entity")
+    parser.add_argument(
+        "--wandb-run-id",
+        help=(
+            "Resume an existing W&B run and log the Higgs outputs under its "
+            "downstream namespace. Intended for attaching evaluation plots to "
+            "the originating tokenizer training run."
+        ),
+    )
     parser.add_argument("--no-wandb", action="store_true", help="Keep results local; do not sync W&B.")
     return parser.parse_args()
 
@@ -176,6 +219,13 @@ def checkpoint_data_settings(cfg) -> tuple[str, int, str | None, float]:
         else float(configured_mask_minimum)
     )
     return sequence_type, max_sequence_length, mask_column, mask_min_value
+
+
+def checkpoint_energy_settings(cfg) -> tuple[bool, float]:
+    """Recover optional energy-feature settings from the training data config."""
+    return bool(cfg.data.get("include_energy", False)), float(
+        cfg.data.get("energy_shift", 2.5)
+    )
 
 
 def decode_batch(model, batch, device):
@@ -291,7 +341,21 @@ def cluster_jets(particles: np.ndarray, radius: float, min_pt: float):
         [ak.to_numpy(jets.eta), ak.to_numpy(jets.phi), ak.to_numpy(jets.pt), ak.to_numpy(jets.mass)],
         axis=-1,
     )
-    return values[np.abs(values[:, 0]) < 2.5]
+    return values[np.argsort(values[:, 2])[::-1]]
+
+
+def accepted_objects(objects: np.ndarray, max_abs_eta: float | None):
+    """Apply an optional post-reconstruction eta acceptance."""
+    if max_abs_eta is None:
+        return objects
+    return objects[np.abs(objects[:, 0]) < max_abs_eta]
+
+
+def resolved_jets(particles, max_abs_eta=None):
+    """Return the accepted anti-kt R=0.4 jets used by the resolved benchmark."""
+    return accepted_objects(
+        cluster_jets(particles, radius=0.4, min_pt=30.0), max_abs_eta
+    )
 
 
 def combine_mass(first, second):
@@ -306,21 +370,98 @@ def combine_mass(first, second):
     return float(np.sqrt(max(total[0] ** 2 - np.dot(total[1:], total[1:]), 0.0)))
 
 
-def resolved_candidate(particles, b, bbar):
-    jets = cluster_jets(particles, radius=0.4, min_pt=30.0)
+def resolved_candidate(
+    particles,
+    b,
+    bbar,
+    max_abs_eta=2.5,
+    max_match_dr=0.2,
+    jets=None,
+):
+    """Legacy candidate formed by matching AK4 jets to truth b daughters."""
+    jets = resolved_jets(particles, max_abs_eta) if jets is None else jets
     if len(jets) < 2:
         return None
     distances = np.array(
         [[delta_r(parton[0], parton[1], jet[0], jet[1]) for jet in jets] for parton in (b, bbar)]
     )
     parton_indices, jet_indices = linear_sum_assignment(distances)
-    if len(jet_indices) != 2 or np.any(distances[parton_indices, jet_indices] >= 0.2):
+    if len(jet_indices) != 2:
+        return None
+    if max_match_dr is not None and np.any(
+        distances[parton_indices, jet_indices] >= max_match_dr
+    ):
         return None
     return combine_mass(jets[jet_indices[0]], jets[jet_indices[1]])
 
 
+def leading_higgs_candidate(particles, max_abs_eta=None):
+    """Build a resolved candidate from the two leading reconstructed AK4 jets."""
+    jets = resolved_jets(particles, max_abs_eta)
+    return leading_higgs_candidate_from_jets(jets)
+
+
+def leading_higgs_candidate_from_jets(jets):
+    """Build the leading-dijet candidate from an already-clustered jet collection."""
+    if len(jets) < 2:
+        return None
+    return {
+        "mass": combine_mass(jets[0], jets[1]),
+        "jets": jets[:2],
+        "indices": np.array([0, 1], dtype=np.int64),
+        "match_dr": np.array([np.nan, np.nan]),
+    }
+
+
+def cross_matched_higgs_candidates(
+    original_particles,
+    decoded_particles,
+    max_abs_eta=None,
+    max_match_dr=None,
+):
+    """Anchor on the original leading jets and match them to decoded AK4 jets."""
+    original_jets = resolved_jets(original_particles, max_abs_eta)
+    decoded_jets = resolved_jets(decoded_particles, max_abs_eta)
+    return cross_matched_higgs_candidates_from_jets(
+        original_jets, decoded_jets, max_match_dr=max_match_dr
+    )
+
+
+def cross_matched_higgs_candidates_from_jets(
+    original_jets,
+    decoded_jets,
+    max_match_dr=None,
+):
+    """Match decoded jets to original leading jets using cached jet collections."""
+    original = leading_higgs_candidate_from_jets(original_jets)
+    if original is None or len(decoded_jets) < 2:
+        return original, None
+    distances = np.array(
+        [
+            [delta_r(reference[0], reference[1], jet[0], jet[1]) for jet in decoded_jets]
+            for reference in original["jets"]
+        ]
+    )
+    reference_indices, decoded_indices = linear_sum_assignment(distances)
+    if len(decoded_indices) != 2:
+        return original, None
+    ordered_indices = np.empty(2, dtype=np.int64)
+    ordered_indices[reference_indices] = decoded_indices
+    matched_dr = distances[np.arange(2), ordered_indices]
+    if max_match_dr is not None and np.any(matched_dr >= max_match_dr):
+        return original, None
+    matched_jets = decoded_jets[ordered_indices]
+    decoded = {
+        "mass": combine_mass(matched_jets[0], matched_jets[1]),
+        "jets": matched_jets,
+        "indices": ordered_indices,
+        "match_dr": matched_dr,
+    }
+    return original, decoded
+
+
 def boosted_candidate(particles, higgs, b, bbar):
-    jets = cluster_jets(particles, radius=0.8, min_pt=250.0)
+    jets = accepted_objects(cluster_jets(particles, radius=0.8, min_pt=250.0), 2.5)
     if not len(jets):
         return None
     distances = np.array([delta_r(higgs[0], higgs[1], jet[0], jet[1]) for jet in jets])
@@ -412,6 +553,13 @@ def distribution_label(label, values):
     return f"{label} ($\\mu$={moments['mean']:.1f}, $\\sigma$={moments['std']:.1f} GeV)"
 
 
+def fitted_distribution_label(label, values):
+    fit = fit_mass(values)
+    if not fit["success"]:
+        return label
+    return f"{label} ($\\mu$={fit['mean']:.1f}, $\\sigma$={fit['sigma']:.1f} GeV)"
+
+
 def summarize_topology(rows, topology, replicas):
     original = np.array([row[f"{topology}_original"] for row in rows], dtype=float)
     decoded = np.array([row[f"{topology}_decoded"] for row in rows], dtype=float)
@@ -445,54 +593,84 @@ def summarize_topology(rows, topology, replicas):
     else:
         summary["fit_peak_shift"] = None
         summary["fit_width_ratio"] = None
-    pt = np.asarray([row["truth_higgs_pt"] for row in rows], dtype=float)
-    summary["truth_higgs_pt_bins"] = {}
-    for low, high in zip((0, 250, 350, 500, 750), (250, 350, 500, 750, np.inf)):
-        selected = (pt >= low) & (pt < high)
-        selected_common = selected & common
-        name = f"{low:g}_{high:g}" if np.isfinite(high) else f"{low:g}_inf"
-        summary["truth_higgs_pt_bins"][name] = {
-            "events": int(selected.sum()),
-            "original_efficiency": float(np.mean(np.isfinite(original[selected])))
-            if np.any(selected)
-            else None,
-            "decoded_efficiency": float(np.mean(np.isfinite(decoded[selected])))
-            if np.any(selected)
-            else None,
-            "common_events": int(selected_common.sum()),
-            "paired_mass_difference_mean": float(
-                np.mean(decoded[selected_common] - original[selected_common])
-            )
-            if np.any(selected_common)
-            else None,
-        }
+    if rows and "truth_higgs_pt" in rows[0]:
+        pt = np.asarray([row["truth_higgs_pt"] for row in rows], dtype=float)
+        summary["truth_higgs_pt_bins"] = {}
+        for low, high in zip((0, 250, 350, 500, 750), (250, 350, 500, 750, np.inf)):
+            selected = (pt >= low) & (pt < high)
+            selected_common = selected & common
+            name = f"{low:g}_{high:g}" if np.isfinite(high) else f"{low:g}_inf"
+            summary["truth_higgs_pt_bins"][name] = {
+                "events": int(selected.sum()),
+                "original_efficiency": float(np.mean(np.isfinite(original[selected])))
+                if np.any(selected)
+                else None,
+                "decoded_efficiency": float(np.mean(np.isfinite(decoded[selected])))
+                if np.any(selected)
+                else None,
+                "common_events": int(selected_common.sum()),
+                "paired_mass_difference_mean": float(
+                    np.mean(decoded[selected_common] - original[selected_common])
+                )
+                if np.any(selected_common)
+                else None,
+            }
     return summary
 
 
-def plot_masses(rows, topology, output_dir):
+def mass_distribution_figure(
+    original,
+    decoded,
+    topology="resolved",
+    candidate_mode="truth",
+    presentation=False,
+    bins=None,
+):
+    """Render paired Higgs candidates with optional presentation styling."""
     set_mpl_style()
+    original = np.asarray(original, dtype=float)
+    decoded = np.asarray(decoded, dtype=float)
+    common = np.isfinite(original) & np.isfinite(decoded)
+    original = original[common]
+    decoded = decoded[common]
+    figure, axis = plt.subplots(figsize=(7, 5))
+    bins = HIGGS_MASS_PLOT_BINS if bins is None else np.asarray(bins, dtype=float)
+    label_fn = fitted_distribution_label if presentation else distribution_label
+    axis.hist(
+        original,
+        bins=bins,
+        histtype="stepfilled" if presentation else "step",
+        density=True,
+        color=ORIGINAL_COLOR if presentation else None,
+        alpha=HISTOGRAM_FILL_ALPHA if presentation else None,
+        linewidth=HISTOGRAM_LINEWIDTH,
+        label=label_fn("Original", original),
+    )
+    axis.hist(
+        decoded,
+        bins=bins,
+        histtype="step",
+        density=True,
+        color=RECONSTRUCTED_COLOR if presentation else None,
+        linewidth=HISTOGRAM_LINEWIDTH,
+        label=label_fn("Decoded", decoded),
+    )
+    axis.set(xlabel="Higgs candidate mass [GeV]", ylabel="Normalized events")
+    if not presentation:
+        axis.set_title(f"{topology} — {candidate_mode.replace('_', ' ')}")
+    axis.legend(
+        fontsize=PRESENTATION_LEGEND_FONTSIZE if presentation else 8,
+    )
+    figure.tight_layout()
+    return figure
+
+
+def plot_masses(rows, topology, output_dir, candidate_mode="truth"):
     original = np.array([row[f"{topology}_original"] for row in rows], dtype=float)
     decoded = np.array([row[f"{topology}_decoded"] for row in rows], dtype=float)
     common = np.isfinite(original) & np.isfinite(decoded)
-    figure, axis = plt.subplots(figsize=(7, 5))
-    bins = np.arange(40, 202, 2)
-    axis.hist(
-        original[common],
-        bins=bins,
-        histtype="step",
-        density=True,
-        label=distribution_label("Original", original[common]),
-    )
-    axis.hist(
-        decoded[common],
-        bins=bins,
-        histtype="step",
-        density=True,
-        label=distribution_label("Decoded", decoded[common]),
-    )
-    axis.set(xlabel="Higgs candidate mass [GeV]", ylabel="Normalized events", title=topology)
-    axis.legend(prop={"size": 8})
-    figure.tight_layout()
+    bins = HIGGS_MASS_PLOT_BINS
+    figure = mass_distribution_figure(original, decoded, topology, candidate_mode)
     figure.savefig(output_dir / f"higgs_mass_{topology}.png", dpi=180)
     plt.close(figure)
     np.savez_compressed(
@@ -503,11 +681,66 @@ def plot_masses(rows, topology, output_dir):
     )
 
 
-def plot_multirun_masses(results, topology, output_dir):
+def plot_event_observables(rows, output_dir):
+    """Plot event-level particle and jet diagnostics beside the mass benchmark."""
+    set_mpl_style()
+    specifications = (
+        (
+            "leading_particle_pt",
+            r"Leading particle $p_{\mathrm{T}}$ [GeV]",
+            output_dir / "leading_particle_pt.png",
+        ),
+        ("n_jets", "Number of AK4 jets", output_dir / "n_jets.png"),
+    )
+    for name, xlabel, output_path in specifications:
+        original = np.asarray([row[f"{name}_original"] for row in rows], dtype=float)
+        decoded = np.asarray([row[f"{name}_decoded"] for row in rows], dtype=float)
+        finite = np.concatenate((original[np.isfinite(original)], decoded[np.isfinite(decoded)]))
+        if name == "n_jets":
+            upper = int(np.max(finite)) if len(finite) else 0
+            bins = np.arange(-0.5, upper + 1.5, 1.0)
+        else:
+            upper = max(float(np.max(finite)) if len(finite) else 1.0, 1.0)
+            bins = np.linspace(0.0, upper, 61)
+        figure, axis = plt.subplots(figsize=(7, 5))
+        axis.hist(
+            original,
+            bins=bins,
+            density=True,
+            histtype="stepfilled",
+            color=ORIGINAL_COLOR,
+            alpha=HISTOGRAM_FILL_ALPHA,
+            linewidth=HISTOGRAM_LINEWIDTH,
+            label="Original",
+        )
+        axis.hist(
+            decoded,
+            bins=bins,
+            density=True,
+            histtype="step",
+            color=RECONSTRUCTED_COLOR,
+            linewidth=HISTOGRAM_LINEWIDTH,
+            label="Decoded",
+        )
+        axis.set(xlabel=xlabel, ylabel="Normalized events")
+        axis.set_yscale("log")
+        axis.legend()
+        figure.tight_layout()
+        figure.savefig(output_path, dpi=180)
+        plt.close(figure)
+        np.savez_compressed(
+            output_dir / f"{name}_histograms.npz",
+            bins=bins,
+            original=original,
+            decoded=decoded,
+        )
+
+
+def plot_multirun_masses(results, topology, output_dir, candidate_mode="truth"):
     """Overlay each decoded distribution and one common original reference."""
     set_mpl_style()
     figure, axis = plt.subplots(figsize=(7, 5))
-    bins = np.arange(40, 202, 2)
+    bins = HIGGS_MASS_PLOT_BINS
     first_label, first_rows, _ = results[0]
     original = np.asarray([row[f"{topology}_original"] for row in first_rows], dtype=float)
     original = original[np.isfinite(original)]
@@ -533,6 +766,7 @@ def plot_multirun_masses(results, topology, output_dir):
                 histtype="step",
                 density=True,
                 linewidth=1.7,
+                color=multirun_color(label),
                 label=distribution_label(label, decoded),
             )
         plot_data[f"decoded_{index}"] = decoded
@@ -540,7 +774,7 @@ def plot_multirun_masses(results, topology, output_dir):
     axis.set(
         xlabel="Higgs candidate mass [GeV]",
         ylabel="Normalized events",
-        title=f"{topology} — decoded comparison",
+        title=f"{topology} — {candidate_mode.replace('_', ' ')} decoded comparison",
     )
     axis.legend(prop={"size": 8})
     figure.tight_layout()
@@ -558,17 +792,36 @@ def upload_to_wandb(args, output_dir: Path, multirun: bool, results):
     except ImportError as exc:
         raise RuntimeError("W&B synchronization requested, but wandb is not installed.") from exc
 
-    run = wandb.init(
-        project=args.wandb_project,
-        name=args.wandb_name or f"higgs-mass-{output_dir.name}",
-        group=args.wandb_group or "orbit-higgs-mass",
-        entity=args.wandb_entity,
-        job_type="multirun-comparison" if multirun else "evaluation",
-        config={"events": args.events, "bootstrap_replicas": args.bootstrap_replicas},
-    )
+    evaluation_config = {
+        "events": args.events,
+        "bootstrap_replicas": args.bootstrap_replicas,
+        "candidate_mode": args.candidate_mode,
+        "max_abs_eta": args.max_abs_eta,
+        "max_match_dr": args.max_match_dr,
+    }
+    if args.wandb_run_id:
+        run = wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            id=args.wandb_run_id,
+            resume="must",
+        )
+        metric_prefix = "downstream/higgs_mass"
+        for key, value in evaluation_config.items():
+            run.summary[f"{metric_prefix}/config/{key}"] = value
+    else:
+        run = wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_name or f"higgs-mass-{output_dir.name}",
+            group=args.wandb_group or "orbit-higgs-mass",
+            entity=args.wandb_entity,
+            job_type="multirun-comparison" if multirun else "evaluation",
+            config=evaluation_config,
+        )
+        metric_prefix = "higgs_mass"
     try:
         images = {
-            f"higgs_mass/{path.stem}": wandb.Image(str(path))
+            f"{metric_prefix}/{path.stem}": wandb.Image(str(path))
             for path in sorted(output_dir.rglob("*.png"))
         }
         if images:
@@ -576,14 +829,26 @@ def upload_to_wandb(args, output_dir: Path, multirun: bool, results):
         scalar_metrics = {}
         for label, _, summary in results:
             run_label = output_component(label)
+            run_component = "" if args.wandb_run_id else f"/{run_label}"
             for topology in ("resolved", "boosted"):
+                if topology not in summary:
+                    continue
                 for representation in ("original", "decoded"):
                     moments = summary[topology][f"{representation}_distribution"]
                     for statistic in ("mean", "std"):
                         value = moments[statistic]
                         if value is not None:
                             scalar_metrics[
-                                f"mass_moments/{run_label}/{topology}/{representation}_{statistic}"
+                                f"{metric_prefix}/mass_moments{run_component}/{topology}/"
+                                f"{representation}_{statistic}"
+                            ] = value
+                    fit = summary[topology][f"{representation}_fit"]
+                    for statistic in ("mean", "sigma"):
+                        value = fit[statistic]
+                        if value is not None:
+                            scalar_metrics[
+                                f"{metric_prefix}/mass_fit{run_component}/{topology}/"
+                                f"{representation}_{statistic}"
                             ] = value
         if scalar_metrics:
             run.log(scalar_metrics)
@@ -605,6 +870,7 @@ def evaluate_run(args, run_dir: Path, output_dir: Path):
     sequence_type, max_sequence_length, mask_column, mask_min_value = (
         checkpoint_data_settings(cfg)
     )
+    include_energy, energy_shift = checkpoint_energy_settings(cfg)
     batch_size = args.batch_size or (16 if max_sequence_length > 128 else 256)
     prepare_test_time_baseline(model, cfg, output_dir)
     dataset = OrbitParquetDataset(
@@ -617,8 +883,10 @@ def evaluate_run(args, run_dir: Path, output_dir: Path):
         return_raw_features=True,
         return_event_metadata=True,
         pid_cfg=cfg.get("pid"),
+        include_energy=include_energy,
+        energy_shift=energy_shift,
     )
-    truth_reader = TruthReader()
+    truth_reader = TruthReader() if args.candidate_mode == "truth" else None
     rows = []
     with tqdm(total=args.events, desc="Evaluating ggHbb", unit="event") as progress:
         for batch in dataset:
@@ -627,33 +895,102 @@ def evaluate_run(args, run_dir: Path, output_dir: Path):
             for index in range(mask.shape[0]):
                 source_file = str(batch["source_files"][index])
                 source_row = int(batch["source_rows"][index])
-                truth = decaying_higgs(truth_reader.row(source_file, source_row))
-                if truth is None:
-                    continue
-                higgs, b, bbar = truth
                 raw = np.asarray(ak.to_numpy(batch["raw_part_features"][index]), dtype=float)
                 original = raw[:, [1, 2, 0]]
                 decoded_event = decoded[index, mask[index]]
-                rows.append(
-                    {
-                        "source_file": source_file,
-                        "source_row": source_row,
-                        "truth_higgs_pt": float(higgs[2]),
-                        "resolved_original": resolved_candidate(original, b, bbar),
-                        "resolved_decoded": resolved_candidate(decoded_event, b, bbar),
-                        "boosted_original": boosted_candidate(original, higgs, b, bbar),
-                        "boosted_decoded": boosted_candidate(decoded_event, higgs, b, bbar),
-                    }
-                )
+                original_jets = resolved_jets(original, args.max_abs_eta)
+                decoded_jets = resolved_jets(decoded_event, args.max_abs_eta)
+                row = {
+                    "source_file": source_file,
+                    "source_row": source_row,
+                    "leading_particle_pt_original": float(np.max(original[:, 2]))
+                    if len(original)
+                    else float("nan"),
+                    "leading_particle_pt_decoded": float(np.max(decoded_event[:, 2]))
+                    if len(decoded_event)
+                    else float("nan"),
+                    "n_jets_original": int(len(original_jets)),
+                    "n_jets_decoded": int(len(decoded_jets)),
+                }
+                if args.candidate_mode == "truth":
+                    truth = decaying_higgs(truth_reader.row(source_file, source_row))
+                    if truth is None:
+                        continue
+                    higgs, b, bbar = truth
+                    row.update(
+                        {
+                            "truth_higgs_pt": float(higgs[2]),
+                            "resolved_original": resolved_candidate(
+                                original,
+                                b,
+                                bbar,
+                                args.max_abs_eta,
+                                args.max_match_dr,
+                                jets=original_jets,
+                            ),
+                            "resolved_decoded": resolved_candidate(
+                                decoded_event,
+                                b,
+                                bbar,
+                                args.max_abs_eta,
+                                args.max_match_dr,
+                                jets=decoded_jets,
+                            ),
+                            "boosted_original": boosted_candidate(original, higgs, b, bbar),
+                            "boosted_decoded": boosted_candidate(decoded_event, higgs, b, bbar),
+                        }
+                    )
+                elif args.candidate_mode == "leading_pt":
+                    original_candidate = leading_higgs_candidate_from_jets(original_jets)
+                    decoded_candidate = leading_higgs_candidate_from_jets(decoded_jets)
+                    row.update(
+                        {
+                            "resolved_original": original_candidate["mass"]
+                            if original_candidate is not None
+                            else None,
+                            "resolved_decoded": decoded_candidate["mass"]
+                            if decoded_candidate is not None
+                            else None,
+                            "decoded_jet0_match_dr": float("nan"),
+                            "decoded_jet1_match_dr": float("nan"),
+                        }
+                    )
+                else:
+                    original_candidate, decoded_candidate = cross_matched_higgs_candidates_from_jets(
+                        original_jets,
+                        decoded_jets,
+                        max_match_dr=args.max_match_dr,
+                    )
+                    row.update(
+                        {
+                            "resolved_original": original_candidate["mass"]
+                            if original_candidate is not None
+                            else None,
+                            "resolved_decoded": decoded_candidate["mass"]
+                            if decoded_candidate is not None
+                            else None,
+                            "decoded_jet0_match_dr": float(decoded_candidate["match_dr"][0])
+                            if decoded_candidate is not None
+                            else float("nan"),
+                            "decoded_jet1_match_dr": float(decoded_candidate["match_dr"][1])
+                            if decoded_candidate is not None
+                            else float("nan"),
+                        }
+                    )
+                rows.append(row)
                 progress.update(1)
                 if len(rows) == args.events:
                     break
             if len(rows) == args.events:
                 break
     if len(rows) != args.events:
-        raise RuntimeError(f"Expected {args.events} truth-selected events, got {len(rows)}")
+        qualifier = "truth-selected " if args.candidate_mode == "truth" else ""
+        raise RuntimeError(f"Expected {args.events} {qualifier}events, got {len(rows)}")
     for row in rows:
-        for key in ("resolved_original", "resolved_decoded", "boosted_original", "boosted_decoded"):
+        mass_keys = ["resolved_original", "resolved_decoded"]
+        if args.candidate_mode == "truth":
+            mass_keys += ["boosted_original", "boosted_decoded"]
+        for key in mass_keys:
             if row[key] is None:
                 row[key] = float("nan")
     with (output_dir / "higgs_candidates.csv").open("w", newline="") as output:
@@ -665,6 +1002,7 @@ def evaluate_run(args, run_dir: Path, output_dir: Path):
         "events": args.events,
         "sequence_type": sequence_type,
         "max_sequence_length": max_sequence_length,
+        "candidate_mode": args.candidate_mode,
         "particle_selection": {
             "mask_column": mask_column,
             "mask_min_value": mask_min_value,
@@ -672,22 +1010,53 @@ def evaluate_run(args, run_dir: Path, output_dir: Path):
         },
         "clustering": {
             "algorithm": "antikt",
-            "resolved": {"radius": 0.4, "min_pt": 30.0, "max_abs_eta": 2.5, "match_dr": 0.2},
-            "boosted": {"radius": 0.8, "min_pt": 250.0, "max_abs_eta": 2.5, "match_dr": 0.4},
+            "resolved": {"radius": 0.4, "min_pt": 30.0},
         },
+        "postprocessing": {
+            "max_abs_eta": args.max_abs_eta,
+            "max_match_dr": args.max_match_dr,
+        },
+        "candidate_selection": (
+            "independent two leading-pT AK4 jets"
+            if args.candidate_mode == "leading_pt"
+            else "original leading AK4 jets matched to decoded AK4 jets by Hungarian delta-R"
+            if args.candidate_mode == "hungarian"
+            else "legacy independent Hungarian matching to generator b daughters"
+        ),
         "resolved": summarize_topology(rows, "resolved", args.bootstrap_replicas),
-        "boosted": summarize_topology(rows, "boosted", args.bootstrap_replicas),
     }
+    if args.candidate_mode == "truth":
+        summary["clustering"]["boosted"] = {
+            "radius": 0.8,
+            "min_pt": 250.0,
+            "max_abs_eta": 2.5,
+            "match_dr": 0.4,
+        }
+        summary["boosted"] = summarize_topology(rows, "boosted", args.bootstrap_replicas)
     (output_dir / "higgs_mass_metrics.json").write_text(json.dumps(summary, indent=2))
-    plot_masses(rows, "resolved", output_dir)
-    plot_masses(rows, "boosted", output_dir)
+    plot_masses(rows, "resolved", output_dir, args.candidate_mode)
+    plot_event_observables(rows, output_dir)
+    if args.candidate_mode == "truth":
+        plot_masses(rows, "boosted", output_dir, args.candidate_mode)
     return rows, summary
 
 
 def main():
     args = parse_args()
+    if args.no_wandb and args.wandb_run_id:
+        raise ValueError("--wandb-run-id cannot be combined with --no-wandb")
     if args.events < 1:
         raise ValueError("--events must be positive")
+    if args.apply_current_cuts:
+        args.max_abs_eta = 2.5 if args.max_abs_eta is None else args.max_abs_eta
+        if args.candidate_mode != "leading_pt":
+            args.max_match_dr = 0.2 if args.max_match_dr is None else args.max_match_dr
+    if args.max_abs_eta is not None and args.max_abs_eta <= 0:
+        raise ValueError("--max-abs-eta must be positive")
+    if args.max_match_dr is not None and args.max_match_dr <= 0:
+        raise ValueError("--max-match-dr must be positive")
+    if args.candidate_mode == "leading_pt" and args.max_match_dr is not None:
+        raise ValueError("--max-match-dr only applies to hungarian or truth mode")
     runs, multirun = run_specs(args)
     if args.output_dir.exists() and any(args.output_dir.iterdir()):
         raise FileExistsError(f"Output directory is not empty: {args.output_dir}")
@@ -704,8 +1073,9 @@ def main():
         results.append((label, rows, summary))
         print(f"Wrote Higgs mass evaluation for {label!r} to {run_output_dir}")
     if multirun:
-        for topology in ("resolved", "boosted"):
-            plot_multirun_masses(results, topology, args.output_dir)
+        topologies = ("resolved", "boosted") if args.candidate_mode == "truth" else ("resolved",)
+        for topology in topologies:
+            plot_multirun_masses(results, topology, args.output_dir, args.candidate_mode)
         comparison = {
             "gghbb_test_manifest": str(args.gghbb_test_manifest.resolve()),
             "events_per_run": args.events,

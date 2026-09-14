@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Evaluate PID-aware Z→μ⁺μ⁻ mass fidelity on DYJetsToLL events."""
+"""Evaluate truth-free or legacy truth-matched Z→μ⁺μ⁻ mass fidelity."""
 
 from __future__ import annotations
 
@@ -14,6 +14,10 @@ from pathlib import Path
 from types import SimpleNamespace
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_Z_TEST_MANIFEST = (
+    Path(os.environ.get("ORBIT_MANIFEST_DIR", PROJECT_ROOT / "manifests" / "production_final"))
+    / "ZZ_leptonic_test.txt"
+)
 
 
 def _load_explicit_env_file() -> None:
@@ -61,6 +65,7 @@ from scipy.optimize import linear_sum_assignment
 from tqdm.auto import tqdm
 
 from gabbro.data.orbit_parquet import SEQUENCE_SCHEMAS, OrbitParquetDataset
+from gabbro.plotting.orbit import multirun_color
 from gabbro.plotting.utils import set_mpl_style
 
 
@@ -91,11 +96,42 @@ def parse_args():
         metavar="RUN_SPEC",
         help="Repeatable comparison entry: --run RUN_DIR or --run RUN_DIR LABEL.",
     )
-    parser.add_argument("--dyjets-test-manifest", required=True, type=Path)
+    parser.add_argument(
+        "--z-test-manifest",
+        "--dyjets-test-manifest",
+        dest="z_test_manifest",
+        type=Path,
+        default=DEFAULT_Z_TEST_MANIFEST,
+        help=(
+            "Input manifest (default: ZZ_leptonic_test.txt under ORBIT_MANIFEST_DIR). "
+            "--dyjets-test-manifest remains available as a compatibility alias."
+        ),
+    )
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--events", type=int, default=10_000)
     parser.add_argument("--batch-size", type=int)
     parser.add_argument("--bootstrap-replicas", type=int, default=200)
+    parser.add_argument(
+        "--candidate-mode",
+        choices=("leading_pt", "hungarian", "truth"),
+        default="leading_pt",
+        help="Candidate definition; the first two modes never access generator truth.",
+    )
+    parser.add_argument(
+        "--max-abs-eta",
+        type=float,
+        help="Optional muon |eta| acceptance, applied to both representations.",
+    )
+    parser.add_argument(
+        "--max-match-dr",
+        type=float,
+        help="Optional Hungarian-match rejection threshold (hungarian/truth modes only).",
+    )
+    parser.add_argument(
+        "--apply-current-cuts",
+        action="store_true",
+        help="Enable the applicable standard cuts: |eta| < 2.5 and match delta-R < 0.2.",
+    )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--wandb-project", default="orbit-tokenizer")
     parser.add_argument("--wandb-name")
@@ -172,6 +208,13 @@ def checkpoint_data_settings(cfg) -> tuple[str, int, str | None, float]:
     if mask_min_value is None:
         mask_min_value = schema["mask_min_value"]
     return sequence_type, max_sequence_length, mask_column, float(mask_min_value)
+
+
+def checkpoint_energy_settings(cfg) -> tuple[bool, float]:
+    """Recover optional energy-feature settings from the training data config."""
+    return bool(cfg.data.get("include_energy", False)), float(
+        cfg.data.get("energy_shift", 2.5)
+    )
 
 
 def decode_batch(model, batch, device: torch.device):
@@ -294,17 +337,22 @@ def truth_matched_dimuon_candidate(
     truth_muon: np.ndarray,
     truth_antimuon: np.ndarray,
     match_dr: float = MUON_MATCH_DR,
+    max_abs_eta: float | None = None,
 ):
     """Build a PID-constrained dimuon candidate matched to direct truth daughters."""
     particles = np.asarray(particles, dtype=float)
     pid = np.asarray(pid, dtype=np.int64)
     if len(particles) != len(pid):
         raise ValueError("particles and pid must have the same length")
-    if len(particles) < 2:
+    eligible_indices = np.arange(len(particles))
+    if max_abs_eta is not None:
+        eligible_indices = eligible_indices[np.abs(particles[:, 0]) < max_abs_eta]
+    if len(eligible_indices) < 2:
         return None
+    eligible_particles = particles[eligible_indices]
     distances = np.array(
         [
-            [delta_r(truth[0], truth[1], particle[0], particle[1]) for particle in particles]
+            [delta_r(truth[0], truth[1], particle[0], particle[1]) for particle in eligible_particles]
             for truth in (truth_muon, truth_antimuon)
         ]
     )
@@ -312,10 +360,13 @@ def truth_matched_dimuon_candidate(
     if len(particle_indices) != 2:
         return None
     matched_indices = dict(zip(truth_indices, particle_indices, strict=True))
-    muon_index, antimuon_index = matched_indices[0], matched_indices[1]
-    muon_dr, antimuon_dr = distances[0, muon_index], distances[1, antimuon_index]
-    if muon_dr >= match_dr or antimuon_dr >= match_dr:
+    muon_local_index, antimuon_local_index = matched_indices[0], matched_indices[1]
+    muon_dr = distances[0, muon_local_index]
+    antimuon_dr = distances[1, antimuon_local_index]
+    if match_dr is not None and (muon_dr >= match_dr or antimuon_dr >= match_dr):
         return None
+    muon_index = int(eligible_indices[muon_local_index])
+    antimuon_index = int(eligible_indices[antimuon_local_index])
     if pid[muon_index] != MUON_PID or pid[antimuon_index] != ANTIMUON_PID:
         return None
     return {
@@ -329,6 +380,95 @@ def truth_matched_dimuon_candidate(
         "muon_pid": int(pid[muon_index]),
         "antimuon_pid": int(pid[antimuon_index]),
     }
+
+
+def leading_dimuon_candidate(particles, pid, max_abs_eta=None):
+    """Select the leading reconstructed muon and antimuon by PID."""
+    particles = np.asarray(particles, dtype=float)
+    pid = np.asarray(pid, dtype=np.int64)
+    if len(particles) != len(pid):
+        raise ValueError("particles and pid must have the same length")
+    eligible = np.ones(len(particles), dtype=bool)
+    if max_abs_eta is not None:
+        eligible &= np.abs(particles[:, 0]) < max_abs_eta
+    muon_indices = np.flatnonzero(eligible & (pid == MUON_PID))
+    antimuon_indices = np.flatnonzero(eligible & (pid == ANTIMUON_PID))
+    if not len(muon_indices) or not len(antimuon_indices):
+        return None
+    muon_index = int(muon_indices[np.argmax(particles[muon_indices, 2])])
+    antimuon_index = int(antimuon_indices[np.argmax(particles[antimuon_indices, 2])])
+    return {
+        "mass": invariant_mass(particles[muon_index], particles[antimuon_index]),
+        "muon": particles[muon_index],
+        "antimuon": particles[antimuon_index],
+        "muon_index": muon_index,
+        "antimuon_index": antimuon_index,
+        "muon_dr": float("nan"),
+        "antimuon_dr": float("nan"),
+        "muon_pid": int(pid[muon_index]),
+        "antimuon_pid": int(pid[antimuon_index]),
+    }
+
+
+def cross_matched_dimuon_candidates(
+    original_particles,
+    original_pid,
+    decoded_particles,
+    decoded_pid,
+    max_abs_eta=None,
+    max_match_dr=None,
+):
+    """Anchor on original leading muons and Hungarian-match compatible decoded PIDs."""
+    original = leading_dimuon_candidate(original_particles, original_pid, max_abs_eta)
+    if original is None:
+        return None, None
+    decoded_particles = np.asarray(decoded_particles, dtype=float)
+    decoded_pid = np.asarray(decoded_pid, dtype=np.int64)
+    if len(decoded_particles) != len(decoded_pid):
+        raise ValueError("particles and pid must have the same length")
+    eligible = np.isin(decoded_pid, (MUON_PID, ANTIMUON_PID))
+    if max_abs_eta is not None:
+        eligible &= np.abs(decoded_particles[:, 0]) < max_abs_eta
+    candidate_indices = np.flatnonzero(eligible)
+    if len(candidate_indices) < 2:
+        return original, None
+    candidates = decoded_particles[candidate_indices]
+    candidate_pid = decoded_pid[candidate_indices]
+    references = (original["muon"], original["antimuon"])
+    expected_pid = (MUON_PID, ANTIMUON_PID)
+    distances = np.full((2, len(candidates)), 1e9, dtype=float)
+    for reference_index, (reference, required_pid) in enumerate(
+        zip(references, expected_pid, strict=True)
+    ):
+        compatible = np.flatnonzero(candidate_pid == required_pid)
+        distances[reference_index, compatible] = [
+            delta_r(reference[0], reference[1], candidates[index, 0], candidates[index, 1])
+            for index in compatible
+        ]
+    reference_indices, local_indices = linear_sum_assignment(distances)
+    if len(local_indices) != 2:
+        return original, None
+    ordered_local = np.empty(2, dtype=np.int64)
+    ordered_local[reference_indices] = local_indices
+    matched_dr = distances[np.arange(2), ordered_local]
+    if np.any(matched_dr >= 1e9):
+        return original, None
+    if max_match_dr is not None and np.any(matched_dr >= max_match_dr):
+        return original, None
+    matched_indices = candidate_indices[ordered_local]
+    muon_index, antimuon_index = map(int, matched_indices)
+    decoded = {
+        "mass": invariant_mass(decoded_particles[muon_index], decoded_particles[antimuon_index]),
+        "muon": decoded_particles[muon_index],
+        "antimuon": decoded_particles[antimuon_index],
+        "muon_index": muon_index,
+        "antimuon_index": antimuon_index,
+        "muon_dr": float(matched_dr[0]),
+        "antimuon_dr": float(matched_dr[1]),
+        "muon_pid": int(decoded_pid[muon_index]),
+        "antimuon_pid": int(decoded_pid[antimuon_index]),
+    }
+    return original, decoded
 
 
 def gaussian(x, norm, mean, sigma):
@@ -434,7 +574,7 @@ def summarize(rows, replicas):
     return summary
 
 
-def plot_masses(rows, output_dir: Path):
+def plot_masses(rows, output_dir: Path, candidate_mode="truth"):
     set_mpl_style()
     original = np.asarray([row["original_mass"] for row in rows], dtype=float)
     decoded = np.asarray([row["decoded_mass"] for row in rows], dtype=float)
@@ -446,17 +586,21 @@ def plot_masses(rows, output_dir: Path):
         bins=bins,
         histtype="step",
         density=True,
-        label=distribution_label("Original, truth-matched", original[common]),
+        label=distribution_label("Original", original[common]),
     )
     axis.hist(
         decoded[common],
         bins=bins,
         histtype="step",
         density=True,
-        label=distribution_label("Decoded, truth-matched", decoded[common]),
+        label=distribution_label("Decoded", decoded[common]),
     )
     axis.axvline(Z_MASS_GEV, color="black", linestyle="--", linewidth=1, label=r"$m_Z$")
-    axis.set(xlabel=r"Truth-matched $Z\to\mu^+\mu^-$ mass [GeV]", ylabel="Normalized events")
+    axis.set(
+        xlabel=r"$Z\to\mu^+\mu^-$ candidate mass [GeV]",
+        ylabel="Normalized events",
+        title=candidate_mode.replace("_", " "),
+    )
     axis.legend(prop={"size": 8})
     figure.tight_layout()
     figure.savefig(output_dir / "z_mumu_mass.png", dpi=180)
@@ -469,7 +613,7 @@ def plot_masses(rows, output_dir: Path):
     )
 
 
-def plot_multirun_masses(results, output_dir: Path):
+def plot_multirun_masses(results, output_dir: Path, candidate_mode="truth"):
     """Overlay decoded dimuon spectra and a single original reference."""
     set_mpl_style()
     figure, axis = plt.subplots(figsize=(7, 5))
@@ -487,7 +631,7 @@ def plot_multirun_masses(results, output_dir: Path):
             color="black",
             linestyle="--",
             linewidth=1.5,
-            label=distribution_label(f"Original, truth-matched ({first_label})", original),
+            label=distribution_label(f"Original ({first_label})", original),
         )
     for index, (label, rows, _) in enumerate(results):
         decoded = np.asarray([row["decoded_mass"] for row in rows], dtype=float)
@@ -499,12 +643,17 @@ def plot_multirun_masses(results, output_dir: Path):
                 histtype="step",
                 density=True,
                 linewidth=1.7,
-                label=distribution_label(f"{label}, truth-matched", decoded),
+                color=multirun_color(label),
+                label=distribution_label(label, decoded),
             )
         plot_data[f"decoded_{index}"] = decoded
         plot_data[f"decoded_{index}_label"] = np.asarray(label)
     axis.axvline(Z_MASS_GEV, color="black", linestyle=":", linewidth=1, label=r"$m_Z$")
-    axis.set(xlabel=r"Truth-matched $Z\to\mu^+\mu^-$ mass [GeV]", ylabel="Normalized events")
+    axis.set(
+        xlabel=r"$Z\to\mu^+\mu^-$ candidate mass [GeV]",
+        ylabel="Normalized events",
+        title=f"{candidate_mode.replace('_', ' ')} — decoded comparison",
+    )
     axis.legend(prop={"size": 8})
     figure.tight_layout()
     figure.savefig(output_dir / "z_mumu_mass_multirun.png", dpi=180)
@@ -527,7 +676,13 @@ def upload_to_wandb(args, output_dir: Path, multirun: bool, results):
         group=args.wandb_group or "orbit-z-mumu-mass",
         entity=args.wandb_entity,
         job_type="multirun-comparison" if multirun else "evaluation",
-        config={"events": args.events, "bootstrap_replicas": args.bootstrap_replicas},
+        config={
+            "events": args.events,
+            "bootstrap_replicas": args.bootstrap_replicas,
+            "candidate_mode": args.candidate_mode,
+            "max_abs_eta": args.max_abs_eta,
+            "max_match_dr": args.max_match_dr,
+        },
     )
     try:
         images = {
@@ -600,10 +755,11 @@ def evaluate_run(args, run_dir: Path, output_dir: Path):
     device = torch.device(args.device)
     model, cfg, checkpoint = load_model(run_dir, device)
     sequence_type, max_sequence_length, mask_column, mask_min_value = checkpoint_data_settings(cfg)
+    include_energy, energy_shift = checkpoint_energy_settings(cfg)
     batch_size = args.batch_size or (16 if max_sequence_length > 128 else 256)
     prepare_test_time_baseline(model, cfg, output_dir)
     dataset = OrbitParquetDataset(
-        args.dyjets_test_manifest,
+        args.z_test_manifest,
         sequence_type=sequence_type,
         batch_size=batch_size,
         max_sequence_length=max_sequence_length,
@@ -612,9 +768,11 @@ def evaluate_run(args, run_dir: Path, output_dir: Path):
         return_raw_features=True,
         return_event_metadata=True,
         pid_cfg=cfg.get("pid"),
+        include_energy=include_energy,
+        energy_shift=energy_shift,
     )
 
-    truth_reader = TruthReader()
+    truth_reader = TruthReader() if args.candidate_mode == "truth" else None
     rows = []
     with tqdm(total=args.events, desc="Evaluating Z→μ⁺μ⁻", unit="event") as progress:
         for batch in dataset:
@@ -624,9 +782,6 @@ def evaluate_run(args, run_dir: Path, output_dir: Path):
             for index in range(mask.shape[0]):
                 source_file = str(batch["source_files"][index])
                 source_row = int(batch["source_rows"][index])
-                truth = decaying_z_to_mumu(truth_reader.row(source_file, source_row))
-                if truth is None:
-                    continue
                 raw = np.asarray(ak.to_numpy(batch["raw_part_features"][index]), dtype=float)
                 valid = mask[index]
                 # Raw features remain ragged, whereas ``part_mask`` is padded to the
@@ -636,18 +791,49 @@ def evaluate_run(args, run_dir: Path, output_dir: Path):
                 original_pid_event = original_pid[index, valid][:particle_count]
                 decoded_event = decoded[index, valid][:particle_count]
                 decoded_pid_event = decoded_pid[index, valid][:particle_count]
-                original_candidate = truth_matched_dimuon_candidate(
-                    original, original_pid_event, truth["muon"], truth["antimuon"]
-                )
-                decoded_candidate = truth_matched_dimuon_candidate(
-                    decoded_event, decoded_pid_event, truth["muon"], truth["antimuon"]
-                )
-                row = {
-                    "source_file": source_file,
-                    "source_row": source_row,
-                    "truth_z_pt": float(truth["z"][2]),
-                    "truth_z_mass": float(truth["z"][3]),
-                }
+                row = {"source_file": source_file, "source_row": source_row}
+                if args.candidate_mode == "truth":
+                    truth = decaying_z_to_mumu(truth_reader.row(source_file, source_row))
+                    if truth is None:
+                        continue
+                    original_candidate = truth_matched_dimuon_candidate(
+                        original,
+                        original_pid_event,
+                        truth["muon"],
+                        truth["antimuon"],
+                        match_dr=args.max_match_dr,
+                        max_abs_eta=args.max_abs_eta,
+                    )
+                    decoded_candidate = truth_matched_dimuon_candidate(
+                        decoded_event,
+                        decoded_pid_event,
+                        truth["muon"],
+                        truth["antimuon"],
+                        match_dr=args.max_match_dr,
+                        max_abs_eta=args.max_abs_eta,
+                    )
+                    row.update(
+                        {
+                            "truth_z_pt": float(truth["z"][2]),
+                            "truth_z_mass": float(truth["z"][3]),
+                        }
+                    )
+                elif args.candidate_mode == "leading_pt":
+                    original_candidate = leading_dimuon_candidate(
+                        original, original_pid_event, args.max_abs_eta
+                    )
+                    decoded_candidate = leading_dimuon_candidate(
+                        decoded_event, decoded_pid_event, args.max_abs_eta
+                    )
+                else:
+                    original_candidate, decoded_candidate = cross_matched_dimuon_candidates(
+                        original,
+                        original_pid_event,
+                        decoded_event,
+                        decoded_pid_event,
+                        max_abs_eta=args.max_abs_eta,
+                        max_match_dr=args.max_match_dr,
+                    )
                 row.update(candidate_row("original", original_candidate))
                 row.update(candidate_row("decoded", decoded_candidate))
                 rows.append(row)
@@ -657,7 +843,8 @@ def evaluate_run(args, run_dir: Path, output_dir: Path):
             if len(rows) == args.events:
                 break
     if len(rows) != args.events:
-        raise RuntimeError(f"Expected {args.events} truth-selected Z→μ⁺μ⁻ events, got {len(rows)}")
+        qualifier = "truth-selected " if args.candidate_mode == "truth" else ""
+        raise RuntimeError(f"Expected {args.events} {qualifier}Z→μ⁺μ⁻ events, got {len(rows)}")
 
     with (output_dir / "z_mumu_candidates.csv").open("w", newline="") as output:
         writer = csv.DictWriter(output, fieldnames=list(rows[0]))
@@ -668,20 +855,27 @@ def evaluate_run(args, run_dir: Path, output_dir: Path):
         "events": args.events,
         "sequence_type": sequence_type,
         "max_sequence_length": max_sequence_length,
+        "candidate_mode": args.candidate_mode,
         "particle_selection": {"mask_column": mask_column, "mask_min_value": mask_min_value},
         "candidate_selection": {
-            "truth_requirement": "generator Z with direct muon and antimuon daughters",
             "original_pid_classes": [MUON_PID, ANTIMUON_PID],
             "decoded_pid_classes": [MUON_PID, ANTIMUON_PID],
-            "pair": "Hungarian assignment to direct generator daughters",
-            "match_dr": MUON_MATCH_DR,
-            "pid_constraint": "matched μ⁻/μ⁺ must retain the corresponding PID class",
+            "pair": (
+                "independent leading-pT muon and antimuon"
+                if args.candidate_mode == "leading_pt"
+                else "original leading muon pair matched to decoded muons by Hungarian delta-R"
+                if args.candidate_mode == "hungarian"
+                else "legacy independent Hungarian matching to direct generator daughters"
+            ),
+            "max_abs_eta": args.max_abs_eta,
+            "max_match_dr": args.max_match_dr,
+            "pid_constraint": "muon and antimuon candidates retain their corresponding PID class",
             "muon_mass_gev": MUON_MASS_GEV,
         },
         "z_mumu": summarize(rows, args.bootstrap_replicas),
     }
     (output_dir / "z_mumu_mass_metrics.json").write_text(json.dumps(summary, indent=2))
-    plot_masses(rows, output_dir)
+    plot_masses(rows, output_dir, args.candidate_mode)
     return rows, summary
 
 
@@ -689,6 +883,16 @@ def main():
     args = parse_args()
     if args.events < 1:
         raise ValueError("--events must be positive")
+    if args.apply_current_cuts:
+        args.max_abs_eta = 2.5 if args.max_abs_eta is None else args.max_abs_eta
+        if args.candidate_mode != "leading_pt":
+            args.max_match_dr = 0.2 if args.max_match_dr is None else args.max_match_dr
+    if args.max_abs_eta is not None and args.max_abs_eta <= 0:
+        raise ValueError("--max-abs-eta must be positive")
+    if args.max_match_dr is not None and args.max_match_dr <= 0:
+        raise ValueError("--max-match-dr must be positive")
+    if args.candidate_mode == "leading_pt" and args.max_match_dr is not None:
+        raise ValueError("--max-match-dr only applies to hungarian or truth mode")
     runs, multirun = run_specs(args)
     if args.output_dir.exists() and any(args.output_dir.iterdir()):
         raise FileExistsError(f"Output directory is not empty: {args.output_dir}")
@@ -705,9 +909,9 @@ def main():
         results.append((label, rows, summary))
         print(f"Wrote Z→μ⁺μ⁻ mass evaluation for {label!r} to {run_output_dir}")
     if multirun:
-        plot_multirun_masses(results, args.output_dir)
+        plot_multirun_masses(results, args.output_dir, args.candidate_mode)
         comparison = {
-            "dyjets_test_manifest": str(args.dyjets_test_manifest.resolve()),
+            "z_test_manifest": str(args.z_test_manifest.resolve()),
             "events_per_run": args.events,
             "runs": [
                 {"label": label, "run_dir": str(run_dir), "metrics": summary}

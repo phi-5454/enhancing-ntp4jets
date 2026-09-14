@@ -6,6 +6,7 @@ import runpy
 import awkward as ak
 import numpy as np
 import pytest
+from omegaconf import OmegaConf
 
 from gabbro.data.orbit_downstream import (
     FIVE_CLASS_GROUPS,
@@ -14,6 +15,23 @@ from gabbro.data.orbit_downstream import (
     physical_particles_to_classifier_features,
 )
 from gabbro.models.orbit_event_classifier import classification_metrics
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        "scripts/evaluate_orbit_higgs_mass.py",
+        "scripts/evaluate_orbit_z_mumu_mass.py",
+    ],
+)
+def test_mass_benchmark_inherits_checkpoint_energy_settings(script):
+    namespace = runpy.run_path(script)
+    settings = namespace["checkpoint_energy_settings"]
+
+    assert settings(OmegaConf.create({"data": {}})) == (False, 2.5)
+    assert settings(
+        OmegaConf.create({"data": {"include_energy": True, "energy_shift": 2.7}})
+    ) == (True, 2.7)
 
 
 def test_five_class_taxonomy_and_feature_contract():
@@ -98,6 +116,31 @@ def test_higgs_candidates_are_stable_for_perfect_reconstruction():
     assert boosted == namespace["boosted_candidate"](particles.copy(), higgs, b, bbar)
 
 
+def test_higgs_leading_pt_and_cross_hungarian_candidates_are_truth_free():
+    namespace = runpy.run_path("scripts/evaluate_orbit_higgs_mass.py")
+    original = np.array(
+        [[0.0, 0.0, 100.0], [1.0, 1.0, 90.0], [-2.0, -2.0, 40.0]]
+    )
+    decoded = np.array(
+        [[0.02, 0.01, 50.0], [1.02, 0.99, 45.0], [-2.5, -2.5, 200.0]]
+    )
+    leading = namespace["leading_higgs_candidate"](original)
+    assert leading is not None
+    assert np.allclose(leading["jets"][:, 2], [100.0, 90.0])
+
+    original_candidate, decoded_candidate = namespace["cross_matched_higgs_candidates"](
+        original, decoded
+    )
+    assert original_candidate is not None
+    assert decoded_candidate is not None
+    assert np.all(decoded_candidate["match_dr"] < 0.05)
+    assert np.allclose(decoded_candidate["jets"][:, 2], [50.0, 45.0])
+    _, rejected = namespace["cross_matched_higgs_candidates"](
+        original, decoded, max_match_dr=0.01
+    )
+    assert rejected is None
+
+
 def test_higgs_multirun_plot_overlays_decoded_outlines(tmp_path):
     namespace = runpy.run_path("scripts/evaluate_orbit_higgs_mass.py")
     rows = [
@@ -178,6 +221,47 @@ def test_z_dimuon_candidate_requires_pid_and_delta_r_match():
         truth_muon,
         truth_antimuon,
     ) is None
+
+
+def test_z_leading_pt_and_cross_hungarian_candidates_are_pid_constrained():
+    namespace = runpy.run_path("scripts/evaluate_orbit_z_mumu_mass.py")
+    original = np.array(
+        [[0.0, 0.0, 60.0], [0.8, 2.8, 55.0], [0.1, 0.1, 20.0]]
+    )
+    original_pid = np.array([6, 7, 6])
+    decoded = np.array(
+        [[0.02, 0.01, 30.0], [0.82, 2.79, 28.0], [-2.5, -2.5, 100.0]]
+    )
+    decoded_pid = np.array([6, 7, 6])
+    leading = namespace["leading_dimuon_candidate"](original, original_pid)
+    assert leading["muon_index"] == 0
+    assert leading["antimuon_index"] == 1
+
+    original_candidate, decoded_candidate = namespace["cross_matched_dimuon_candidates"](
+        original, original_pid, decoded, decoded_pid
+    )
+    assert original_candidate is not None
+    assert decoded_candidate is not None
+    assert decoded_candidate["muon_index"] == 0
+    assert decoded_candidate["antimuon_index"] == 1
+    assert decoded_candidate["muon_pid"] == 6
+    assert decoded_candidate["antimuon_pid"] == 7
+    _, rejected = namespace["cross_matched_dimuon_candidates"](
+        original, original_pid, decoded, decoded_pid, max_match_dr=0.01
+    )
+    assert rejected is None
+
+
+def test_optional_eta_acceptance_is_separate_from_object_existence():
+    higgs = runpy.run_path("scripts/evaluate_orbit_higgs_mass.py")
+    particles = np.array([[3.0, 0.0, 100.0], [0.0, 2.0, 90.0]])
+    assert higgs["leading_higgs_candidate"](particles) is not None
+    assert higgs["leading_higgs_candidate"](particles, max_abs_eta=2.5) is None
+
+    z = runpy.run_path("scripts/evaluate_orbit_z_mumu_mass.py")
+    pid = np.array([6, 7])
+    assert z["leading_dimuon_candidate"](particles, pid) is not None
+    assert z["leading_dimuon_candidate"](particles, pid, max_abs_eta=2.5) is None
 
 
 def test_z_multirun_plot_overlays_decoded_outlines(tmp_path):

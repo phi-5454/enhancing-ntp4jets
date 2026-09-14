@@ -1,0 +1,48 @@
+# Four-job truth-free mass benchmark matrix:
+#   Higgs and Z, each with independent leading-pT selection and
+#   original-to-decoded Hungarian matching.
+#
+# All jobs process 10,000 events. No |eta| acceptance or maximum matching
+# delta-R is applied. Supply the checkpoints and labels at submission time:
+#
+#   condor_submit \
+#     -append 'RUN_SPECS=--run /path/to/run_a \"Run A\" --run /path/to/run_b \"Run B\"' \
+#     condor/orbit_mass_candidate_modes_multirun.sub
+
+executable = scripts/condor_run_mass_benchmark.sh
+
+PROJECT_DIR = /eos/home-y/yelberke/enhancing-ntp4jets
+OUTPUT_DIR = /eos/user/y/yelberke/enhancing_ntp4jets_runs
+CONDA_ENV = /eos/home-y/yelberke/conda_condor_orbit_env
+MANIFEST_DIR = /eos/home-y/yelberke/enhancing-ntp4jets/manifests/production_final
+GABBRO_ENV_FILE = /eos/user/y/yelberke/wandb.env
+QUEUE_SLICE =
+
+arguments = $(PROJECT_DIR) \
+  $(OUTPUT_DIR)/$(OUTPUT_STEM)_$(Cluster) \
+  $(BENCHMARK) \
+  $(MANIFEST_DIR)/$(INPUT_MANIFEST) \
+  --candidate-mode $(CANDIDATE_MODE) \
+  --wandb-name $(OUTPUT_STEM)_$(Cluster) \
+  --wandb-group orbit_mass_candidate_modes_$(Cluster) \
+  $(RUN_SPECS)
+
+environment = "CONDA_ENV=$(CONDA_ENV) GABBRO_ENV_FILE=$(GABBRO_ENV_FILE) ORBIT_MANIFEST_DIR=$(MANIFEST_DIR) WANDB_MODE=online MASS_BENCHMARK_EVENTS=10000"
+
+log    = $(OUTPUT_DIR)/condor_logs/orbit_mass_candidate_modes_$(Cluster).log
+output = $(OUTPUT_DIR)/condor_logs/$(OUTPUT_STEM)_$(Cluster)_$(Process).out
+error  = $(OUTPUT_DIR)/condor_logs/$(OUTPUT_STEM)_$(Cluster)_$(Process).err
+
+should_transfer_files = YES
+when_to_transfer_output = ON_EXIT
+request_cpus = 4
+request_memory = 16GB
+request_gpus = 1
++JobFlavour = "tomorrow"
+
+queue BENCHMARK, CANDIDATE_MODE, INPUT_MANIFEST, OUTPUT_STEM from $(QUEUE_SLICE) (
+  higgs  leading_pt  ggHbb_test.txt                                      higgs_mass_leading_pt_multirun
+  higgs  hungarian   ggHbb_test.txt                                      higgs_mass_hungarian_multirun
+  z_mumu leading_pt  ZZ_leptonic_test.txt                                z_mumu_mass_leading_pt_multirun
+  z_mumu hungarian   ZZ_leptonic_test.txt                                z_mumu_mass_hungarian_multirun
+)

@@ -1,3 +1,4 @@
+# Override BENCHMARK_ARGS to select Hungarian matching or acceptance cuts.
 # Submit with -append 'RUN_SPECS=--run /path/to/run LABEL ...'.
 executable = scripts/condor_run_mass_benchmark.sh
 
@@ -6,8 +7,9 @@ OUTPUT_DIR = /eos/user/y/yelberke/enhancing_ntp4jets_runs
 CONDA_ENV = /eos/home-y/yelberke/conda_condor_orbit_env
 MANIFEST_DIR = /eos/home-y/yelberke/enhancing-ntp4jets/manifests/production_final
 GABBRO_ENV_FILE = /eos/user/y/yelberke/wandb.env
+BENCHMARK_ARGS = --candidate-mode leading_pt
 
-arguments = $(PROJECT_DIR) $(OUTPUT_DIR)/higgs_mass_multirun_$(Cluster) higgs $(MANIFEST_DIR)/ggHbb_test.txt $(RUN_SPECS)
+arguments = $(PROJECT_DIR) $(OUTPUT_DIR)/higgs_mass_multirun_$(Cluster) higgs $(MANIFEST_DIR)/ggHbb_test.txt $(BENCHMARK_ARGS) $(RUN_SPECS)
 environment = "CONDA_ENV=$(CONDA_ENV) GABBRO_ENV_FILE=$(GABBRO_ENV_FILE) ORBIT_MANIFEST_DIR=$(MANIFEST_DIR) WANDB_MODE=online"
 
 log    = $(OUTPUT_DIR)/condor_logs/orbit_higgs_mass_multirun_$(Cluster).log

@@ -23,7 +23,7 @@ case "${BENCHMARK}" in
     ;;
   z_mumu)
     SCRIPT="scripts/evaluate_orbit_z_mumu_mass.py"
-    MANIFEST_ARGUMENT="--dyjets-test-manifest"
+    MANIFEST_ARGUMENT="--z-test-manifest"
     ;;
   *)
     echo "Unknown benchmark: ${BENCHMARK}" >&2
