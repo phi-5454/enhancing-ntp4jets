@@ -39,10 +39,10 @@ CODEBOOK_FAMILY_COLORS = {
     "kmeans": plot_utils.DEFAULT_COLORS[3],
     "scalar_baseline": plot_utils.DEFAULT_COLORS[4],
     "continuous": plot_utils.DEFAULT_COLORS[5],
-    # Preserve the identities used by the original TT_only/SM_mixture
-    # downstream comparisons for all equivalent display labels.
+    # Preserve the identities used by the tt/ggHbb VQ-STE training-domain
+    # comparisons for all equivalent display labels.
     "training_tt": plot_utils.DEFAULT_COLORS[3],
-    "training_sm_mixture": plot_utils.DEFAULT_COLORS[9],
+    "training_sm_mixture": plot_utils.DEFAULT_COLORS[7],
 }
 CODEBOOK_FAMILY_MARKERS = {
     "fsq": "o",
@@ -55,8 +55,8 @@ CODEBOOK_FAMILY_MARKERS = {
     "split_fsq_alpha_128": "*",
     "split_fsq_alpha_64": "<",
     "split_fsq_alpha_32": ">",
-    "training_tt": "<",
-    "training_sm_mixture": "*",
+    "training_tt": "D",
+    "training_sm_mixture": "P",
 }
 MIN_CODEBOOK_MARKER_AREA = 55.0
 MAX_CODEBOOK_MARKER_AREA = 210.0
@@ -230,8 +230,10 @@ def _multirun_family_key(series_name: str) -> str | None:
         "continuous_autoencoder": "continuous",
         "tt_only": "training_tt",
         "trained_on_tt": "training_tt",
+        "tt_trained_vq_ste": "training_tt",
         "sm_mixture": "training_sm_mixture",
         "trained_on_sm_mixture": "training_sm_mixture",
+        "mixture_trained_vq_ste": "training_sm_mixture",
         "vq_mu_plus_fsq_alpha_128": "split_vq_fsq_alpha_128",
         "vq_mu_plus_fsq_alpha_64": "split_vq_fsq_alpha_64",
         "vq_mu_plus_fsq_alpha_32": "split_vq_fsq_alpha_32",

@@ -258,6 +258,20 @@ def test_split_quantizer_families_have_distinct_styles():
     assert len({multirun_marker(family) for family in families}) == len(families)
 
 
+def test_training_domain_style_aliases_match_presentation_labels():
+    tt_labels = ("TT_only", "Trained on tt", "tt-trained VQ-STE")
+    mixture_labels = (
+        "SM_mixture",
+        "Trained on SM mixture",
+        "mixture-trained VQ-STE",
+    )
+
+    assert len({multirun_color(label) for label in tt_labels}) == 1
+    assert len({multirun_marker(label) for label in tt_labels}) == 1
+    assert len({multirun_color(label) for label in mixture_labels}) == 1
+    assert len({multirun_marker(label) for label in mixture_labels}) == 1
+
+
 def test_multirun_wandb_upload_uses_detected_credentials(monkeypatch, tmp_path):
     args = SimpleNamespace(
         no_wandb=False,
