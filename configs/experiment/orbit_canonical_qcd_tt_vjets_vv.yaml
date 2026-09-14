@@ -104,6 +104,13 @@ trainer:
   max_epochs: 30
   enable_checkpointing: true
 
+callbacks:
+  orbit_plotting_callback:
+    jet_min_pt: 30.0
+    include_tau32: false
+    cache_subset_jet_results: true
+    validation_plot_every_n_epochs: 5
+
 model:
   model_kwargs:
     input_dim: 4

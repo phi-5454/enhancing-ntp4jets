@@ -1,0 +1,53 @@
+# Test the eight tt-trained VQ-STE checkpoints on the balanced canonical SM
+# mixture.  Physics/jet plots are disabled: this recovery only needs the
+# particle reconstruction and entropy/rate artifacts used by comparison plots.
+
+executable = scripts/condor_run_training.sh
+
+PROJECT_DIR = /eos/user/y/yelberke/enhancing-ntp4jets
+OUTPUT_DIR = /eos/user/y/yelberke/enhancing_ntp4jets_runs
+CONDA_ENV = /eos/home-y/yelberke/conda_condor_orbit_env
+ORBIT_MANIFEST_DIR = /eos/home-y/yelberke/enhancing-ntp4jets/manifests/production_final
+GABBRO_ENV_FILE = /eos/user/y/yelberke/wandb.env
+MIXTURE_CONFIG = /eos/user/y/yelberke/enhancing-ntp4jets/configs/experiment/orbit_canonical_qcd_tt_vjets_vv.yaml
+SUITE_ID = orbit_tt_vq_ste_mixture_test_$(Cluster)
+
+arguments = $(PROJECT_DIR) $(OUTPUT_DIR) train $(SUITE_ID) $(Process) \
+  experiment=orbit_canonical_tt \
+  ckpt_path_for_evaluation=$(CHECKPOINT) \
+  +evaluation_data_config=$(MIXTURE_CONFIG) \
+  +evaluation_test_suites=[training_like] \
+  +evaluation_output_name=mixture_test \
+  train=false \
+  test=true \
+  data.num_workers=4 \
+  callbacks.orbit_plotting_callback.enable_physics_plots=false \
+  callbacks.orbit_plotting_callback.include_codebook_histogram=false \
+  callbacks.orbit_plotting_callback.include_event_reconstruction_grid=false \
+  ++callbacks.orbit_plotting_callback.include_pid_conditional_residuals=false \
+  task_name=orbit_particle_orbit_canonical_tt_vq_ste_codes_$(NUM_CODES)_mixture_test
+
+environment = "ORBIT_MANIFEST_DIR=$(ORBIT_MANIFEST_DIR) GABBRO_ENV_FILE=$(GABBRO_ENV_FILE) CONDA_ENV=$(CONDA_ENV) WANDB_MODE=offline"
+
+log    = $(OUTPUT_DIR)/condor_logs/orbit_tt_vq_ste_mixture_test_$(Cluster).log
+output = $(OUTPUT_DIR)/condor_logs/orbit_tt_vq_ste_mixture_test_$(NUM_CODES)_$(Cluster)_$(Process).out
+error  = $(OUTPUT_DIR)/condor_logs/orbit_tt_vq_ste_mixture_test_$(NUM_CODES)_$(Cluster)_$(Process).err
+
+should_transfer_files = YES
+when_to_transfer_output = ON_EXIT
+request_cpus = 4
+request_memory = 16GB
+request_gpus = 1
++JobFlavour = "longlunch"
+priority = 10000
+
+queue NUM_CODES, CHECKPOINT from (
+  128, /eos/user/y/yelberke/enhancing_ntp4jets_runs/orbit_vq_ste_scan_canonical_orbit_canonical_tt_967979/orbit-canonical-tt/runs/2026-07-28_05-09-18_b9pgpun014_PossessiveBench/checkpoints/best.ckpt
+  256, /eos/user/y/yelberke/enhancing_ntp4jets_runs/orbit_vq_ste_scan_canonical_orbit_canonical_tt_1108948/orbit-canonical-tt/runs/2026-09-05_02-41-53_b9pgpun214_AmusingFilicide/checkpoints/best.ckpt
+  512, /eos/user/y/yelberke/enhancing_ntp4jets_runs/orbit_vq_ste_scan_canonical_orbit_canonical_tt_967979/orbit-canonical-tt/runs/2026-07-28_05-12-50_b9pgpun213_ConceitedElectrograph/checkpoints/best.ckpt
+  1024, /eos/user/y/yelberke/enhancing_ntp4jets_runs/orbit_vq_ste_scan_canonical_orbit_canonical_tt_967979/orbit-canonical-tt/runs/2026-07-28_05-15-58_b9pgpun216_ApologeticTorture/checkpoints/best.ckpt
+  2048, /eos/user/y/yelberke/enhancing_ntp4jets_runs/orbit_vq_ste_scan_canonical_orbit_canonical_tt_967979/orbit-canonical-tt/runs/2026-07-28_05-16-02_b9g57n6415_GammyBenevolence/checkpoints/best.ckpt
+  4096, /eos/user/y/yelberke/enhancing_ntp4jets_runs/orbit_vq_ste_scan_canonical_orbit_canonical_tt_967979/orbit-canonical-tt/runs/2026-07-28_05-18-48_b9g57n1695_AbolishableAnnexation/checkpoints/best.ckpt
+  8192, /eos/user/y/yelberke/enhancing_ntp4jets_runs/orbit_vq_ste_scan_canonical_orbit_canonical_tt_967979/orbit-canonical-tt/runs/2026-07-28_05-18-48_b9g57n1136_UnpeopledCap/checkpoints/best.ckpt
+  16384, /eos/user/y/yelberke/enhancing_ntp4jets_runs/orbit_vq_ste_scan_canonical_orbit_canonical_tt_967979/orbit-canonical-tt/runs/2026-07-28_05-15-46_b9g57n2934_FractiousFile/checkpoints/best.ckpt
+)

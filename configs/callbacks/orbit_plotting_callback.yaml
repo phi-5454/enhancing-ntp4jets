@@ -8,6 +8,14 @@ orbit_plotting_callback:
   enable_physics_plots: true
   include_all_ratios: true
   jet_radius: 0.8
+  # Inclusive reclustered-jet threshold; zero preserves legacy behavior.
+  jet_min_pt: 0.0
+  # Tau32 requires an additional exclusive clustering for every inclusive jet.
+  include_tau32: true
+  # Reuse per-event jet evaluation between class subsets and their `all` union.
+  cache_subset_jet_results: false
+  # Keep validation and metrics every epoch, but make plots at this cadence.
+  validation_plot_every_n_epochs: 1
   # One-to-one true/reconstructed jet matches must satisfy delta-R <= R * this value.
   jet_matching_radius_fraction: 0.5
   include_codebook_histogram: true
@@ -16,3 +24,5 @@ orbit_plotting_callback:
   # Plot post-selection input-particle multiplicity from a bounded training sample.
   include_train_particle_count_histogram: true
   train_particle_count_max_events: 2048
+  # One compact same-position residual figure per test suite, split by original PID.
+  include_pid_conditional_residuals: true

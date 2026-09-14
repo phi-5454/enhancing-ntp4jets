@@ -1,0 +1,50 @@
+# Test-only recovery for trained canonical tt full-event checkpoints.
+#
+# Keep this separate from orbit_canonical_common.sub: checkpoint evaluation
+# reloads the resolved training config. Hydra still needs a valid experiment
+# selector for its initial composition; train.py removes that selector before
+# applying the remaining overrides to the checkpoint config.
+
+executable = scripts/condor_run_training.sh
+
+PROJECT_DIR = /eos/user/y/yelberke/enhancing-ntp4jets
+OUTPUT_DIR = /eos/user/y/yelberke/enhancing_ntp4jets_runs
+CONDA_ENV = /eos/home-y/yelberke/conda_condor_orbit_env
+ORBIT_MANIFEST_DIR = /eos/home-y/yelberke/enhancing-ntp4jets/manifests/production_final
+GABBRO_ENV_FILE = /eos/user/y/yelberke/wandb.env
+SUITE_ID = orbit_tt_full_event_test_recovery_$(Cluster)
+QUEUE_SLICE =
+
+arguments = $(PROJECT_DIR) $(OUTPUT_DIR) train $(SUITE_ID) $(Process) \
+  experiment=orbit_canonical_tt_full_event \
+  ckpt_path_for_evaluation=$(CHECKPOINT) \
+  train=false \
+  test=true \
+  data.num_workers=0 \
+  task_name=orbit_particle_orbit_canonical_tt_full_event_$(RUN_NAME)_test_recovery \
+  logger.wandb.name=orbit_particle_orbit_canonical_tt_full_event_$(RUN_NAME)_test_recovery_$(Cluster)_$(Process) \
+  logger.wandb.group=$(SUITE_ID)
+
+environment = "ORBIT_MANIFEST_DIR=$(ORBIT_MANIFEST_DIR) GABBRO_ENV_FILE=$(GABBRO_ENV_FILE) CONDA_ENV=$(CONDA_ENV) WANDB_MODE=online"
+
+log    = $(OUTPUT_DIR)/condor_logs/orbit_tt_full_event_test_recovery_$(Cluster).log
+output = $(OUTPUT_DIR)/condor_logs/orbit_tt_full_event_test_recovery_$(RUN_NAME)_$(Cluster)_$(Process).out
+error  = $(OUTPUT_DIR)/condor_logs/orbit_tt_full_event_test_recovery_$(RUN_NAME)_$(Cluster)_$(Process).err
+
+should_transfer_files = YES
+when_to_transfer_output = ON_EXIT
+request_cpus = 4
+request_memory = 12GB
+request_gpus = 1
++JobFlavour = "workday"
+priority = 100
+
+queue RUN_NAME, CHECKPOINT from $(QUEUE_SLICE) (
+  vq_ste_codes_512, /eos/user/y/yelberke/enhancing_ntp4jets_runs/orbit_vq_ste_scan_canonical_orbit_canonical_tt_full_event_1108966/orbit-canonical-tt-full-event/runs/2026-09-06_10-07-37_b9pgpun001_InartisticBust/checkpoints/best.ckpt
+  vq_ste_codes_8192, /eos/user/y/yelberke/enhancing_ntp4jets_runs/orbit_vq_ste_scan_canonical_orbit_canonical_tt_full_event_1001367/orbit-canonical-tt-full-event/runs/2026-08-24_04-12-30_b9pgpun205_ConstantWing/checkpoints/best.ckpt
+  vq_ste_codes_16384, /eos/user/y/yelberke/enhancing_ntp4jets_runs/orbit_vq_ste_scan_canonical_orbit_canonical_tt_full_event_1108970/orbit-canonical-tt-full-event/runs/2026-09-06_11-00-59_b9pgpun203_HypercatalecticAspirator/checkpoints/best.ckpt
+  fsq_mu_3_3_2_alpha_128, /eos/user/y/yelberke/enhancing_ntp4jets_runs/orbit_split_fsq_alpha128_scan_canonical_orbit_canonical_tt_full_event_1110358/orbit-canonical-tt-full-event/runs/2026-09-09_02-53-21_b9g47n2007_CrispValve/checkpoints/best.ckpt
+  fsq_mu_5_4_3_2_alpha_128, /eos/user/y/yelberke/enhancing_ntp4jets_runs/orbit_split_fsq_alpha128_scan_canonical_orbit_canonical_tt_full_event_1110358/orbit-canonical-tt-full-event/runs/2026-09-09_02-58-58_b9g47n6004_AirborneProtoceratops/checkpoints/best.ckpt
+  fsq_mu_3_alpha_64, /eos/user/y/yelberke/enhancing_ntp4jets_runs/orbit_split_fsq_alpha64_scan_canonical_orbit_canonical_tt_full_event_1110359/orbit-canonical-tt-full-event/runs/2026-09-09_04-34-03_b9g47n6001_EmbezzledVisiting/checkpoints/best.ckpt
+  fsq_mu_3_3_2_2_alpha_32, /eos/user/y/yelberke/enhancing_ntp4jets_runs/orbit_split_fsq_alpha32_scan_canonical_orbit_canonical_tt_full_event_1110360/orbit-canonical-tt-full-event/runs/2026-09-09_14-36-45_b9g47n6009_MovableForemanship/checkpoints/best.ckpt
+)

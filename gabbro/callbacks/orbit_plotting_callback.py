@@ -25,7 +25,10 @@ from gabbro.plotting.orbit import (
     plot_event_reconstruction_grid,
     plot_feature_histograms,
     plot_particle_count_histograms,
+    plot_pid_conditional_residuals,
     plot_residual_histograms,
+    pid_residual_arrays,
+    pid_residual_distribution_summary,
     reconstruction_loss_metrics,
 )
 from gabbro.utils.pylogger import get_pylogger
@@ -112,12 +115,17 @@ class OrbitPlottingCallback(L.Callback):
         enable_physics_plots: bool = True,
         include_all_ratios: bool = True,
         jet_radius: float = 0.8,
+        jet_min_pt: float = 0.0,
+        include_tau32: bool = True,
+        cache_subset_jet_results: bool = False,
+        validation_plot_every_n_epochs: int = 1,
         include_codebook_histogram: bool = True,
         include_event_reconstruction_grid: bool = True,
         event_reconstruction_examples_per_class: int = 3,
         jet_matching_radius_fraction: float = 0.5,
         include_train_particle_count_histogram: bool = True,
         train_particle_count_max_events: int = 2048,
+        include_pid_conditional_residuals: bool = True,
     ):
         super().__init__()
         self.image_path = image_path
@@ -127,6 +135,10 @@ class OrbitPlottingCallback(L.Callback):
         self.enable_physics_plots = enable_physics_plots
         self.include_all_ratios = include_all_ratios
         self.jet_radius = jet_radius
+        self.jet_min_pt = float(jet_min_pt)
+        self.include_tau32 = bool(include_tau32)
+        self.cache_subset_jet_results = bool(cache_subset_jet_results)
+        self.validation_plot_every_n_epochs = int(validation_plot_every_n_epochs)
         self.include_codebook_histogram = include_codebook_histogram
         self.include_event_reconstruction_grid = include_event_reconstruction_grid
         self.event_reconstruction_examples_per_class = int(
@@ -137,10 +149,15 @@ class OrbitPlottingCallback(L.Callback):
             include_train_particle_count_histogram
         )
         self.train_particle_count_max_events = int(train_particle_count_max_events)
+        self.include_pid_conditional_residuals = bool(include_pid_conditional_residuals)
         if self.event_reconstruction_examples_per_class < 1:
             raise ValueError("event_reconstruction_examples_per_class must be positive")
         if self.jet_matching_radius_fraction <= 0:
             raise ValueError("jet_matching_radius_fraction must be positive")
+        if self.jet_min_pt < 0:
+            raise ValueError("jet_min_pt must be non-negative")
+        if self.validation_plot_every_n_epochs < 1:
+            raise ValueError("validation_plot_every_n_epochs must be positive")
         if self.train_particle_count_max_events < 1:
             raise ValueError("train_particle_count_max_events must be positive")
 
@@ -213,6 +230,8 @@ class OrbitPlottingCallback(L.Callback):
     def on_validation_epoch_end(self, trainer, pl_module):
         if trainer.sanity_checking:
             return
+        if (trainer.current_epoch + 1) % self.validation_plot_every_n_epochs != 0:
+            return
         pl_module.concat_validation_loop_predictions()
         self.plot(trainer, pl_module, stage="val")
 
@@ -235,6 +254,7 @@ class OrbitPlottingCallback(L.Callback):
             "L1T_PUPPIPart_Phi_cos": "cos_phi",
             "L1T_PUPPIPart_Phi_sin": "sin_phi",
             "L1T_PUPPIPart_PT": "log_pt_shifted",
+            "L1T_PUPPIPart_E": "log_energy_shifted",
         }
         return aliases.get(
             feature_name,
@@ -262,6 +282,123 @@ class OrbitPlottingCallback(L.Callback):
             return f"train_start_{name}.{self.image_filetype}"
         return f"test_{name}.{self.image_filetype}"
 
+    def _plot_pid_residuals_for_suite(
+        self,
+        trainer,
+        pl_module,
+        suite_name: str | None,
+        suite_selector: np.ndarray,
+        x_original: np.ndarray,
+        x_reco: np.ndarray,
+        mask: np.ndarray,
+    ) -> None:
+        """Save and log one original-PID-conditioned residual plot per test suite."""
+        if not self.include_pid_conditional_residuals:
+            return
+        pid = getattr(pl_module, "test_pid_concat", None)
+        if pid is None:
+            logger.info("No original PID predictions found; skipping PID residual plot.")
+            return
+        selected_mask = mask[suite_selector]
+        if not np.any(selected_mask):
+            return
+        original_flat = x_original[suite_selector][selected_mask]
+        reconstructed_flat = x_reco[suite_selector][selected_mask]
+        pid_flat = np.asarray(pid)[suite_selector][selected_mask]
+        feature_names = self._feature_names(trainer, pl_module)
+        residuals = pid_residual_arrays(original_flat, reconstructed_flat, feature_names)
+        class_names = tuple(
+            getattr(getattr(pl_module, "model", None), "pid_class_names", ())
+        )
+        if not class_names:
+            class_names = tuple(f"class_{index}" for index in range(int(pid_flat.max()) + 1))
+        by_pid = {
+            index: {
+                key: values[pid_flat == index]
+                for key, values in residuals.items()
+            }
+            for index in range(len(class_names))
+        }
+        suite_label = suite_name or "all"
+        figure = plot_pid_conditional_residuals(
+            by_pid,
+            class_names,
+            title=(
+                "Same-token reconstruction residuals by original PID"
+                f" ({suite_label})"
+            ),
+        )
+        name = f"test/{suite_label}/all/orbit_pid_conditional_residuals"
+        path = self._plot_dir(trainer) / self._figure_name(
+            trainer,
+            "test",
+            f"{suite_label}_all_orbit_pid_conditional_residuals",
+        )
+        figure.savefig(path, dpi=300, bbox_inches="tight")
+        self._log_figure(trainer, path, name)
+        close_figure(figure)
+
+        summary = {
+            "suite": suite_label,
+            "particles": int(len(pid_flat)),
+            "conditioning": "original PID at the same sequence position",
+            "classes": {
+                class_name: {
+                    "count": int(np.sum(pid_flat == index)),
+                    **{
+                        key: pid_residual_distribution_summary(values)
+                        for key, values in by_pid[index].items()
+                    },
+                }
+                for index, class_name in enumerate(class_names)
+            },
+        }
+        metrics_dir = Path(trainer.default_root_dir) / "saved_metrics"
+        metrics_dir.mkdir(parents=True, exist_ok=True)
+        summary_path = metrics_dir / (
+            f"test_{suite_label}_pid_conditional_residuals_step_"
+            f"{trainer.global_step}.json"
+        )
+        with summary_path.open("w") as file:
+            json.dump(summary, file, indent=2, sort_keys=True)
+        histogram_dir = Path(trainer.default_root_dir) / "saved_histograms"
+        histogram_dir.mkdir(parents=True, exist_ok=True)
+        values_path = histogram_dir / (
+            f"test_{suite_label}_pid_conditional_residuals_step_"
+            f"{trainer.global_step}.npz"
+        )
+        np.savez_compressed(values_path, original_pid=pid_flat, **residuals)
+
+        for run_logger in trainer.loggers:
+            if not isinstance(run_logger, L.pytorch.loggers.WandbLogger):
+                continue
+            try:
+                import wandb
+
+                residual_keys = list(residuals)
+                columns = ["PID", "count"] + [
+                    f"{key} {stat}"
+                    for key in residual_keys
+                    for stat in ("bias", "rmse")
+                ]
+                rows = []
+                for class_name in class_names:
+                    class_summary = summary["classes"][class_name]
+                    rows.append(
+                        [class_name, class_summary["count"]]
+                        + [
+                            class_summary[key][stat]
+                            for key in residual_keys
+                            for stat in ("bias", "rmse")
+                        ]
+                    )
+                run_logger.experiment.log(
+                    {f"test/{suite_label}/all/pid_residual_summary": wandb.Table(
+                        columns=columns, data=rows
+                    )}
+                )
+            except Exception as exc:
+                logger.warning(f"Failed to log PID residual summary table: {exc}")
     @staticmethod
     def _wandb_figure_key(name: str) -> str:
         parts = [part.strip().replace(" ", "_") for part in name.split("/") if part.strip()]
@@ -584,7 +721,7 @@ class OrbitPlottingCallback(L.Callback):
         )
         jetdef = fastjet.JetDefinition(fastjet.kt_algorithm, jet_radius)
         cluster = fastjet.ClusterSequence(particles, jetdef)
-        inclusive_jets = cluster.inclusive_jets(min_pt=0.0)
+        inclusive_jets = cluster.inclusive_jets(min_pt=self.jet_min_pt)
         if not len(inclusive_jets[0]):
             return {
                 "pt": np.array([]),
@@ -595,17 +732,20 @@ class OrbitPlottingCallback(L.Callback):
                 "jet_count": 0,
             }
 
-        constituents = cluster.constituents()[0]
-        tau32 = np.asarray(
-            [
-                self._calculate_tau32(
-                    jet_constituents[np.newaxis],
-                    jet_radius,
-                )
-                for jet_constituents in constituents
-            ],
-            dtype=np.float64,
-        )
+        if self.include_tau32:
+            constituents = cluster.constituents(min_pt=self.jet_min_pt)[0]
+            tau32 = np.asarray(
+                [
+                    self._calculate_tau32(
+                        jet_constituents[np.newaxis],
+                        jet_radius,
+                    )
+                    for jet_constituents in constituents
+                ],
+                dtype=np.float64,
+            )
+        else:
+            tau32 = np.empty(0, dtype=np.float64)
         return {
             "pt": np.asarray(inclusive_jets.pt[0]),
             "eta": np.asarray(inclusive_jets.eta[0]),
@@ -615,13 +755,95 @@ class OrbitPlottingCallback(L.Callback):
             "jet_count": len(inclusive_jets[0]),
         }
 
-    def _collect_particle_jet_metrics(
+    def _evaluate_particle_event_jets(
+        self,
+        x_physical: np.ndarray,
+        x_reco_physical: np.ndarray,
+        event_mask: np.ndarray,
+        jet_radius: float,
+    ) -> dict:
+        true_jets = self._reconstruct_event_jets(
+            x_physical[event_mask, 2],
+            x_physical[event_mask, 0],
+            x_physical[event_mask, 1],
+            jet_radius,
+        )
+        reco_jets = self._reconstruct_event_jets(
+            x_reco_physical[event_mask, 2],
+            x_reco_physical[event_mask, 0],
+            x_reco_physical[event_mask, 1],
+            jet_radius,
+        )
+        all_true_indices, all_reco_indices, _ = match_jets_by_delta_r(
+            true_jets["eta"],
+            true_jets["phi"],
+            reco_jets["eta"],
+            reco_jets["phi"],
+            max_delta_r=None,
+        )
+        true_indices, reco_indices, delta_r = match_jets_by_delta_r(
+            true_jets["eta"],
+            true_jets["phi"],
+            reco_jets["eta"],
+            reco_jets["phi"],
+            max_delta_r=jet_radius * self.jet_matching_radius_fraction,
+        )
+
+        result = {
+            "true_jet_pts": true_jets["pt"][true_indices],
+            "reco_jet_pts": reco_jets["pt"][reco_indices],
+            "true_jet_masses": true_jets["mass"][true_indices],
+            "reco_jet_masses": reco_jets["mass"][reco_indices],
+            "all_true_jet_pts": true_jets["pt"][all_true_indices],
+            "all_reco_jet_pts": reco_jets["pt"][all_reco_indices],
+            "all_true_jet_masses": true_jets["mass"][all_true_indices],
+            "all_reco_jet_masses": reco_jets["mass"][all_reco_indices],
+            "true_tau32s": np.empty(0, dtype=np.float64),
+            "reco_tau32s": np.empty(0, dtype=np.float64),
+            "all_true_tau32s": np.empty(0, dtype=np.float64),
+            "all_reco_tau32s": np.empty(0, dtype=np.float64),
+            "true_jet_count": true_jets["jet_count"],
+            "reco_jet_count": reco_jets["jet_count"],
+            "match_stats": {
+                "true": true_jets["jet_count"],
+                "reco": reco_jets["jet_count"],
+                "matched": len(true_indices),
+                "delta_r": np.asarray(delta_r, dtype=np.float64),
+            },
+        }
+        if self.include_tau32:
+            true_tau = true_jets["tau32"][true_indices]
+            reco_tau = reco_jets["tau32"][reco_indices]
+            finite_tau = np.isfinite(true_tau) & np.isfinite(reco_tau)
+            result["true_tau32s"] = true_tau[finite_tau]
+            result["reco_tau32s"] = reco_tau[finite_tau]
+
+            all_true_tau = true_jets["tau32"][all_true_indices]
+            all_reco_tau = reco_jets["tau32"][all_reco_indices]
+            all_finite_tau = np.isfinite(all_true_tau) & np.isfinite(all_reco_tau)
+            result["all_true_tau32s"] = all_true_tau[all_finite_tau]
+            result["all_reco_tau32s"] = all_reco_tau[all_finite_tau]
+        return result
+
+    def _evaluate_particle_event_batch(
         self,
         x_physical: np.ndarray,
         x_reco_physical: np.ndarray,
         mask: np.ndarray,
         jet_radii: np.ndarray,
-    ):
+    ) -> list[dict]:
+        return [
+            self._evaluate_particle_event_jets(
+                x_physical[i],
+                x_reco_physical[i],
+                mask[i],
+                float(jet_radii[i]),
+            )
+            for i in range(x_physical.shape[0])
+        ]
+
+    @staticmethod
+    def _combine_particle_event_jet_results(event_results: list[dict]):
         true_jet_pts = []
         reco_jet_pts = []
         true_jet_masses = []
@@ -638,61 +860,27 @@ class OrbitPlottingCallback(L.Callback):
         reco_jet_counts = []
         match_stats = {"true": 0, "reco": 0, "matched": 0, "delta_r": []}
 
-        for i in range(x_physical.shape[0]):
-            event_mask = mask[i]
-            jet_radius = float(jet_radii[i])
-            true_jets = self._reconstruct_event_jets(
-                x_physical[i, event_mask, 2],
-                x_physical[i, event_mask, 0],
-                x_physical[i, event_mask, 1],
-                jet_radius,
-            )
-            reco_jets = self._reconstruct_event_jets(
-                x_reco_physical[i, event_mask, 2],
-                x_reco_physical[i, event_mask, 0],
-                x_reco_physical[i, event_mask, 1],
-                jet_radius,
-            )
-            true_jet_counts.append(true_jets["jet_count"])
-            reco_jet_counts.append(reco_jets["jet_count"])
-            all_true_indices, all_reco_indices, _ = match_jets_by_delta_r(
-                true_jets["eta"],
-                true_jets["phi"],
-                reco_jets["eta"],
-                reco_jets["phi"],
-                max_delta_r=None,
-            )
-            true_indices, reco_indices, delta_r = match_jets_by_delta_r(
-                true_jets["eta"],
-                true_jets["phi"],
-                reco_jets["eta"],
-                reco_jets["phi"],
-                max_delta_r=jet_radius * self.jet_matching_radius_fraction,
-            )
-            match_stats["true"] += true_jets["jet_count"]
-            match_stats["reco"] += reco_jets["jet_count"]
-            match_stats["matched"] += len(true_indices)
-            match_stats["delta_r"].extend(delta_r)
-            if len(all_true_indices):
-                all_true_jet_pts.extend(true_jets["pt"][all_true_indices])
-                all_reco_jet_pts.extend(reco_jets["pt"][all_reco_indices])
-                all_true_jet_masses.extend(true_jets["mass"][all_true_indices])
-                all_reco_jet_masses.extend(reco_jets["mass"][all_reco_indices])
-                all_true_tau = true_jets["tau32"][all_true_indices]
-                all_reco_tau = reco_jets["tau32"][all_reco_indices]
-                all_finite_tau = np.isfinite(all_true_tau) & np.isfinite(all_reco_tau)
-                all_true_tau32s.extend(all_true_tau[all_finite_tau])
-                all_reco_tau32s.extend(all_reco_tau[all_finite_tau])
-            if len(true_indices):
-                true_jet_pts.extend(true_jets["pt"][true_indices])
-                reco_jet_pts.extend(reco_jets["pt"][reco_indices])
-                true_jet_masses.extend(true_jets["mass"][true_indices])
-                reco_jet_masses.extend(reco_jets["mass"][reco_indices])
-                true_tau = true_jets["tau32"][true_indices]
-                reco_tau = reco_jets["tau32"][reco_indices]
-                finite_tau = np.isfinite(true_tau) & np.isfinite(reco_tau)
-                true_tau32s.extend(true_tau[finite_tau])
-                reco_tau32s.extend(reco_tau[finite_tau])
+        for result in event_results:
+            for key, target in (
+                ("true_jet_pts", true_jet_pts),
+                ("reco_jet_pts", reco_jet_pts),
+                ("true_jet_masses", true_jet_masses),
+                ("reco_jet_masses", reco_jet_masses),
+                ("true_tau32s", true_tau32s),
+                ("reco_tau32s", reco_tau32s),
+                ("all_true_jet_pts", all_true_jet_pts),
+                ("all_reco_jet_pts", all_reco_jet_pts),
+                ("all_true_jet_masses", all_true_jet_masses),
+                ("all_reco_jet_masses", all_reco_jet_masses),
+                ("all_true_tau32s", all_true_tau32s),
+                ("all_reco_tau32s", all_reco_tau32s),
+            ):
+                target.extend(result[key])
+            true_jet_counts.append(result["true_jet_count"])
+            reco_jet_counts.append(result["reco_jet_count"])
+            for key in ("true", "reco", "matched"):
+                match_stats[key] += int(result["match_stats"][key])
+            match_stats["delta_r"].extend(result["match_stats"]["delta_r"])
 
         return (
             true_jet_pts,
@@ -710,6 +898,22 @@ class OrbitPlottingCallback(L.Callback):
             true_jet_counts,
             reco_jet_counts,
             match_stats,
+        )
+
+    def _collect_particle_jet_metrics(
+        self,
+        x_physical: np.ndarray,
+        x_reco_physical: np.ndarray,
+        mask: np.ndarray,
+        jet_radii: np.ndarray,
+    ):
+        return self._combine_particle_event_jet_results(
+            self._evaluate_particle_event_batch(
+                x_physical,
+                x_reco_physical,
+                mask,
+                jet_radii,
+            )
         )
 
     def _plot_jet_count_difference(
@@ -819,9 +1023,49 @@ class OrbitPlottingCallback(L.Callback):
                 ]
 
         for suite_name, suite_selector in suite_selections:
-            groups = [("all", "all", suite_selector)]
+            if stage == "test":
+                self._plot_pid_residuals_for_suite(
+                    trainer,
+                    pl_module,
+                    suite_name,
+                    suite_selector,
+                    x_original,
+                    x_reco,
+                    mask,
+                )
+            subset_groups = []
             for label, class_name in sorted(label_to_class.items()):
-                groups.append((class_name, class_name, suite_selector & (labels == label)))
+                subset_groups.append(
+                    (class_name, class_name, suite_selector & (labels == label))
+                )
+            all_group = ("all", "all", suite_selector)
+            groups = (
+                [*subset_groups, all_group]
+                if self.cache_subset_jet_results
+                else [all_group, *subset_groups]
+            )
+
+            particle_jet_cache = None
+            if (
+                self.cache_subset_jet_results
+                and self.enable_physics_plots
+                and self._data_level(trainer) == "particle"
+            ):
+                suite_indices = np.flatnonzero(suite_selector)
+                suite_x_physical = self._to_physical_features(x_original[suite_selector])
+                suite_x_reco_physical = self._to_physical_features(x_reco[suite_selector])
+                suite_jet_radii, _ = self._jet_radii_for_group(
+                    trainer,
+                    "all",
+                    labels[suite_selector],
+                )
+                suite_results = self._evaluate_particle_event_batch(
+                    suite_x_physical,
+                    suite_x_reco_physical,
+                    mask[suite_selector],
+                    suite_jet_radii,
+                )
+                particle_jet_cache = dict(zip(suite_indices, suite_results))
 
             if self.include_event_reconstruction_grid and class_to_label:
                 event_groups = []
@@ -858,6 +1102,14 @@ class OrbitPlottingCallback(L.Callback):
 
             for group_name, display_name, event_selector in groups:
                 if np.any(event_selector):
+                    cached_particle_jet_results = (
+                        [
+                            particle_jet_cache[int(index)]
+                            for index in np.flatnonzero(event_selector)
+                        ]
+                        if particle_jet_cache is not None
+                        else None
+                    )
                     self._plot_arrays(
                         trainer=trainer,
                         pl_module=pl_module,
@@ -871,6 +1123,7 @@ class OrbitPlottingCallback(L.Callback):
                         labels=labels[event_selector],
                         code_idx=code_idx[event_selector],
                         code_mask=code_mask[event_selector],
+                        particle_jet_results=cached_particle_jet_results,
                         preserve_legacy_names=(suite_name is None and group_name == "all"),
                     )
 
@@ -888,6 +1141,7 @@ class OrbitPlottingCallback(L.Callback):
         labels: np.ndarray,
         code_idx: np.ndarray,
         code_mask: np.ndarray,
+        particle_jet_results: list[dict] | None,
         preserve_legacy_names: bool,
     ) -> None:
         if not np.any(mask):
@@ -1024,11 +1278,15 @@ class OrbitPlottingCallback(L.Callback):
                         true_jet_counts,
                         reco_jet_counts,
                         match_stats,
-                    ) = self._collect_particle_jet_metrics(
-                        x_physical,
-                        x_reco_physical,
-                        mask,
-                        jet_radii=jet_radii,
+                    ) = (
+                        self._combine_particle_event_jet_results(particle_jet_results)
+                        if particle_jet_results is not None
+                        else self._collect_particle_jet_metrics(
+                            x_physical,
+                            x_reco_physical,
+                            mask,
+                            jet_radii=jet_radii,
+                        )
                     )
                     missing_ets = self._collect_missing_transverse_energy(
                         x_physical, x_reco_physical, mask,
@@ -1064,6 +1322,8 @@ class OrbitPlottingCallback(L.Callback):
                     metrics["metrics/jet_count_diff_abs_mean"] = float(
                         np.mean(np.abs(jet_count_diff))
                     )
+                    metrics["metrics/jet_min_pt"] = self.jet_min_pt
+                    metrics["metrics/tau32_enabled"] = int(self.include_tau32)
                     self._add_jet_match_metrics(metrics, match_stats)
                     figures[f"{namespace}/{group_name}/orbit_jet_count_difference"] = (
                         self._plot_jet_count_difference(
@@ -1071,7 +1331,8 @@ class OrbitPlottingCallback(L.Callback):
                             reco_jet_counts,
                             title=(
                                 f"{stage.capitalize()} {display_name} "
-                                f"reclustered jet counts (R={jet_radius_label})"
+                                f"reclustered jet counts (R={jet_radius_label}, "
+                                rf"$p_T \geq {self.jet_min_pt:g}$ GeV)"
                             ),
                         )
                     )
