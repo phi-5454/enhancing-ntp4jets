@@ -32,6 +32,8 @@ except ImportError:
     OmegaConf = None
 
 from gabbro.plotting.orbit import (
+    PRESENTATION_CODEBOOK_MARKER_AREA_SCALE,
+    multirun_color,
     plot_multirun_feature_histograms,
     plot_multirun_metric,
     plot_multirun_residual_histograms,
@@ -253,8 +255,10 @@ def _artifact_prefix(stage: str, group: str, suite: str | None = None) -> str:
     return f"{stage}_orbit" if group == "all" else f"{stage}_{group}_orbit"
 
 
-def _artifact_dirs(run_dir: Path) -> list[Path]:
+def _artifact_dirs(run_dir: Path, artifact_dir: Path | None = None) -> list[Path]:
     """Return candidate directories containing saved ORBIT artifacts for a run."""
+    if artifact_dir is not None:
+        return [artifact_dir]
     candidates = [run_dir]
     best_ckpt = run_dir / "evaluation" / "best.ckpt"
     if best_ckpt.is_dir():
@@ -269,9 +273,14 @@ def _artifact_dirs(run_dir: Path) -> list[Path]:
     return candidates
 
 
-def _latest_artifact_file(run_dir: Path, subdir: str, pattern: str) -> Path | None:
-    for artifact_dir in _artifact_dirs(run_dir):
-        path = _latest_file(artifact_dir / subdir, pattern)
+def _latest_artifact_file(
+    run_dir: Path,
+    subdir: str,
+    pattern: str,
+    artifact_dir: Path | None = None,
+) -> Path | None:
+    for candidate in _artifact_dirs(run_dir, artifact_dir):
+        path = _latest_file(candidate / subdir, pattern)
         if path is not None:
             return path
     return None
@@ -284,6 +293,7 @@ def _collect_record(
     suite: str | None = None,
     label_override: str | None = None,
     family_override: str | None = None,
+    artifact_dir_override: Path | None = None,
 ) -> tuple[dict[str, Any], dict[str, np.ndarray] | None]:
     cfg = _load_config(run_dir / ".hydra" / "config.yaml")
     artifact_prefix = _artifact_prefix(stage, group, suite)
@@ -291,11 +301,13 @@ def _collect_record(
         run_dir,
         "saved_histograms",
         f"{artifact_prefix}_hists_step_*.npz",
+        artifact_dir_override,
     )
     metrics_path = _latest_artifact_file(
         run_dir,
         "saved_metrics",
         f"{artifact_prefix}_metrics_step_*.json",
+        artifact_dir_override,
     )
     metrics = _load_latest_csv_metrics(run_dir)
     metrics.update(_load_json(metrics_path))
@@ -312,6 +324,7 @@ def _collect_record(
         "histogram_path": histogram_path,
         "metrics_path": metrics_path,
         "artifact_dir": histogram_path.parents[1] if histogram_path else None,
+        "artifact_dir_override": artifact_dir_override,
         "stage": stage,
         "group": group,
         "suite": suite,
@@ -373,6 +386,30 @@ def _parse_family_runs(family_specs: list[list[str]]) -> list[tuple[Path, str | 
         for run_dir in spec[1:]:
             runs.append((Path(run_dir), None, family))
     _validate_run_dirs([run_dir for run_dir, _, _ in runs])
+    return runs
+
+
+def _parse_artifact_family_runs(
+    family_specs: list[list[str]],
+) -> list[tuple[Path, str | None, str, Path]]:
+    """Parse families whose runs use explicitly selected evaluation directories."""
+    runs = []
+    for spec in family_specs:
+        if len(spec) < 3 or len(spec[1:]) % 2:
+            raise SystemExit(
+                "Each --artifact-family entry must be '--artifact-family FAMILY "
+                "RUN_DIR ARTIFACT_DIR [RUN_DIR ARTIFACT_DIR ...]'."
+            )
+        family = spec[0]
+        for index in range(1, len(spec), 2):
+            runs.append((Path(spec[index]), None, family, Path(spec[index + 1])))
+    _validate_run_dirs([run_dir for run_dir, _, _, _ in runs])
+    missing_artifact_dirs = [
+        artifact_dir for _, _, _, artifact_dir in runs if not artifact_dir.is_dir()
+    ]
+    if missing_artifact_dirs:
+        formatted = "\n".join(f"  {path}" for path in missing_artifact_dirs)
+        raise SystemExit(f"Explicit artifact directories do not exist:\n{formatted}")
     return runs
 
 
@@ -445,13 +482,55 @@ def _add_multirun_metric_aliases(records: list[dict[str, Any]]) -> None:
                 record[alias] = value
 
 
+def _records_with_compression_ratio(
+    records: list[dict[str, Any]], reference_bits: float
+) -> list[dict[str, Any]]:
+    """Return plotting records with marginal particle rate normalized to a payload size."""
+    normalized_records = []
+    for record in records:
+        normalized = dict(record)
+        rate = record.get("metrics/rate/marginal_bits_per_input_particle")
+        if rate is not None:
+            normalized["plot_metrics/compression_ratio"] = float(rate) / reference_bits
+        normalized_records.append(normalized)
+    return normalized_records
+
+
+def _compression_ratio_figure(
+    records: list[dict[str, Any]],
+    *,
+    reference_bits: float = 40.0,
+    continuous_autoencoder_mse: float | None = None,
+    show_title: bool = True,
+):
+    """Plot reconstruction error against the fraction of a fixed-width payload."""
+    return plot_multirun_metric(
+        _records_with_compression_ratio(records, reference_bits),
+        "plot_metrics/reco_mse_total",
+        "Reconstruction MSE",
+        "Compression ratio vs. reconstruction MSE",
+        log_x=False,
+        log_y=True,
+        x_metric="plot_metrics/compression_ratio",
+        xlabel=f"Compressed rate / {reference_bits:g}-bit input payload",
+        horizontal_reference=continuous_autoencoder_mse,
+        horizontal_reference_label="Continuous autoencoder reference",
+        show_title=show_title,
+        scale_marker_by_codebook_size=True,
+        marker_area_scale=PRESENTATION_CODEBOOK_MARKER_AREA_SCALE,
+    )
+
+
 def _save_figures(
     records: list[dict[str, Any]],
     histogram_runs: list[dict],
     output_dir: Path,
     *,
     original_bits_per_input_particle: float = 43.0,
+    compression_reference_bits: float = 40.0,
     continuous_autoencoder_mse: float | None = None,
+    show_titles: bool = True,
+    histogram_features: list[str] | None = None,
 ) -> None:
     figures = {
         "codebook_size_vs_reco_mse": plot_multirun_metric(
@@ -460,6 +539,7 @@ def _save_figures(
             "Reconstruction MSE",
             "Codebook size vs. reconstruction MSE",
             log_y=True,
+            show_title=show_titles,
         ),
         "codebook_size_vs_mse_total": plot_multirun_metric(
             records,
@@ -467,12 +547,14 @@ def _save_figures(
             "Total reconstruction MSE",
             "Codebook size vs. reconstruction MSE",
             log_y=True,
+            show_title=show_titles,
         ),
         "codebook_size_vs_utilization_total": plot_multirun_metric(
             records,
             "metrics/utilization_total",
             "Codebook utilization",
             "Codebook size vs. utilization",
+            show_title=show_titles,
         ),
         "codebook_size_vs_marginal_entropy_bits_per_token": plot_multirun_metric(
             records,
@@ -481,12 +563,14 @@ def _save_figures(
             "Codebook size vs. marginal token entropy",
             reference_fn=np.log2,
             reference_label=r"$\log_2 |\mathcal{C}|$ upper bound",
+            show_title=show_titles,
         ),
         "codebook_size_vs_normalized_entropy": plot_multirun_metric(
             records,
             "metrics/entropy/normalized_to_log2_codebook",
             r"Marginal entropy / $\log_2 |\mathcal{C}|$",
             "Codebook size vs. normalized marginal entropy",
+            show_title=show_titles,
         ),
         "codebook_size_vs_marginal_bits_per_event": plot_multirun_metric(
             records,
@@ -494,6 +578,7 @@ def _save_figures(
             "Marginal rate [bits/event]",
             "Codebook size vs. marginal event rate",
             log_y=True,
+            show_title=show_titles,
         ),
         "codebook_size_vs_marginal_bits_per_input_particle": plot_multirun_metric(
             records,
@@ -501,6 +586,7 @@ def _save_figures(
             "Marginal rate [bits/input particle]",
             "Codebook size vs. marginal rate per input particle",
             log_y=True,
+            show_title=show_titles,
         ),
         "marginal_bits_per_input_particle_vs_reco_mse": plot_multirun_metric(
             records,
@@ -516,6 +602,13 @@ def _save_figures(
             ),
             horizontal_reference=continuous_autoencoder_mse,
             horizontal_reference_label="Continuous autoencoder reference",
+            show_title=show_titles,
+        ),
+        "compression_ratio_40bit_vs_reco_mse": _compression_ratio_figure(
+            records,
+            reference_bits=compression_reference_bits,
+            continuous_autoencoder_mse=continuous_autoencoder_mse,
+            show_title=show_titles,
         ),
         "marginal_bits_per_event_vs_reco_mse": plot_multirun_metric(
             records,
@@ -525,6 +618,7 @@ def _save_figures(
             log_y=True,
             x_metric="metrics/rate/marginal_bits_per_event",
             xlabel="Marginal rate [bits/event]",
+            show_title=show_titles,
         ),
         "codebook_size_vs_val_loss": plot_multirun_metric(
             records,
@@ -532,6 +626,7 @@ def _save_figures(
             "Validation loss",
             "Codebook size vs. validation loss",
             log_y=True,
+            show_title=show_titles,
         ),
         "codebook_size_vs_transformed_mse_eta_scaled": plot_multirun_metric(
             records,
@@ -539,6 +634,7 @@ def _save_figures(
             r"MSE $\eta/3$",
             r"Codebook size vs. transformed $\eta/3$ MSE",
             log_y=True,
+            show_title=show_titles,
         ),
         "codebook_size_vs_transformed_mse_cos_phi": plot_multirun_metric(
             records,
@@ -546,6 +642,7 @@ def _save_figures(
             r"MSE $\cos\phi$",
             r"Codebook size vs. transformed $\cos\phi$ MSE",
             log_y=True,
+            show_title=show_titles,
         ),
         "codebook_size_vs_transformed_mse_sin_phi": plot_multirun_metric(
             records,
@@ -553,6 +650,7 @@ def _save_figures(
             r"MSE $\sin\phi$",
             r"Codebook size vs. transformed $\sin\phi$ MSE",
             log_y=True,
+            show_title=show_titles,
         ),
         "codebook_size_vs_transformed_mse_log_pt_shifted": plot_multirun_metric(
             records,
@@ -560,6 +658,7 @@ def _save_figures(
             r"MSE $\log(p_T)-1.8$",
             r"Codebook size vs. transformed $\log(p_T)-1.8$ MSE",
             log_y=True,
+            show_title=show_titles,
         ),
         "codebook_size_vs_physical_mse_eta": plot_multirun_metric(
             records,
@@ -567,6 +666,7 @@ def _save_figures(
             r"Physical MSE $\eta$",
             r"Codebook size vs. physical $\eta$ MSE",
             log_y=True,
+            show_title=show_titles,
         ),
         "codebook_size_vs_physical_mse_phi": plot_multirun_metric(
             records,
@@ -574,6 +674,7 @@ def _save_figures(
             r"Physical MSE $\phi$",
             r"Codebook size vs. physical $\phi$ MSE",
             log_y=True,
+            show_title=show_titles,
         ),
         "codebook_size_vs_physical_mse_pT": plot_multirun_metric(
             records,
@@ -581,6 +682,7 @@ def _save_figures(
             r"Physical MSE $p_T$",
             r"Codebook size vs. physical $p_T$ MSE",
             log_y=True,
+            show_title=show_titles,
         ),
         "codebook_size_vs_physical_mse_total": plot_multirun_metric(
             records,
@@ -588,27 +690,38 @@ def _save_figures(
             "Mean physical MSE",
             "Codebook size vs. mean physical MSE",
             log_y=True,
+            show_title=show_titles,
         ),
     }
     if histogram_runs:
         common_features = set(_histogram_features(histogram_runs[0]["histograms"]))
         for run in histogram_runs[1:]:
             common_features &= set(_histogram_features(run["histograms"]))
-        feature_names = sorted(common_features)
+        feature_names = (
+            [name for name in histogram_features if name in common_features]
+            if histogram_features
+            else sorted(common_features)
+        )
         if feature_names:
             figures["combined_reconstruction_features"] = plot_multirun_feature_histograms(
                 histogram_runs,
                 feature_names,
                 figsize_per_axis=(7.0, 5.2),
+                show_titles=show_titles,
             )
         common_residual_features = set(_histogram_residual_features(histogram_runs[0]["histograms"]))
         for run in histogram_runs[1:]:
             common_residual_features &= set(_histogram_residual_features(run["histograms"]))
-        residual_feature_names = sorted(common_residual_features)
+        residual_feature_names = (
+            [name for name in histogram_features if name in common_residual_features]
+            if histogram_features
+            else sorted(common_residual_features)
+        )
         if residual_feature_names:
             figures["combined_reconstruction_residuals"] = plot_multirun_residual_histograms(
                 histogram_runs,
                 residual_feature_names,
+                show_titles=show_titles,
             )
     output_dir.mkdir(parents=True, exist_ok=True)
     for name, figure in figures.items():
@@ -729,6 +842,17 @@ def main() -> None:
             "--family FAMILY RUN_DIR [RUN_DIR ...]."
         ),
     )
+    source.add_argument(
+        "--artifact-family",
+        nargs="+",
+        action="append",
+        metavar="ARTIFACT_FAMILY_SPEC",
+        help=(
+            "Repeatable family with an explicit artifact directory per run: "
+            "--artifact-family FAMILY RUN_DIR ARTIFACT_DIR "
+            "[RUN_DIR ARTIFACT_DIR ...]."
+        ),
+    )
     parser.add_argument("--stage", choices=("val", "test"), default="val")
     parser.add_argument(
         "--suite",
@@ -737,6 +861,24 @@ def main() -> None:
     parser.add_argument("--group", default="all")
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--no-wandb", action="store_true", help="Keep comparison outputs local.")
+    parser.add_argument(
+        "--no-histograms",
+        action="store_true",
+        help="Generate scalar comparison curves without loading combined histogram payloads.",
+    )
+    parser.add_argument(
+        "--no-titles",
+        action="store_true",
+        help="Suppress axes and panel titles for presentation-ready figures.",
+    )
+    parser.add_argument(
+        "--histogram-feature",
+        action="append",
+        help=(
+            "Restrict combined histogram and residual figures to this saved feature. "
+            "Repeat to select and order multiple features."
+        ),
+    )
     parser.add_argument("--wandb-project", help="Override the dedicated W&B comparison project.")
     parser.add_argument("--wandb-name", help="Override the W&B comparison run name.")
     parser.add_argument("--wandb-group", help="Override the W&B comparison run group.")
@@ -748,6 +890,15 @@ def main() -> None:
         help="Vertical source-size reference in the particle rate-distortion plot (default: 43).",
     )
     parser.add_argument(
+        "--compression-reference-bits",
+        type=float,
+        default=40.0,
+        help=(
+            "Denominator used for the normalized compression-ratio plot "
+            "(default: 40 bits)."
+        ),
+    )
+    parser.add_argument(
         "--continuous-autoencoder-mse",
         type=float,
         help="Optional horizontal MSE reference from a continuous autoencoder.",
@@ -756,6 +907,8 @@ def main() -> None:
 
     if args.original_bits_per_input_particle <= 0:
         parser.error("--original-bits-per-input-particle must be positive")
+    if args.compression_reference_bits <= 0:
+        parser.error("--compression-reference-bits must be positive")
     if args.continuous_autoencoder_mse is not None and args.continuous_autoencoder_mse <= 0:
         parser.error("--continuous-autoencoder-mse must be positive")
     if args.suite is not None and args.stage != "test":
@@ -763,23 +916,30 @@ def main() -> None:
 
     if args.multirun_dir is not None:
         run_specs = [
-            (run_dir, None, None) for run_dir in _run_dirs_from_multirun(args.multirun_dir)
+            (run_dir, None, None, None)
+            for run_dir in _run_dirs_from_multirun(args.multirun_dir)
         ]
         default_output_dir = args.multirun_dir / "comparisons" / args.stage / args.group
+    elif args.artifact_family is not None:
+        run_specs = _parse_artifact_family_runs(args.artifact_family)
+        default_output_dir = Path.cwd() / "orbit_run_comparison" / args.stage / args.group
     elif args.family is not None:
-        run_specs = _parse_family_runs(args.family)
+        run_specs = [(*spec, None) for spec in _parse_family_runs(args.family)]
         default_output_dir = Path.cwd() / "orbit_run_comparison" / args.stage / args.group
     elif args.run is not None:
-        run_specs = [(run_dir, label, None) for run_dir, label in _parse_named_runs(args.run)]
+        run_specs = [
+            (run_dir, label, None, None)
+            for run_dir, label in _parse_named_runs(args.run)
+        ]
         default_output_dir = Path.cwd() / "orbit_run_comparison" / args.stage / args.group
     else:
         run_dirs = _validate_run_dirs([run_dir for group in args.run_dir for run_dir in group])
-        run_specs = [(run_dir, None, None) for run_dir in run_dirs]
+        run_specs = [(run_dir, None, None, None) for run_dir in run_dirs]
         default_output_dir = Path.cwd() / "orbit_run_comparison" / args.stage / args.group
 
     records = []
     loaded_histograms = []
-    for run_dir, label_override, family_override in run_specs:
+    for run_dir, label_override, family_override, artifact_dir_override in run_specs:
         record, histograms = _collect_record(
             run_dir,
             args.stage,
@@ -787,16 +947,21 @@ def main() -> None:
             args.suite,
             label_override,
             family_override,
+            artifact_dir_override,
         )
         records.append(record)
-        loaded_histograms.append(histograms)
+        loaded_histograms.append(None if args.no_histograms else histograms)
 
     label_counts = Counter(record["label"] for record in records)
     for record in records:
         if label_counts[record["label"]] > 1:
             record["label"] = f"{record['label']} [{record['job']}]"
     histogram_runs = [
-        {"label": record["label"], "histograms": histograms}
+        {
+            "label": record["label"],
+            "plot_color": multirun_color(record.get("plot_family") or record["label"]),
+            "histograms": histograms,
+        }
         for record, histograms in zip(records, loaded_histograms)
         if histograms is not None
     ]
@@ -809,7 +974,10 @@ def main() -> None:
         histogram_runs,
         output_dir,
         original_bits_per_input_particle=args.original_bits_per_input_particle,
+        compression_reference_bits=args.compression_reference_bits,
         continuous_autoencoder_mse=args.continuous_autoencoder_mse,
+        show_titles=not args.no_titles,
+        histogram_features=args.histogram_feature,
     )
     wandb_settings = _wandb_upload_settings(args, records, output_dir)
     if wandb_settings is not None:

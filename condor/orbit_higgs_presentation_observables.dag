@@ -1,0 +1,3 @@
+JOB OBSERVABLES condor/orbit_higgs_presentation_observables.sub DIR /eos/home-y/yelberke/enhancing-ntp4jets
+JOB COLLECT condor/orbit_presentation_collect.sub DIR /eos/home-y/yelberke/enhancing-ntp4jets
+PARENT OBSERVABLES CHILD COLLECT

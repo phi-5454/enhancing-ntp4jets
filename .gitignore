@@ -184,3 +184,12 @@ cython_debug/
 Tokenizer/
 
 /wandb/
+
+# HTCondor DAGMan runtime files (keep authored *.dag files tracked)
+*.dag.condor.sub
+*.dag.dagman.out
+*.dag.lib.err
+*.dag.lib.out
+*.dag.metrics
+*.dag.nodes.log
+*.dag.rescue*

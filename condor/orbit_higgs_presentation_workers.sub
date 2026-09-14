@@ -1,0 +1,71 @@
+executable = scripts/condor_run_higgs_presentation_worker.sh
+
+PROJECT_DIR = /eos/home-y/yelberke/enhancing-ntp4jets
+OUTPUT_ROOT = /eos/user/y/yelberke/enhancing_ntp4jets_runs/presentation_plots/canonical_tt_golden
+CACHE_DIR = $(OUTPUT_ROOT)/higgs_cache
+CONDA_ENV = /eos/home-y/yelberke/conda_condor_orbit_env
+MANIFEST_DIR = /eos/home-y/yelberke/enhancing-ntp4jets/manifests/production_final
+FULL_MANIFEST = /eos/user/y/yelberke/enhancing_ntp4jets_runs/comparisons/canonical_tt_full_training_like_all/manifest.json
+QUEUE_SLICE =
+
+arguments = $(PROJECT_DIR) $(CACHE_DIR) $(FULL_MANIFEST) $(INDEX) $(MANIFEST_DIR)/ggHbb_test.txt
+environment = "CONDA_ENV=$(CONDA_ENV)"
+
+log = /eos/user/y/yelberke/enhancing_ntp4jets_runs/condor_logs/orbit_higgs_presentation_workers_$(Cluster).log
+output = /eos/user/y/yelberke/enhancing_ntp4jets_runs/condor_logs/orbit_higgs_presentation_workers_$(Cluster)_$(INDEX).out
+error = /eos/user/y/yelberke/enhancing_ntp4jets_runs/condor_logs/orbit_higgs_presentation_workers_$(Cluster)_$(INDEX).err
+
+should_transfer_files = YES
+when_to_transfer_output = ON_EXIT
+request_cpus = 4
+request_memory = 12GB
+request_gpus = 1
++JobFlavour = "espresso"
+queue INDEX from $(QUEUE_SLICE) (
+  0
+  1
+  2
+  3
+  4
+  5
+  6
+  7
+  8
+  9
+  10
+  11
+  12
+  13
+  14
+  15
+  16
+  17
+  18
+  19
+  20
+  21
+  22
+  23
+  24
+  25
+  26
+  27
+  28
+  29
+  30
+  31
+  32
+  33
+  34
+  35
+  36
+  37
+  38
+  39
+  40
+  41
+  42
+  43
+  44
+  45
+)

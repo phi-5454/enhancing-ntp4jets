@@ -1,0 +1,3 @@
+JOB HIGGS condor/orbit_higgs_presentation_workers.sub DIR /eos/home-y/yelberke/enhancing-ntp4jets
+JOB COLLECT condor/orbit_presentation_collect.sub DIR /eos/home-y/yelberke/enhancing-ntp4jets
+PARENT HIGGS CHILD COLLECT
