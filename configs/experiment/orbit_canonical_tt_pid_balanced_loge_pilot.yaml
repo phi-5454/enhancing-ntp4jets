@@ -1,0 +1,55 @@
+# @package _global_
+
+defaults:
+  - orbit_canonical_tt
+  - override /feature_dict: feature_dict_orbit_absolute_with_energy.yaml
+  - _self_
+
+project_name: orbit-canonical-tt-pid-balanced-loge-pilot
+task_name: orbit_canonical_tt_vq_ste_4096_pid_balanced_loge_pilot
+tags: [orbit, canonical, tt, particle, vq_ste, pid_balanced, log_energy, pilot]
+
+load_weights_from: /eos/user/y/yelberke/enhancing_ntp4jets_runs/orbit_vq_ste_scan_canonical_orbit_canonical_tt_967979/orbit-canonical-tt/runs/2026-07-28_05-18-48_b9g57n1695_AbolishableAnnexation/checkpoints/best.ckpt
+load_weights_strict: false
+load_weights_feature_expansion:
+  enabled: true
+  output_initializers:
+    L1T_PUPPIPart_E:
+      copy_from: L1T_PUPPIPart_PT
+      bias_offset: -0.7
+
+pid:
+  reconstruction_class_weights:
+    [0.934881, 0.834510, 0.370941, 0.369077, 13.399507, 13.656551, 11.170280, 11.192126]
+
+data:
+  include_energy: true
+  energy_shift: 2.5
+  train_event_budget: 20000
+  val_event_budget: 5000
+  test_suites:
+    training_like:
+      event_budget: 2000
+    tt_vs_gghbb:
+      event_budget: 2000
+
+model:
+  model_kwargs:
+    input_dim: 5
+    vq_kwargs:
+      num_codes: 4096
+      rotation_tr: false
+  optimizer:
+    lr: 0.0002
+  scheduler: null
+
+trainer:
+  max_epochs: 5
+
+callbacks:
+  orbit_plotting_callback:
+    enable_physics_plots: false
+    include_codebook_histogram: false
+    include_event_reconstruction_grid: false
+    include_train_particle_count_histogram: false
+    validation_plot_every_n_epochs: 5

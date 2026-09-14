@@ -7,6 +7,8 @@ val_event_budget: 200000
 
 sequence_type: particle
 pid_cfg: ${pid}
+include_energy: false
+energy_shift: 2.5
 max_sequence_length: null
 batch_size: 256
 num_workers: 4

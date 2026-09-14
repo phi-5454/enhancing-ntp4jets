@@ -186,31 +186,52 @@ def _log_worker_exception(message: str) -> None:
 class OrbitPreprocessor:
     """Apply absolute-coordinate preprocessing without centering on a jet axis."""
 
-    def __init__(self, feature_prefix: str, epsilon: float = 1e-8):
+    def __init__(
+        self,
+        feature_prefix: str,
+        epsilon: float = 1e-8,
+        include_energy: bool = False,
+        energy_shift: float = 2.5,
+    ):
         self.eta_column = f"{feature_prefix}_Eta"
         self.phi_column = f"{feature_prefix}_Phi"
         self.pt_column = f"{feature_prefix}_PT"
+        self.energy_column = f"{feature_prefix}_E"
         self.output_features = [
             self.eta_column,
             f"{self.phi_column}_cos",
             f"{self.phi_column}_sin",
             self.pt_column,
         ]
+        self.include_energy = bool(include_energy)
+        self.energy_shift = float(energy_shift)
+        if self.include_energy:
+            self.output_features.append(self.energy_column)
         self.epsilon = epsilon
 
     @property
     def input_features(self) -> list[str]:
-        return [self.eta_column, self.phi_column, self.pt_column]
+        features = [self.eta_column, self.phi_column, self.pt_column]
+        if self.include_energy:
+            features.append(self.energy_column)
+        return features
 
     def forward(self, array: ak.Array) -> ak.Array:
         array = ak.with_field(array, array[self.eta_column] / 3, self.eta_column)
         array = ak.with_field(array, np.cos(array[self.phi_column]), f"{self.phi_column}_cos")
         array = ak.with_field(array, np.sin(array[self.phi_column]), f"{self.phi_column}_sin")
-        return ak.with_field(
+        array = ak.with_field(
             array,
             np.log(array[self.pt_column] + self.epsilon) - 1.8,
             self.pt_column,
         )
+        if self.include_energy:
+            array = ak.with_field(
+                array,
+                np.log(array[self.energy_column] + self.epsilon) - self.energy_shift,
+                self.energy_column,
+            )
+        return array
 
 
 class OrbitParquetDataset(IterableDataset):
@@ -237,6 +258,8 @@ class OrbitParquetDataset(IterableDataset):
         return_raw_features: bool = False,
         return_event_metadata: bool = False,
         pid_cfg: Optional[Mapping] = None,
+        include_energy: bool = False,
+        energy_shift: float = 2.5,
     ):
         super().__init__()
         if sequence_type not in SEQUENCE_SCHEMAS:
@@ -257,7 +280,11 @@ class OrbitParquetDataset(IterableDataset):
             raise ValueError("parquet_files must contain at least one parquet file or directory")
 
         schema = SEQUENCE_SCHEMAS[sequence_type]
-        self.preprocessor = OrbitPreprocessor(schema["prefix"])
+        self.preprocessor = OrbitPreprocessor(
+            schema["prefix"],
+            include_energy=include_energy,
+            energy_shift=energy_shift,
+        )
         self.features = list(self.preprocessor.input_features)
         pid_cfg = {} if pid_cfg is None else dict(pid_cfg)
         self.pid_enabled = bool(pid_cfg.get("enabled", False))
@@ -594,6 +621,8 @@ class OrbitParquetDataModule(L.LightningDataModule):
         max_val_events_per_class: Optional[dict] = None,
         max_test_events_per_class: Optional[dict] = None,
         pid_cfg: Optional[dict] = None,
+        include_energy: bool = False,
+        energy_shift: float = 2.5,
         **kwargs,
     ):
         super().__init__()
@@ -718,7 +747,9 @@ class OrbitParquetDataModule(L.LightningDataModule):
             else SEQUENCE_SCHEMAS[sequence_type]["max_sequence_length"]
         )
         self.selected_features = OrbitPreprocessor(
-            SEQUENCE_SCHEMAS[sequence_type]["prefix"]
+            SEQUENCE_SCHEMAS[sequence_type]["prefix"],
+            include_energy=include_energy,
+            energy_shift=energy_shift,
         ).output_features
         self.save_hyperparameters(ignore=["parquet_files_train", "parquet_files_val"])
         self.hparams["selected_features"] = self.selected_features
@@ -981,6 +1012,8 @@ class OrbitParquetDataModule(L.LightningDataModule):
             event_filter_min_pt=event_filter_min_pt,
             max_events=max_events,
             pid_cfg=self.hparams.get("pid_cfg"),
+            include_energy=self.hparams.include_energy,
+            energy_shift=self.hparams.energy_shift,
         )
 
     def _loader(self, dataset, persistent_workers: bool = True):
@@ -1142,6 +1175,8 @@ class CanonicalOrbitParquetDataModule(L.LightningDataModule):
         pid_cfg: Optional[dict] = None,
         return_raw_features: bool = False,
         return_event_metadata: bool = False,
+        include_energy: bool = False,
+        energy_shift: float = 2.5,
         **kwargs,
     ):
         super().__init__()
@@ -1231,7 +1266,9 @@ class CanonicalOrbitParquetDataModule(L.LightningDataModule):
             else int(max_sequence_length)
         )
         self.selected_features = OrbitPreprocessor(
-            SEQUENCE_SCHEMAS[sequence_type]["prefix"]
+            SEQUENCE_SCHEMAS[sequence_type]["prefix"],
+            include_energy=include_energy,
+            energy_shift=energy_shift,
         ).output_features
         self.save_hyperparameters()
         self.hparams["selected_features"] = self.selected_features
@@ -1324,6 +1361,8 @@ class CanonicalOrbitParquetDataModule(L.LightningDataModule):
             return_raw_features=self.hparams.return_raw_features,
             return_event_metadata=self.hparams.return_event_metadata,
             pid_cfg=self.hparams.get("pid_cfg"),
+            include_energy=self.hparams.include_energy,
+            energy_shift=self.hparams.energy_shift,
         )
 
     def _loader(self, dataset, *, persistent_workers: bool = True) -> DataLoader:

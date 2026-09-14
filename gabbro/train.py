@@ -92,6 +92,120 @@ from gabbro.utils.utils import (
 log = get_pylogger(__name__)
 
 
+def _load_feature_expanded_weights(
+    model: L.LightningModule,
+    source_state: dict[str, torch.Tensor],
+    source_cfg: DictConfig,
+    target_cfg: DictConfig,
+    expansion_cfg: DictConfig,
+) -> None:
+    """Warm-start a model whose ordered continuous feature set was expanded."""
+    target_state = model.state_dict()
+    source_features = list(source_cfg.feature_dict.keys())
+    target_features = list(target_cfg.feature_dict.keys())
+    source_pid = source_cfg.get("pid") or {}
+    target_pid = target_cfg.get("pid") or {}
+    source_pid_count = int(source_pid.get("num_classes", 0)) if source_pid.get("enabled") else 0
+    target_pid_count = int(target_pid.get("num_classes", 0)) if target_pid.get("enabled") else 0
+    if source_pid_count != target_pid_count:
+        raise ValueError(
+            "Feature-expanded warm start requires unchanged PID conditioning; got "
+            f"{source_pid_count} and {target_pid_count} classes"
+        )
+    if not set(source_features).issubset(target_features):
+        raise ValueError(
+            "Feature-expanded warm start only supports additive features; source="
+            f"{source_features}, target={target_features}"
+        )
+
+    input_key = "model.input_projection.weight"
+    output_weight_key = "model.output_projection.weight"
+    output_bias_key = "model.output_projection.bias"
+    allowed_shape_changes = {input_key, output_weight_key, output_bias_key}
+    unexpected = sorted(set(source_state) - set(target_state))
+    if unexpected:
+        raise ValueError(f"Warm-start checkpoint contains unexpected tensors: {unexpected}")
+
+    expanded_state = {key: value.clone() for key, value in target_state.items()}
+    mismatched = []
+    for key, source_value in source_state.items():
+        if source_value.shape == target_state[key].shape:
+            expanded_state[key] = source_value
+        elif key not in allowed_shape_changes:
+            mismatched.append(
+                f"{key}: checkpoint {tuple(source_value.shape)} != model "
+                f"{tuple(target_state[key].shape)}"
+            )
+    if mismatched:
+        raise ValueError("Unexpected warm-start shape mismatches:\n  " + "\n  ".join(mismatched))
+
+    if input_key not in source_state or input_key not in target_state:
+        raise ValueError("Feature-expanded warm start requires a linear input projection")
+    source_input = source_state[input_key]
+    target_input = expanded_state[input_key]
+    if source_input.shape[0] != target_input.shape[0]:
+        raise ValueError("Input projection output dimension changed during warm start")
+    target_input.zero_()
+    for source_index, feature_name in enumerate(source_features):
+        target_index = target_features.index(feature_name)
+        target_input[:, target_index] = source_input[:, source_index]
+    if source_pid_count:
+        source_start = len(source_features)
+        target_start = len(target_features)
+        target_input[:, target_start : target_start + target_pid_count] = source_input[
+            :, source_start : source_start + source_pid_count
+        ]
+    source_trailing_start = len(source_features) + source_pid_count
+    target_trailing_start = len(target_features) + target_pid_count
+    source_trailing = source_input.shape[1] - source_trailing_start
+    target_trailing = target_input.shape[1] - target_trailing_start
+    if source_trailing != target_trailing:
+        raise ValueError("Conditional input dimension changed during warm start")
+    if source_trailing:
+        target_input[:, target_trailing_start:] = source_input[:, source_trailing_start:]
+    expanded_state[input_key] = target_input
+
+    for key in (output_weight_key, output_bias_key):
+        if key not in source_state or key not in target_state:
+            raise ValueError("Feature-expanded warm start requires a linear output projection")
+    source_output_weight = source_state[output_weight_key]
+    source_output_bias = source_state[output_bias_key]
+    target_output_weight = expanded_state[output_weight_key]
+    target_output_bias = expanded_state[output_bias_key]
+    if source_output_weight.shape[1] != target_output_weight.shape[1]:
+        raise ValueError("Output projection input dimension changed during warm start")
+    for source_index, feature_name in enumerate(source_features):
+        target_index = target_features.index(feature_name)
+        target_output_weight[target_index] = source_output_weight[source_index]
+        target_output_bias[target_index] = source_output_bias[source_index]
+
+    for feature_name, initializer in dict(
+        expansion_cfg.get("output_initializers") or {}
+    ).items():
+        if feature_name not in target_features or feature_name in source_features:
+            raise ValueError(f"Invalid new-feature output initializer for {feature_name!r}")
+        copy_from = str(initializer["copy_from"])
+        if copy_from not in source_features:
+            raise ValueError(f"Initializer source feature {copy_from!r} is unavailable")
+        source_index = source_features.index(copy_from)
+        target_index = target_features.index(feature_name)
+        target_output_weight[target_index] = source_output_weight[source_index]
+        target_output_bias[target_index] = source_output_bias[source_index] + float(
+            initializer.get("bias_offset", 0.0)
+        )
+    expanded_state[output_weight_key] = target_output_weight
+    expanded_state[output_bias_key] = target_output_bias
+    model.load_state_dict(expanded_state, strict=True)
+    retained = sorted(set(target_state) - set(source_state))
+    log.info(
+        "Loaded feature-expanded warm start: source_features=%s target_features=%s "
+        "retained_new_tensors=%s",
+        source_features,
+        target_features,
+        retained,
+    )
+
+
 def _log_data_split_summary(trainer: L.Trainer, datamodule) -> None:
     if trainer.global_rank != 0 or not trainer.loggers:
         return
@@ -369,12 +483,31 @@ def train(cfg: DictConfig) -> Tuple[dict, dict]:
             print("Model config before loading weights:")
             print(OmegaConf.to_yaml(cfg.model))
             cfg_ckpt = OmegaConf.load(load_cpt_path)
-            cfg.model.model_kwargs_loaded = cfg_ckpt.model.model_kwargs
+            OmegaConf.update(
+                cfg.model,
+                "model_kwargs_loaded",
+                cfg_ckpt.model.model_kwargs,
+                force_add=True,
+            )
 
             # we want to only load the weights, not the optimizer state etc. as would
             # be done with LightningModule.load_from_checkpoint()
-            state_dict = torch.load(cfg.load_weights_from, map_location="cpu")["state_dict"]  # nosec
-            model.load_state_dict(state_dict, strict=cfg.get("load_weights_strict", True))
+            state_dict = torch.load(
+                cfg.load_weights_from,
+                map_location="cpu",
+                weights_only=False,
+            )["state_dict"]  # nosec
+            expansion_cfg = cfg.get("load_weights_feature_expansion") or {}
+            if expansion_cfg.get("enabled", False):
+                _load_feature_expanded_weights(
+                    model,
+                    state_dict,
+                    cfg_ckpt,
+                    cfg,
+                    expansion_cfg,
+                )
+            else:
+                model.load_state_dict(state_dict, strict=cfg.get("load_weights_strict", True))
 
             log.info("Model config after loading weights:")
             log.info(OmegaConf.to_yaml(cfg.model))
@@ -590,8 +723,18 @@ def train(cfg: DictConfig) -> Tuple[dict, dict]:
 
         # update the default root dir for testing
         ckpt_filename = Path(ckpt_path).name if ckpt_path else "current"
+        evaluation_output_name = cfg.get("evaluation_output_name") or ckpt_filename
+        evaluation_output_name = str(evaluation_output_name)
+        if (
+            Path(evaluation_output_name).name != evaluation_output_name
+            or evaluation_output_name in {".", ".."}
+        ):
+            raise ValueError(
+                "evaluation_output_name must be a single directory name, got "
+                f"{evaluation_output_name!r}"
+            )
         cfg.trainer.default_root_dir = (
-            Path(cfg.trainer.default_root_dir) / "evaluation" / ckpt_filename
+            Path(cfg.trainer.default_root_dir) / "evaluation" / evaluation_output_name
         )
         cfg.trainer.default_root_dir.mkdir(parents=True, exist_ok=True)
 
@@ -697,7 +840,71 @@ def main(cfg: DictConfig) -> Optional[float]:
         # redundant output dir / ".hydra" / "overrides.yaml" (cause those are the
         # ones passed in the command line)
         ConfigStore.instance().store("cfg_ckpt", node=cfg_ckpt)
-        cfg = compose(config_name="cfg_ckpt", overrides=HydraConfig.get().overrides.task)
+        checkpoint_overrides = [
+            override
+            for override in HydraConfig.get().overrides.task
+            # The initial Hydra composition may need an experiment selector,
+            # but the loaded checkpoint is already a complete config and has
+            # no experiment defaults entry to override.
+            if not override.startswith("experiment=")
+        ]
+        cfg = compose(config_name="cfg_ckpt", overrides=checkpoint_overrides)
+
+        # A checkpoint normally inherits its training datamodule verbatim.  For
+        # cross-domain tests, merge only the data section from another config
+        # while retaining the checkpoint's model, feature, and loss settings.
+        evaluation_data_config = cfg.get("evaluation_data_config")
+        if evaluation_data_config:
+            evaluation_data_path = Path(str(evaluation_data_config)).expanduser()
+            if not evaluation_data_path.is_absolute():
+                evaluation_data_path = Path.cwd() / evaluation_data_path
+            if not evaluation_data_path.is_file():
+                raise FileNotFoundError(
+                    f"Evaluation data config does not exist: {evaluation_data_path}"
+                )
+            log.info(f"Loading evaluation data from {evaluation_data_path}")
+            evaluation_cfg = OmegaConf.load(evaluation_data_path)
+            evaluation_data = evaluation_cfg.get("data", evaluation_cfg)
+            # These mappings describe a complete dataset.  Replace rather than
+            # recursively merge them so processes from the training domain do
+            # not leak into the evaluation domain.
+            replacement_keys = {
+                "process_catalog",
+                "train_val_processes",
+                "test_suites",
+            }
+            evaluation_data_values = OmegaConf.to_container(
+                evaluation_data,
+                resolve=False,
+            )
+            merge_values = {
+                key: value
+                for key, value in evaluation_data_values.items()
+                if key not in replacement_keys
+            }
+            merged_data = OmegaConf.merge(cfg.data, merge_values)
+            OmegaConf.set_struct(merged_data, False)
+            for key in replacement_keys:
+                if key in evaluation_data_values:
+                    merged_data[key] = evaluation_data_values[key]
+            cfg.data = merged_data
+
+        selected_test_suites = cfg.get("evaluation_test_suites")
+        if selected_test_suites:
+            if isinstance(selected_test_suites, str):
+                selected_test_suites = [selected_test_suites]
+            available_test_suites = cfg.data.get("test_suites") or {}
+            missing_test_suites = [
+                name for name in selected_test_suites if name not in available_test_suites
+            ]
+            if missing_test_suites:
+                raise ValueError(
+                    "Unknown evaluation test suite(s): "
+                    + ", ".join(map(str, missing_test_suites))
+                )
+            cfg.data.test_suites = {
+                name: available_test_suites[name] for name in selected_test_suites
+            }
 
         # set the output dir to the parent of the ckpt config path
         log.info(f"Setting output dir to {cfg_ckpt_path.parent}")
@@ -706,7 +913,10 @@ def main(cfg: DictConfig) -> Optional[float]:
         remove_empty_hydra_run_dir(redundant_output_dir)
 
         log.info(f"paths.output_dir={cfg.paths.output_dir}")
-        log.info(f"logger.comet.experiment_name={cfg.logger.comet.experiment_name}")
+        log.info(
+            "logger.comet.experiment_name=%s",
+            OmegaConf.select(cfg, "logger.comet.experiment_name", default=None),
+        )
 
         # set the evaluation flag to True and the training flag to False
         log.info("Setting evaluation flag to True and training flag to False")

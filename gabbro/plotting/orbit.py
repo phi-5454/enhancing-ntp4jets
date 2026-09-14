@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,18 +25,52 @@ RECONSTRUCTED_COLOR = plot_utils.DEFAULT_COLORS[1]
 RESIDUAL_COLOR = plot_utils.DEFAULT_COLORS[1]
 TRUTH_REFERENCE_COLOR = "grey"
 RUN_COLORS = tuple(plot_utils.DEFAULT_COLORS)
+# Keep codebook-size-only legends readable: the generic hash fallback can map
+# different numeric labels onto the same finite palette.  These entries cover
+# the canonical VQ scans and are intentionally stable across all figures.
+CODEBOOK_SIZE_COLORS = {
+    label: RUN_COLORS[index]
+    for index, label in enumerate(("128", "256", "512", "1024", "2048", "4096", "8192", "16384"))
+}
 CODEBOOK_FAMILY_COLORS = {
     "fsq": plot_utils.DEFAULT_COLORS[0],
     "vq_ste": plot_utils.DEFAULT_COLORS[1],
     "vq_rotation": plot_utils.DEFAULT_COLORS[2],
     "kmeans": plot_utils.DEFAULT_COLORS[3],
+    "scalar_baseline": plot_utils.DEFAULT_COLORS[4],
+    "continuous": plot_utils.DEFAULT_COLORS[5],
+    # Preserve the identities used by the original TT_only/SM_mixture
+    # downstream comparisons for all equivalent display labels.
+    "training_tt": plot_utils.DEFAULT_COLORS[3],
+    "training_sm_mixture": plot_utils.DEFAULT_COLORS[9],
 }
 CODEBOOK_FAMILY_MARKERS = {
     "fsq": "o",
     "vq_ste": "s",
     "vq_rotation": "^",
     "kmeans": "D",
+    "split_vq_fsq_alpha_128": "v",
+    "split_vq_fsq_alpha_64": "P",
+    "split_vq_fsq_alpha_32": "X",
+    "split_fsq_alpha_128": "*",
+    "split_fsq_alpha_64": "<",
+    "split_fsq_alpha_32": ">",
+    "training_tt": "<",
+    "training_sm_mixture": "*",
 }
+MIN_CODEBOOK_MARKER_AREA = 55.0
+MAX_CODEBOOK_MARKER_AREA = 210.0
+PRESENTATION_CODEBOOK_MARKER_AREA_SCALE = 0.55
+CODEBOOK_FAMILY_COLORS.update(
+    {
+        "split_vq_fsq_alpha_128": plot_utils.DEFAULT_COLORS[4],
+        "split_vq_fsq_alpha_64": plot_utils.DEFAULT_COLORS[5],
+        "split_vq_fsq_alpha_32": plot_utils.DEFAULT_COLORS[6],
+        "split_fsq_alpha_128": plot_utils.DEFAULT_COLORS[7],
+        "split_fsq_alpha_64": plot_utils.DEFAULT_COLORS[8],
+        "split_fsq_alpha_32": plot_utils.DEFAULT_COLORS[9],
+    }
+)
 CODEBOOK_FAMILY_LABELS = {
     "fsq": "FSQ",
     "vq_ste": "VQ STE",
@@ -43,6 +78,190 @@ CODEBOOK_FAMILY_LABELS = {
     "kmeans": "FAISS k-means",
 }
 SCATTER_MARKERS = ("o", "s", "^", "D", "v", "P", "X", "*", "<", ">", "h", "8")
+
+
+def pid_residual_arrays(
+    original: np.ndarray,
+    reconstructed: np.ndarray,
+    feature_names: list[str] | tuple[str, ...],
+) -> dict[str, np.ndarray]:
+    """Return same-position residuals in physical angular/log coordinates."""
+    original = np.asarray(original)
+    reconstructed = np.asarray(reconstructed)
+    if original.shape != reconstructed.shape or original.ndim != 2:
+        raise ValueError("PID residual inputs must have matching [particles, features] shapes")
+    feature_to_index = {str(name): index for index, name in enumerate(feature_names)}
+    required = (
+        "L1T_PUPPIPart_Eta",
+        "L1T_PUPPIPart_Phi_cos",
+        "L1T_PUPPIPart_Phi_sin",
+        "L1T_PUPPIPart_PT",
+    )
+    missing = [name for name in required if name not in feature_to_index]
+    if missing:
+        raise ValueError(f"PID residual plots require features {missing}")
+
+    eta = feature_to_index[required[0]]
+    phi_cos = feature_to_index[required[1]]
+    phi_sin = feature_to_index[required[2]]
+    pt = feature_to_index[required[3]]
+    original_phi = np.arctan2(original[:, phi_sin], original[:, phi_cos])
+    reconstructed_phi = np.arctan2(
+        reconstructed[:, phi_sin], reconstructed[:, phi_cos]
+    )
+    delta_phi = np.remainder(reconstructed_phi - original_phi + np.pi, 2 * np.pi) - np.pi
+    residuals = {
+        "delta_eta": 3.0 * (reconstructed[:, eta] - original[:, eta]),
+        "delta_phi": delta_phi,
+        "delta_log_pt": reconstructed[:, pt] - original[:, pt],
+    }
+    energy_name = "L1T_PUPPIPart_E"
+    if energy_name in feature_to_index:
+        energy = feature_to_index[energy_name]
+        residuals["delta_log_energy"] = reconstructed[:, energy] - original[:, energy]
+    return residuals
+
+
+def pid_residual_distribution_summary(values: np.ndarray) -> dict[str, float | int | None]:
+    """Summarize one PID-conditioned residual distribution."""
+    values = np.asarray(values, dtype=np.float64)
+    values = values[np.isfinite(values)]
+    if not len(values):
+        return {
+            "count": 0,
+            "bias": None,
+            "rmse": None,
+            "median": None,
+            "q16": None,
+            "q84": None,
+            "abs_q95": None,
+        }
+    return {
+        "count": int(len(values)),
+        "bias": float(np.mean(values)),
+        "rmse": float(np.sqrt(np.mean(values**2))),
+        "median": float(np.median(values)),
+        "q16": float(np.quantile(values, 0.16)),
+        "q84": float(np.quantile(values, 0.84)),
+        "abs_q95": float(np.quantile(np.abs(values), 0.95)),
+    }
+
+
+def plot_pid_conditional_residuals(
+    by_pid: dict[int, dict[str, np.ndarray]],
+    class_names: list[str] | tuple[str, ...],
+    bins: int = 80,
+    title: str = "Same-token reconstruction residuals, conditioned on original PID",
+):
+    """Plot one residual panel per available kinematic coordinate."""
+    plot_utils.set_mpl_style()
+    specifications = [
+        ("delta_eta", r"$\eta^\mathrm{reco}-\eta^\mathrm{orig}$", (-2.0, 2.0)),
+        (
+            "delta_phi",
+            r"wrapped $\phi^\mathrm{reco}-\phi^\mathrm{orig}$",
+            (-1.0, 1.0),
+        ),
+        (
+            "delta_log_pt",
+            r"$\log(p_T^\mathrm{reco}/p_T^\mathrm{orig})$",
+            (-1.5, 1.5),
+        ),
+    ]
+    if any("delta_log_energy" in values for values in by_pid.values()):
+        specifications.append(
+            (
+                "delta_log_energy",
+                r"$\log(E^\mathrm{reco}/E^\mathrm{orig})$",
+                (-1.5, 1.5),
+            )
+        )
+    figure, axes = plt.subplots(
+        1,
+        len(specifications),
+        figsize=(6 * len(specifications), 5.5),
+        constrained_layout=True,
+    )
+    axes = np.atleast_1d(axes)
+    for axis, (key, label, value_range) in zip(axes, specifications):
+        edges = np.linspace(*value_range, bins + 1)
+        for pid, class_name in enumerate(class_names):
+            values = np.asarray(by_pid.get(pid, {}).get(key, []))
+            if not len(values):
+                continue
+            axis.hist(
+                values,
+                bins=edges,
+                density=True,
+                histtype="step",
+                linewidth=1.5,
+                color=RUN_COLORS[pid % len(RUN_COLORS)],
+                label=f"{class_name} ({len(values):,})",
+            )
+        axis.axvline(0.0, color="black", linestyle="--", linewidth=1, alpha=0.6)
+        axis.set(xlabel=label, ylabel="Density", xlim=value_range)
+    axes[-1].legend(fontsize=7, frameon=False)
+    figure.suptitle(title)
+    return figure
+
+
+def _multirun_family_key(series_name: str) -> str | None:
+    """Return the canonical style key for a known multirun family."""
+    name = str(series_name).strip()
+    normalized = name.lower().replace("-", "_").replace(" ", "_")
+    normalized = (
+        normalized.replace("μ", "mu")
+        .replace("α", "alpha")
+        .replace("+", "plus")
+        .replace("=", "_")
+    )
+    normalized = "_".join(part for part in normalized.split("_") if part)
+    family_aliases = {
+        "fsq": "fsq",
+        "fsq_mu_only": "fsq",
+        "vq_ste": "vq_ste",
+        "vq_rotation": "vq_rotation",
+        "faiss_k_means": "kmeans",
+        "faiss_kmeans": "kmeans",
+        "kmeans": "kmeans",
+        "scalar_baseline": "scalar_baseline",
+        "dumb_quantization": "scalar_baseline",
+        "continuous": "continuous",
+        "continuous_autoencoder": "continuous",
+        "tt_only": "training_tt",
+        "trained_on_tt": "training_tt",
+        "sm_mixture": "training_sm_mixture",
+        "trained_on_sm_mixture": "training_sm_mixture",
+        "vq_mu_plus_fsq_alpha_128": "split_vq_fsq_alpha_128",
+        "vq_mu_plus_fsq_alpha_64": "split_vq_fsq_alpha_64",
+        "vq_mu_plus_fsq_alpha_32": "split_vq_fsq_alpha_32",
+        "fsq_mu_plus_alpha_128": "split_fsq_alpha_128",
+        "fsq_mu_plus_alpha_64": "split_fsq_alpha_64",
+        "fsq_mu_plus_alpha_32": "split_fsq_alpha_32",
+    }
+    return family_aliases.get(normalized)
+
+
+def multirun_color(series_name: str) -> str:
+    """Return a stable color for a multirun series, independent of input order."""
+    name = str(series_name).strip()
+    if name in CODEBOOK_SIZE_COLORS:
+        return CODEBOOK_SIZE_COLORS[name]
+    family = _multirun_family_key(name)
+    if family is not None:
+        return CODEBOOK_FAMILY_COLORS[family]
+    digest = hashlib.sha256(name.encode("utf-8")).digest()
+    return RUN_COLORS[int.from_bytes(digest[:8], "big") % len(RUN_COLORS)]
+
+
+def multirun_marker(series_name: str) -> str:
+    """Return a stable marker for a multirun family, independent of input order."""
+    name = str(series_name).strip()
+    family = _multirun_family_key(name)
+    if family in CODEBOOK_FAMILY_MARKERS:
+        return CODEBOOK_FAMILY_MARKERS[family]
+    digest = hashlib.sha256(name.encode("utf-8")).digest()
+    return SCATTER_MARKERS[int.from_bytes(digest[8:16], "big") % len(SCATTER_MARKERS)]
 HISTOGRAM_LINEWIDTH = 2
 HISTOGRAM_FILL_ALPHA = 0.35
 TRUTH_REFERENCE_FILL_ALPHA = 0.35
@@ -61,6 +280,9 @@ RATIO_WSPACE = 0.25
 ATTENTION_DELTA_FIGSIZE = (6, 5)
 ATTENTION_MAP_FIGSIZE = (5, 4)
 SCATTER_FIGSIZE = (8, 6)
+MULTIRUN_LEGEND_FONTSIZE = 8
+PRESENTATION_LEGEND_FONTSIZE = 12
+PRESENTATION_LEGEND_MARKERSCALE = 1.35
 TRANSFORMED_FEATURE_RANGES = {
     "L1T_PUPPIPart_Eta": (-1.5, 1.5),
     "L1T_PUPPIPart_Phi_cos": (-1.0, 1.0),
@@ -118,6 +340,13 @@ def _set_suptitle(fig, title, **kwargs) -> None:
 
 
 def _feature_label(feature_name: str) -> str:
+    physical_labels = {
+        "physical_pT": r"$p_T$ [GeV]",
+        "physical_Eta": r"$\eta$",
+        "physical_Phi": r"$\phi$",
+    }
+    if feature_name in physical_labels:
+        return physical_labels[feature_name]
     return plot_utils.DEFAULT_LABELS.get(feature_name, feature_name)
 
 
@@ -775,7 +1004,7 @@ def plot_residual_histograms(
             alpha=REFERENCE_LINE_ALPHA,
         )
         _set_title(ax, _feature_label(feature_name))
-        ax.set_xlabel(f"Reco - original {_feature_label(feature_name)}")
+        ax.set_xlabel(f"Reco - original\n{_feature_label(feature_name)}")
         ax.set_ylabel("Density")
     for ax in axes[len(feature_names) :]:
         ax.axis("off")
@@ -956,8 +1185,6 @@ def collect_physical_reconstruction_histograms(
     if data_level == "particle" and len(true_jet_masses) > 0:
         true_jet_masses = np.asarray(true_jet_masses)
         reco_jet_masses = np.asarray(reco_jet_masses)
-        true_tau32s = np.asarray(true_tau32s)
-        reco_tau32s = np.asarray(reco_tau32s)
 
         mass_bins = _linear_bins(jet_mass_range, 50)
         histograms["jet_mass_orig_counts"] = _safe_density_hist(
@@ -977,13 +1204,6 @@ def collect_physical_reconstruction_histograms(
         )
         histograms["jet_mass_diff_bins"] = mass_diff_bins
 
-        tau_diff_bins = _linear_bins(TAU32_RESIDUAL_RANGE, 50)
-        histograms["tau32_diff_counts"] = _safe_density_hist(
-            reco_tau32s - true_tau32s,
-            tau_diff_bins,
-        )
-        histograms["tau32_diff_bins"] = tau_diff_bins
-
     if data_level == "particle" and len(unfiltered_true_jet_masses) > 0:
         unfiltered_true_jet_masses = np.asarray(unfiltered_true_jet_masses)
         unfiltered_reco_jet_masses = np.asarray(unfiltered_reco_jet_masses)
@@ -994,6 +1214,17 @@ def collect_physical_reconstruction_histograms(
         )
         histograms["jet_mass_diff_unfiltered_bins"] = mass_diff_bins
 
+    if data_level == "particle" and len(true_tau32s) > 0:
+        true_tau32s = np.asarray(true_tau32s)
+        reco_tau32s = np.asarray(reco_tau32s)
+        tau_diff_bins = _linear_bins(TAU32_RESIDUAL_RANGE, 50)
+        histograms["tau32_diff_counts"] = _safe_density_hist(
+            reco_tau32s - true_tau32s,
+            tau_diff_bins,
+        )
+        histograms["tau32_diff_bins"] = tau_diff_bins
+
+    if data_level == "particle" and len(unfiltered_true_tau32s) > 0:
         tau_diff_bins = _linear_bins(TAU32_RESIDUAL_RANGE, 50)
         histograms["tau32_diff_unfiltered_counts"] = _safe_density_hist(
             np.asarray(unfiltered_reco_tau32s) - np.asarray(unfiltered_true_tau32s),
@@ -1259,6 +1490,7 @@ def plot_paper_kinematic_differences(
             xlabel=KINEMATIC_RESIDUAL_LABELS[feature_name],
             title=f"{feature_label} residuals",
         )
+        axis.set_yscale("log", nonpositive="clip")
 
     _set_suptitle(fig, f"{data_level.capitalize()} kinematic residuals")
     plt.tight_layout()
@@ -1418,7 +1650,10 @@ def physical_reconstruction_plots(
             histograms,
         )
     if data_level == "particle" and "jet_mass_orig_counts" in histograms:
-        fig, axes = plt.subplots(1, 3, figsize=SUBSTRUCTURE_SIMPLE_FIGSIZE)
+        include_tau32 = "tau32_diff_counts" in histograms
+        n_columns = 3 if include_tau32 else 2
+        figsize = SUBSTRUCTURE_SIMPLE_FIGSIZE if include_tau32 else (12, 4)
+        fig, axes = plt.subplots(1, n_columns, figsize=figsize)
         _set_suptitle(fig, "Jet Substructure", fontsize=16)
         _plot_original_reconstructed_histograms(
             axes[0],
@@ -1454,28 +1689,29 @@ def physical_reconstruction_plots(
             xlabel=r"$m^\mathrm{reco} - m^\mathrm{orig}$ [GeV]",
             title="Jet Mass Residuals",
         )
-        tau_residual_series = [
-            (
-                histograms["tau32_diff_counts"],
-                jet_matching_cut_label,
-                RESIDUAL_COLOR,
-            )
-        ]
-        if "tau32_diff_unfiltered_counts" in histograms:
-            tau_residual_series.append(
+        if include_tau32:
+            tau_residual_series = [
                 (
-                    histograms["tau32_diff_unfiltered_counts"],
-                    r"No $\Delta R$ cutoff",
-                    RUN_COLORS[3],
+                    histograms["tau32_diff_counts"],
+                    jet_matching_cut_label,
+                    RESIDUAL_COLOR,
                 )
+            ]
+            if "tau32_diff_unfiltered_counts" in histograms:
+                tau_residual_series.append(
+                    (
+                        histograms["tau32_diff_unfiltered_counts"],
+                        r"No $\Delta R$ cutoff",
+                        RUN_COLORS[3],
+                    )
+                )
+            plot_physical_residual_histogram(
+                axes[2],
+                histograms["tau32_diff_bins"],
+                tau_residual_series,
+                xlabel=r"$\tau_{32}^\mathrm{reco} - \tau_{32}^\mathrm{orig}$",
+                title=r"$\tau_{32}$ Residuals",
             )
-        plot_physical_residual_histogram(
-            axes[2],
-            histograms["tau32_diff_bins"],
-            tau_residual_series,
-            xlabel=r"$\tau_{32}^\mathrm{reco} - \tau_{32}^\mathrm{orig}$",
-            title=r"$\tau_{32}$ Residuals",
-        )
         plt.tight_layout()
         figures["jet_substructure"] = fig
 
@@ -1602,6 +1838,32 @@ def _multirun_mplhep():
     return plot_utils.set_mpl_style()
 
 
+def codebook_marker_areas(
+    records: list[dict], size_range: tuple[float, float] | None = None
+) -> np.ndarray:
+    """Map effective codebook size to a bounded, logarithmic marker area."""
+    sizes = np.asarray(
+        [record.get("total_codebook_size") or np.nan for record in records],
+        dtype=float,
+    )
+    finite = np.isfinite(sizes) & (sizes > 0)
+    if not np.any(finite):
+        return np.full(len(records), MIN_CODEBOOK_MARKER_AREA)
+    log_sizes = np.log2(sizes[finite])
+    if size_range is None:
+        low, high = float(log_sizes.min()), float(log_sizes.max())
+    else:
+        low, high = map(float, np.log2(size_range))
+    result = np.full(len(records), MIN_CODEBOOK_MARKER_AREA)
+    if high > low:
+        result[finite] += (MAX_CODEBOOK_MARKER_AREA - MIN_CODEBOOK_MARKER_AREA) * (
+            (log_sizes - low) / (high - low)
+        )
+    else:
+        result[finite] = 0.5 * (MIN_CODEBOOK_MARKER_AREA + MAX_CODEBOOK_MARKER_AREA)
+    return result
+
+
 def save_figures(figures: dict[str, object], output_dir: str | Path, suffix: str = "png") -> None:
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -1623,11 +1885,13 @@ def plot_multirun_feature_histograms(
     feature_names: list[str],
     title: str = "Reconstruction comparison",
     figsize_per_axis: tuple[float, float] = (5.0, 3.6),
+    show_titles: bool = True,
 ):
     """Overlay reconstructed feature histograms from several runs."""
     hep = _multirun_mplhep()
     fig, axes = _grid(len(feature_names), figsize_per_axis=figsize_per_axis)
-    _set_suptitle(fig, title, fontsize=16)
+    if show_titles:
+        _set_suptitle(fig, title, fontsize=16)
     reference = runs[0]["histograms"]
     for i, feature_name in enumerate(feature_names):
         ax = axes[i]
@@ -1641,18 +1905,19 @@ def plot_multirun_feature_histograms(
             histtype="fill",
             alpha=TRUTH_REFERENCE_FILL_ALPHA,
         )
-        for j, run in enumerate(runs):
+        for run in runs:
             histograms = run["histograms"]
             hep.histplot(
                 histograms[f"{clean_name}_reco_counts"],
                 histograms[f"{clean_name}_bins"],
                 ax=ax,
                 label=run["label"],
-                color=RUN_COLORS[j % len(RUN_COLORS)],
+                color=run.get("plot_color", multirun_color(run["label"])),
                 histtype="step",
                 linewidth=HISTOGRAM_LINEWIDTH,
             )
-        _set_title(ax, _feature_label(feature_name))
+        if show_titles:
+            _set_title(ax, _feature_label(feature_name))
         ax.set_xlabel(_feature_label(feature_name))
         ax.set_ylabel("Density")
         if _multirun_feature_uses_log_x(feature_name):
@@ -1662,12 +1927,25 @@ def plot_multirun_feature_histograms(
             ]
             if positive_bins.size > 0:
                 ax.set_xlim(left=positive_bins[0])
-        if _multirun_feature_uses_log_y(feature_name):
-            ax.set_yscale("log", nonpositive="clip")
-        ax.legend(prop={"size": 8})
+        ax.set_yscale("log", nonpositive="clip")
+        if show_titles:
+            ax.legend(fontsize=MULTIRUN_LEGEND_FONTSIZE)
     for ax in axes[len(feature_names) :]:
         ax.axis("off")
-    fig.tight_layout()
+    if not show_titles:
+        handles, labels = axes[0].get_legend_handles_labels()
+        fig.legend(
+            handles,
+            labels,
+            loc="upper center",
+            bbox_to_anchor=(0.5, 1.01),
+            ncol=min(5, len(labels)),
+            fontsize=PRESENTATION_LEGEND_FONTSIZE,
+            frameon=False,
+        )
+        fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.82))
+    else:
+        fig.tight_layout()
     return fig
 
 
@@ -1675,22 +1953,25 @@ def plot_multirun_residual_histograms(
     runs: list[dict],
     feature_names: list[str],
     title: str = "Reconstruction residual comparison",
+    show_titles: bool = True,
+    figsize_per_axis: tuple[float, float] = (5.0, 5.6),
 ):
     """Overlay reconstructed-minus-original residuals from several runs."""
     hep = _multirun_mplhep()
-    fig, axes = _grid(len(feature_names))
-    _set_suptitle(fig, title, fontsize=16)
+    fig, axes = _grid(len(feature_names), figsize_per_axis=figsize_per_axis)
+    if show_titles:
+        _set_suptitle(fig, title, fontsize=16)
     for i, feature_name in enumerate(feature_names):
         ax = axes[i]
         clean_name = _clean_feature_name(feature_name)
-        for j, run in enumerate(runs):
+        for run in runs:
             histograms = run["histograms"]
             hep.histplot(
                 histograms[f"{clean_name}_diff_counts"],
                 histograms[f"{clean_name}_diff_bins"],
                 ax=ax,
                 label=run["label"],
-                color=RUN_COLORS[j % len(RUN_COLORS)],
+                color=run.get("plot_color", multirun_color(run["label"])),
                 histtype="step",
                 linewidth=HISTOGRAM_LINEWIDTH,
             )
@@ -1700,13 +1981,29 @@ def plot_multirun_residual_histograms(
             linestyle=REFERENCE_LINE_STYLE,
             alpha=REFERENCE_LINE_ALPHA,
         )
-        _set_title(ax, _feature_label(feature_name))
-        ax.set_xlabel(f"Reco - original {_feature_label(feature_name)}")
+        ax.set_yscale("log", nonpositive="clip")
+        if show_titles:
+            _set_title(ax, _feature_label(feature_name))
+        ax.set_xlabel(f"Reco - original\n{_feature_label(feature_name)}")
         ax.set_ylabel("Density")
-        ax.legend(prop={"size": 8})
+        if show_titles:
+            ax.legend(fontsize=MULTIRUN_LEGEND_FONTSIZE)
     for ax in axes[len(feature_names) :]:
         ax.axis("off")
-    fig.tight_layout()
+    if not show_titles:
+        handles, labels = axes[0].get_legend_handles_labels()
+        fig.legend(
+            handles,
+            labels,
+            loc="upper center",
+            bbox_to_anchor=(0.5, 1.01),
+            ncol=min(4, len(labels)),
+            fontsize=PRESENTATION_LEGEND_FONTSIZE,
+            frameon=False,
+        )
+        fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.82))
+    else:
+        fig.tight_layout()
     return fig
 
 
@@ -1725,6 +2022,9 @@ def plot_multirun_metric(
     vertical_reference_label: str | None = None,
     horizontal_reference: float | None = None,
     horizontal_reference_label: str | None = None,
+    show_title: bool = True,
+    scale_marker_by_codebook_size: bool = False,
+    marker_area_scale: float = 1.0,
 ):
     """Plot one scalar metric against another, grouped by run family."""
     _multirun_mplhep()
@@ -1741,9 +2041,30 @@ def plot_multirun_metric(
     for record in usable_records:
         grouped_records[record.get("plot_family") or record["label"]].append(record)
 
-    for i, (family, family_records) in enumerate(grouped_records.items()):
-        color = RUN_COLORS[i % len(RUN_COLORS)]
-        marker = SCATTER_MARKERS[i % len(SCATTER_MARKERS)]
+    explicit_marker_areas = all(
+        record.get("plot_marker_area") is not None for record in usable_records
+    )
+    variable_marker_areas = scale_marker_by_codebook_size or explicit_marker_areas
+    codebook_size_range = None
+    if scale_marker_by_codebook_size and not explicit_marker_areas:
+        codebook_sizes = np.asarray(
+            [record.get("total_codebook_size") or np.nan for record in usable_records],
+            dtype=float,
+        )
+        finite_sizes = codebook_sizes[
+            np.isfinite(codebook_sizes) & (codebook_sizes > 0)
+        ]
+        if finite_sizes.size:
+            codebook_size_range = (
+                float(finite_sizes.min()),
+                float(finite_sizes.max()),
+            )
+
+    for family, family_records in sorted(
+        grouped_records.items(), key=lambda item: item[0]
+    ):
+        color = multirun_color(family)
+        marker = multirun_marker(family)
         family_records = sorted(
             family_records,
             key=lambda record: (record[x_metric], str(record["label"])),
@@ -1757,14 +2078,24 @@ def plot_multirun_metric(
                 color=color,
                 linewidth=1.5,
                 alpha=0.75,
-                label=family,
+                marker=None if variable_marker_areas else marker,
+                markersize=7,
+                label=None if variable_marker_areas else family,
             )
-            scatter_label = None
+            scatter_label = family if variable_marker_areas else None
         else:
             scatter_label = family
         ax.scatter(
             x_values,
             y_values,
+            s=(
+                [record["plot_marker_area"] for record in family_records]
+                if explicit_marker_areas
+                else marker_area_scale
+                * codebook_marker_areas(family_records, codebook_size_range)
+                if scale_marker_by_codebook_size
+                else None
+            ),
             label=scatter_label,
             color=color,
             marker=marker,
@@ -1805,7 +2136,15 @@ def plot_multirun_metric(
         ax.set_yscale("log")
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
-    _set_title(ax, title)
-    ax.legend(prop={"size": 8})
+    if show_title:
+        _set_title(ax, title)
+    ax.legend(
+        fontsize=(
+            MULTIRUN_LEGEND_FONTSIZE
+            if show_title
+            else PRESENTATION_LEGEND_FONTSIZE
+        ),
+        markerscale=PRESENTATION_LEGEND_MARKERSCALE if not show_title else 1.0,
+    )
     fig.tight_layout()
     return fig

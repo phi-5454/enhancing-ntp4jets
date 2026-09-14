@@ -239,6 +239,7 @@ class DumbQuantizationBaselineLightning(L.LightningModule):
         self.test_labels = []
         self.test_suite_labels = []
         self.test_code_idx = []
+        self.test_pid = []
 
     @staticmethod
     def _should_store_loop_batch(batch_idx: int, max_batches: int | None) -> bool:
@@ -569,6 +570,7 @@ class DumbQuantizationBaselineLightning(L.LightningModule):
         self.test_labels = []
         self.test_suite_labels = []
         self.test_code_idx = []
+        self.test_pid = []
         self._pid_confusion_matrices = {}
         self._clear_concat_outputs("test")
 
@@ -578,7 +580,8 @@ class DumbQuantizationBaselineLightning(L.LightningModule):
 
     def _clear_concat_outputs(self, prefix: str) -> None:
         for name in [
-            "x_original", "x_reco", "mask", "labels", "suite_labels", "code_idx", "code_mask"
+            "x_original", "x_reco", "mask", "labels", "suite_labels", "code_idx", "code_mask",
+            "pid",
         ]:
             attr = f"{prefix}_{name}_concat"
             if hasattr(self, attr):
@@ -606,6 +609,8 @@ class DumbQuantizationBaselineLightning(L.LightningModule):
         self.test_labels_concat = np.concatenate(self.test_labels)
         self.test_suite_labels_concat = np.concatenate(self.test_suite_labels)
         self.test_code_idx_concat = np.concatenate(self.test_code_idx)
+        if self.test_pid:
+            self.test_pid_concat = np.concatenate(self.test_pid)
 
     def test_step(
         self,
@@ -627,6 +632,8 @@ class DumbQuantizationBaselineLightning(L.LightningModule):
                 suite_labels = torch.full_like(labels, dataloader_idx)
             self.test_suite_labels.append(suite_labels.detach().cpu().numpy())
             self.test_code_idx.append(code_idx.detach().cpu().numpy())
+            if "part_pid" in batch:
+                self.test_pid.append(batch["part_pid"].detach().cpu().numpy())
         self.log("test_loss", loss.item(), on_step=False, on_epoch=True, prog_bar=True)
         self._log_step_metrics(
             "test_metrics",
@@ -1000,6 +1007,7 @@ class FaissKMeansBaselineLightning(DumbQuantizationBaselineLightning):
         self.test_labels = []
         self.test_suite_labels = []
         self.test_code_idx = []
+        self.test_pid = []
         self._clear_concat_outputs("test")
 
     def on_test_end(self):
@@ -1174,6 +1182,27 @@ class VQVAETransformer(torch.nn.Module):
         )
         if self.pid_num_classes < 2:
             raise ValueError("pid_cfg.num_classes must be at least 2")
+        reconstruction_class_weights = pid_cfg.get("reconstruction_class_weights")
+        if reconstruction_class_weights is None:
+            self.register_buffer("reconstruction_class_weights", None)
+        else:
+            reconstruction_class_weights = torch.as_tensor(
+                reconstruction_class_weights, dtype=torch.float32
+            )
+            if reconstruction_class_weights.shape != (self.pid_num_classes,):
+                raise ValueError(
+                    "pid_cfg.reconstruction_class_weights must contain exactly "
+                    f"{self.pid_num_classes} values"
+                )
+            if not torch.all(torch.isfinite(reconstruction_class_weights)) or torch.any(
+                reconstruction_class_weights <= 0
+            ):
+                raise ValueError(
+                    "pid_cfg.reconstruction_class_weights must be finite and positive"
+                )
+            self.register_buffer(
+                "reconstruction_class_weights", reconstruction_class_weights
+            )
 
         self.conditional_dim = conditional_dim
         self.latent_dim = latent_dim
@@ -1539,7 +1568,8 @@ class VQVAELightning(L.LightningModule):
 
     def _clear_concat_outputs(self, prefix: str) -> None:
         for name in [
-            "x_original", "x_reco", "mask", "labels", "suite_labels", "code_idx", "code_mask"
+            "x_original", "x_reco", "mask", "labels", "suite_labels", "code_idx", "code_mask",
+            "pid",
         ]:
             attr = f"{prefix}_{name}_concat"
             if hasattr(self, attr):
@@ -1587,12 +1617,32 @@ class VQVAELightning(L.LightningModule):
         reco_l2_per_value = torch.sum(reco_delta**2) / n_valid_values
         reco_l1_per_value = torch.sum(torch.abs(reco_delta)) / n_valid_values
 
+        particle_weights = mask_particle.to(dtype=x_particle.dtype)
+        reconstruction_class_weights = self.model.reconstruction_class_weights
+        if reconstruction_class_weights is not None:
+            if pid_particle is None:
+                raise ValueError(
+                    "PID-balanced reconstruction loss requires a part_pid tensor"
+                )
+            valid_pid = pid_particle[mask_particle.bool()]
+            if torch.any(valid_pid < 0) or torch.any(valid_pid >= self.model.pid_num_classes):
+                raise ValueError("Valid particles contain out-of-range PID class indices")
+            particle_weights = torch.zeros_like(particle_weights)
+            particle_weights[mask_particle.bool()] = reconstruction_class_weights[valid_pid]
+        reconstruction_weight_sum = particle_weights.sum().clamp_min(1.0)
+        reco_l2_weighted = (
+            (reco_delta**2).sum(dim=-1) * particle_weights
+        ).sum() / reconstruction_weight_sum
+        reco_l1_weighted = (
+            torch.abs(reco_delta).sum(dim=-1) * particle_weights
+        ).sum() / reconstruction_weight_sum
+
         alpha = self.hparams["model_kwargs"]["alpha"]
         reconstruction_loss = self.hparams["model_kwargs"].get("reconstruction_loss", "l2")
         if reconstruction_loss == "l2":
-            reco_loss = reco_l2
+            reco_loss = reco_l2_weighted
         elif reconstruction_loss == "l1":
-            reco_loss = reco_l1
+            reco_loss = reco_l1_weighted
         else:
             raise ValueError(
                 f"Unknown reconstruction_loss={reconstruction_loss!r}. "
@@ -1645,6 +1695,8 @@ class VQVAELightning(L.LightningModule):
             "loss_reco_l1": reco_l1.detach(),
             "loss_reco_l2_per_value": reco_l2_per_value.detach(),
             "loss_reco_l1_per_value": reco_l1_per_value.detach(),
+            "loss_reco_l2_weighted": reco_l2_weighted.detach(),
+            "loss_reco_l1_weighted": reco_l1_weighted.detach(),
             "loss_quantizer": quantizer_loss.detach(),
             "loss_quantizer_weighted": quantizer_loss_weighted.detach(),
             "loss_pid": pid_loss.detach(),
@@ -1897,6 +1949,7 @@ class VQVAELightning(L.LightningModule):
         self.test_suite_labels = []
         self.test_code_idx = []
         self.test_code_mask = []
+        self.test_pid = []
         self._pid_confusion_matrices = {}
         self._clear_concat_outputs("test")
 
@@ -1926,6 +1979,8 @@ class VQVAELightning(L.LightningModule):
             self.test_suite_labels.append(suite_labels.detach().cpu().numpy())
             self.test_code_idx.append(code_idx.detach().cpu().numpy())
             self.test_code_mask.append(code_mask.detach().cpu().numpy())
+            if "part_pid" in batch:
+                self.test_pid.append(batch["part_pid"].detach().cpu().numpy())
 
         self.log("test_loss", loss.item(), on_step=False, on_epoch=True, prog_bar=True)
         self._log_step_metrics(
@@ -2319,6 +2374,8 @@ class VQVAELightning(L.LightningModule):
         self.test_suite_labels_concat = np.concatenate(self.test_suite_labels)
         self.test_code_idx_concat = np.concatenate(self.test_code_idx)
         self.test_code_mask_concat = np.concatenate(self.test_code_mask)
+        if self.test_pid:
+            self.test_pid_concat = np.concatenate(self.test_pid)
 
     def configure_optimizers(self) -> Dict[str, Any]:
         """Configures optimizers and learning-rate schedulers to be used for training."""

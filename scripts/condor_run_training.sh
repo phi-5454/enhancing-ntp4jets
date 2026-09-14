@@ -49,6 +49,9 @@ for hydra_override in "$@"; do
     experiment=orbit_canonical_tt_full_event)
       HYDRA_PROJECT_NAME="orbit-canonical-tt-full-event"
       ;;
+    experiment=orbit_canonical_tt_pid_balanced_loge_pilot)
+      HYDRA_PROJECT_NAME="orbit-canonical-tt-pid-balanced-loge-pilot"
+      ;;
     experiment=orbit_canonical_qcd_tt_vjets_vv)
       HYDRA_PROJECT_NAME="orbit-canonical-qcd-tt-vjets-vv"
       ;;
