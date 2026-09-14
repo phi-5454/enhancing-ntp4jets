@@ -1,6 +1,7 @@
 defaults:
   - model_checkpoint.yaml
   - early_stopping.yaml
+  - _self_
 
 model_checkpoint:
   monitor: val_macro_auroc
@@ -11,7 +12,6 @@ model_checkpoint:
 early_stopping:
   monitor: val_macro_auroc
   mode: max
-  patience: 10
+  patience: 4
   min_delta: 0.0001
   strict: true
-

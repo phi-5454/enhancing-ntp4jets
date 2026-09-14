@@ -1,6 +1,7 @@
 defaults:
   - model_summary.yaml
   - model_checkpoint.yaml
+  - early_stopping.yaml
   - lr_monitor.yaml
   - orbit_plotting_callback.yaml
   - token_export_callback.yaml
@@ -16,6 +17,12 @@ model_checkpoint:
   save_top_k: 1
   save_last: true
   auto_insert_metric_name: false
+
+early_stopping:
+  monitor: val_loss
+  mode: min
+  patience: 4
+  strict: false
 
 gradient_monitoring:
   logging_interval: 10

@@ -128,7 +128,7 @@ model:
 
 callbacks:
   early_stopping:
-    patience: 5 # number of checks with no improvement after which training will be stopped
+    patience: 4 # number of validation epochs without improvement
   model_checkpoint:
     save_top_k: 5 # save k best models (determined by above metric)
   classification_callback:
