@@ -1,0 +1,30 @@
+# Firmware-aware storage benchmark for the canonical-tt full-event VQ-STE 4096 model.
+# The checkpoint uses the unfiltered top-500-particle representation.
+# Produces min-bias, ggHbb, and balanced inclusive-tt rows.
+
+executable = scripts/condor_run_orbit_storage_benchmark.sh
+
+PROJECT_DIR = /eos/home-y/yelberke/enhancing-ntp4jets
+OUTPUT_ROOT = /eos/user/y/yelberke/enhancing_ntp4jets_runs
+CONDA_ENV = /eos/home-y/yelberke/conda_condor_orbit_env
+MANIFEST_ROOT = /eos/home-y/yelberke/enhancing-ntp4jets/manifests/production_final
+CMSSW_BASE = /eos/home-y/yelberke/WORKSPACE_SNAPSHOT/CMSSW_14_0_9
+RUN_DIR = /eos/user/y/yelberke/enhancing_ntp4jets_runs/orbit_vq_ste_scan_canonical_orbit_canonical_tt_full_event_1108969/orbit-canonical-tt-full-event/runs/2026-09-06_10-08-25_b9pgpun001_ConjugateEngraving
+OUTPUT_DIR = $(OUTPUT_ROOT)/storage_benchmark_canonical_tt_full_event_vq_ste_4096
+
+arguments = $(PROJECT_DIR) $(RUN_DIR) $(MANIFEST_ROOT) $(OUTPUT_DIR) $(CMSSW_BASE)
+environment = "CONDA_ENV=$(CONDA_ENV) ORBIT_MANIFEST_DIR=$(MANIFEST_ROOT) STORAGE_BENCHMARK_EVENTS=1000 ORBIT_CMSSW_BUILD_JOBS=4 STORAGE_BENCHMARK_MODEL_LABEL=Canonical_tt_full-event_VQ-STE_4096"
+
+log    = $(OUTPUT_ROOT)/condor_logs/orbit_storage_benchmark_tt_full_event_vq_ste_4096_$(Cluster).log
+output = $(OUTPUT_ROOT)/condor_logs/orbit_storage_benchmark_tt_full_event_vq_ste_4096_$(Cluster)_$(Process).out
+error  = $(OUTPUT_ROOT)/condor_logs/orbit_storage_benchmark_tt_full_event_vq_ste_4096_$(Cluster)_$(Process).err
+
+should_transfer_files = YES
+when_to_transfer_output = ON_EXIT
+request_cpus = 4
+request_memory = 16GB
+request_disk = 10GB
+request_gpus = 1
++JobFlavour = "tomorrow"
+
+queue 1

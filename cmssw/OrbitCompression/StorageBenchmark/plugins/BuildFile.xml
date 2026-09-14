@@ -1,0 +1,7 @@
+<use name="FWCore/Framework"/>
+<use name="FWCore/ParameterSet"/>
+<use name="FWCore/Utilities"/>
+<use name="DataFormats/NanoAOD"/>
+<library file="*.cc" name="OrbitCompressionStorageBenchmarkPlugins">
+  <flags EDM_PLUGIN="1"/>
+</library>
