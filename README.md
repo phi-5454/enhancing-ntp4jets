@@ -613,6 +613,53 @@ conda run -p /eos/home-y/yelberke/conda_condor_orbit_env \
 The original files contain `[PT, Eta, Phi]` exactly as read from parquet. The
 2048-code token files use little-endian uint16 IDs.
 
+### Firmware-aware storage table
+
+`scripts/benchmark_orbit_storage.py` generates a per-checkpoint LaTeX storage
+table for minimum bias, ggHbb, and inclusive tt by default. The optional
+`mixture` sample adds the canonical QCD/tt/VJets/VV mixture. The standalone
+plain representation contains the common PUPPI payload only: 14-bit pT (0.25
+GeV LSB), 12-bit signed eta and 11-bit signed phi (both pi/720 LSB), and the
+3-bit hardware PID class. These fields are rounded to the nearest code,
+saturated, and densely packed into 40 bits per candidate. VQ indices are also
+densely packed, using `ceil(log2(num_codes))` bits per token. PID is predicted
+by the decoder and is therefore not stored beside the tokens.
+
+The EDM and NanoAOD measurements use the same compact leaf types. Plain
+candidates have aligned `uint16` pT, eta, and phi code columns plus a `uint8`
+PID column; unused high bits are zero. Token IDs use `uint16` for codebooks of
+up to 65536 entries. EDM stores these as native integer vector products through
+`PoolOutputModule`, while nanoAOD uses `nanoaod::FlatTable` and
+`NanoAODOutputModule`. All compressed outputs use LZMA level 9. Reported EDM and NanoAOD
+payload sizes sum only the corresponding compressed physics branches; total
+file sizes and the exact branch list remain available in the JSON manifest.
+
+Build the small companion plugin once in any compatible CMSSW area:
+
+```bash
+./scripts/setup_orbit_storage_cmssw.sh /path/to/CMSSW_X_Y_Z
+```
+
+Then generate the three-sample table for one trained model:
+
+```bash
+conda run --no-capture-output \
+  -p /eos/home-y/yelberke/conda_condor_orbit_env \
+  python scripts/benchmark_orbit_storage.py \
+  --run-dir /path/to/orbit/run \
+  --manifest-root /eos/home-y/yelberke/enhancing-ntp4jets/manifests/production_final \
+  --cmssw-base /path/to/CMSSW_X_Y_Z \
+  --output-dir /path/to/storage_benchmark \
+  --events-per-sample 1000 \
+  --device cuda
+```
+
+The output directory contains `compression_table.tex`, a flat CSV,
+`compression_measurements.json`, the packed streams and their `.xz` versions,
+and the EDM/NanoAOD ROOT files. Use `--skip-containers` for a quick Raw and
+Standalone-only pass, or `--keep-existing-containers` to resume a partially
+completed container run.
+
 ### GPU FAISS k-means baseline
 
 `model_faiss_kmeans_baseline` provides a test-only classical baseline that
@@ -759,6 +806,20 @@ uv run --locked python scripts/collect_orbit_multirun.py \
   --output-dir /path/to/comparison
 ```
 
+If a run contains several evaluations with the same suite/group names, select
+the intended artifact directory explicitly with `--artifact-family`. Supply
+each run together with the corresponding evaluation directory:
+
+```bash
+uv run --locked python scripts/collect_orbit_multirun.py \
+  --artifact-family "Trained on tt" \
+    /path/to/tt_run /path/to/tt_run/evaluation/mixture_test \
+  --artifact-family "Trained on SM mixture" \
+    /path/to/mixture_run /path/to/mixture_run/evaluation/best.ckpt \
+  --stage test --suite training_like --group all \
+  --output-dir /path/to/comparison
+```
+
 When `WANDB_API_KEY` is available—either in the shell, repository `.env`, or
 the same `GABBRO_ENV_FILE` used by training—the collector automatically creates
 its own W&B comparison run. It uploads the plots plus `manifest.json` and
@@ -779,6 +840,9 @@ uv run --locked python scripts/collect_orbit_multirun.py \
 
 Use `--no-wandb` for a local-only comparison.
 
+Use `--no-titles` to render presentation-ready copies without axes or panel
+titles. Axis labels, legends, CMS labels, and reference lines are retained.
+
 The particle rate-distortion plot includes a vertical reference at 43
 bits/input particle, representing the original particle encoding. To also show
 the reconstruction error of a continuous autoencoder as a horizontal reference,
@@ -793,6 +857,12 @@ uv run --locked python scripts/collect_orbit_multirun.py \
 The value must use the same reconstruction-MSE definition and data split as the
 plotted runs. Override the source-size reference with
 `--original-bits-per-input-particle` if the input representation changes.
+
+An additional `compression_ratio_40bit_vs_reco_mse.png` view normalizes the
+marginal compressed rate per input particle to the 40-bit common PUPPI payload.
+Thus, an x value of 0.25 means that the compressed representation uses 25% of
+that payload size (a factor-four reduction), and the original payload is marked
+at 1. Override the denominator with `--compression-reference-bits` when needed.
 
 Each explicit run entry must point at a single Hydra run directory containing
 `.hydra/config.yaml`. The collector first looks for `saved_histograms/` and
@@ -815,6 +885,7 @@ codebook_size_vs_normalized_entropy.png
 codebook_size_vs_marginal_bits_per_event.png
 codebook_size_vs_marginal_bits_per_input_particle.png
 marginal_bits_per_input_particle_vs_reco_mse.png
+compression_ratio_40bit_vs_reco_mse.png
 marginal_bits_per_event_vs_reco_mse.png
 ```
 
@@ -936,10 +1007,11 @@ It exports 10k balanced events for each split, trains one epoch on the
 original representation, and tests the paired original and decoded versions
 of the same 10k test events.
 
-Evaluate truth-matched resolved AK4 and boosted AK8 Higgs mass fidelity with:
+Evaluate truth-independent resolved Higgs mass fidelity from the two leading
+anti-$k_t$ $R=0.4$ jets with:
 
 ```bash
-python scripts/evaluate_orbit_higgs_mass.py --run-dir /path/to/tokenizer_run --gghbb-test-manifest /path/to/downstream_manifests/ggHbb_test.txt --output-dir /path/to/higgs_mass_results --device cuda
+python scripts/evaluate_orbit_higgs_mass.py --candidate-mode leading_pt --run-dir /path/to/tokenizer_run --gghbb-test-manifest /path/to/downstream_manifests/ggHbb_test.txt --output-dir /path/to/higgs_mass_results --device cuda
 ```
 
 To compare several checkpoints, use the same labelled `--run RUN_DIR LABEL`
@@ -948,7 +1020,7 @@ artifacts under `runs/<label>/`, plus decoded outline overlays and a combined
 metrics JSON at the output root:
 
 ```bash
-python scripts/evaluate_orbit_higgs_mass.py \
+python scripts/evaluate_orbit_higgs_mass.py --candidate-mode leading_pt \
   --run /path/to/vq_run "VQ (1024)" \
   --run /path/to/fsq_run "FSQ" \
   --gghbb-test-manifest /path/to/downstream_manifests/ggHbb_test.txt \
@@ -960,24 +1032,103 @@ Both mass evaluators sync their PNG plots to W&B by default (project
 containing every metrics JSON and compact histogram `.npz` input: `bins`, the
 original spectrum, and each decoded spectrum with its label. Use
 `--wandb-name`, `--wandb-group`, and `--wandb-entity` to name the benchmark run,
-or `--no-wandb` to retain only local outputs.
+or `--no-wandb` to retain only local outputs. To place a single-model Higgs
+plot and its fitted peak metrics directly on the originating tokenizer run,
+pass that training run's W&B ID with `--wandb-run-id`. The appended keys live
+under `downstream/higgs_mass/`; resuming the W&B run does not resume or modify
+model training.
 
-For PID-enabled tokenizers, evaluate the dimuon mass response on truth-selected
-DY (Z\to\mu^+\mu^-\) events with:
+The canonical-tt presentation suite combines title-free copies of all four
+golden-child multirun collections with a 46-model Higgs peak comparison and a
+six-model near-4096 Higgs histogram. It evaluates each tokenizer once on 10k
+ggHbb events, caches the candidate masses, and runs the presentation collector
+only after every cache job succeeds:
 
 ```bash
-python scripts/evaluate_orbit_z_mumu_mass.py --run-dir /path/to/tokenizer_run --dyjets-test-manifest /path/to/downstream_manifests/DYJetsToLL_13TeV-madgraphMLM-pythia8_test.txt --output-dir /path/to/z_mumu_mass_results --device cuda
+mkdir -p /eos/user/y/yelberke/enhancing_ntp4jets_runs/condor_logs
+condor_submit_dag condor/orbit_presentation_plots.dag
+```
+
+The resulting collection is written below
+`presentation_plots/canonical_tt_golden/` and uploaded as the single W&B run
+`canonical_tt_presentation_plots`. The Higgs scatter uses the fitted
+double-sided-Crystal-Ball peak mean and width on its axes, with the inclusive
+original reconstruction marked as the common reference. A complementary mass
+response plot shows the fitted decoded-to-original peak ratio,
+$\mu_{\mathrm{decoded}}/\mu_{\mathrm{original}}$, against the marginal
+compressed rate normalized to the 40-bit common particle payload.
+
+For PID-enabled tokenizers, evaluate the dimuon response on leptonic ZZ events
+using the leading reconstructed muon and antimuon in each representation. The
+ZZ manifest below is the default and may be omitted:
+
+```bash
+python scripts/evaluate_orbit_z_mumu_mass.py --candidate-mode leading_pt --run-dir /path/to/tokenizer_run --z-test-manifest /path/to/downstream_manifests/ZZ_leptonic_test.txt --output-dir /path/to/z_mumu_mass_results --device cuda
 ```
 
 The Z evaluator accepts the same repeatable `--run RUN_DIR LABEL` interface;
 it writes `z_mumu_mass_multirun.png` and
 `z_mumu_mass_multirun_metrics.json` alongside per-run outputs.
 
-It independently Hungarian-matches original and decoded PID-labelled muons to
-the direct generator-level Z daughters, requires the correct muon charge class
-and $\Delta R < 0.2$, then compares the matched-pair masses. Both mass
-benchmarks save and log empirical means and standard deviations and include
-them in the plot legends alongside the existing fitted peak diagnostics.
+Canonical PID-enabled test runs now log one PID-conditioned residual figure per
+test suite and save compact JSON/NPZ inputs. Four-feature checkpoints show
+$\Delta\eta$, wrapped $\Delta\phi$, and
+$\log(p_T^\mathrm{reco}/p_T^\mathrm{orig})$; checkpoints with the optional
+energy feature add $\log(E^\mathrm{reco}/E^\mathrm{orig})$. To run only this
+diagnostic for an existing checkpoint, use:
+
+```bash
+python scripts/evaluate_orbit_pid_pulls.py \
+  --run-dir /path/to/tokenizer_run \
+  --test-manifest /path/to/downstream_manifests/ZZ_leptonic_test.txt \
+  --output-dir /path/to/pid_pull_results \
+  --events 10000 --device cuda --wandb
+```
+
+The distributions are conditioned on the original PID at each sequence
+position. Since the decoder does not predict a per-particle uncertainty, these
+are reconstruction residuals rather than uncertainty-normalized statistical
+pulls.
+Existing output can be uploaded without repeating inference using
+`--output-dir /path/to/pid_pull_results --wandb --upload-only`.
+
+The focused warm-started VQ-STE 4096 pilot adds $\log E-2.5$ and applies
+inverse-frequency PID weights only to the reconstruction loss. It trains for
+at most five epochs on 20k events and tests on 2k events per canonical suite:
+
+```bash
+mkdir -p /eos/user/y/yelberke/enhancing_ntp4jets_runs/condor_logs
+condor_submit condor/orbit_tt_pid_balanced_loge_pilot.sub
+```
+
+Both evaluators also accept `--candidate-mode hungarian`. This anchors the
+candidate on the original leading objects and Hungarian-matches compatible
+decoded objects by $\Delta R$; Z matches retain the reconstructed muon charge
+classes. Neither mode reads generator truth. Post-processing is disabled by
+default. Add `--max-abs-eta 2.5` and/or `--max-match-dr 0.2` independently, or
+use `--apply-current-cuts` to enable all cuts applicable to the selected mode.
+The Higgs AK4 clustering threshold remains
+30 GeV in every configuration and is not a post-processing cut.
+
+The previous generator-matched benchmark remains available as
+`--candidate-mode truth`; use `--apply-current-cuts` with it to reproduce the
+old resolved acceptance. Truth mode also retains the legacy boosted AK8
+observable. Both mass benchmarks save and log empirical means and standard
+deviations and include them in plot legends alongside the fitted peak
+diagnostics.
+
+To submit all four truth-free comparisons (Higgs/Z crossed with leading-$p_T$/
+Hungarian), each with 10k events and no acceptance or matching cuts, use:
+
+```bash
+mkdir -p /eos/user/y/yelberke/enhancing_ntp4jets_runs/condor_logs
+condor_submit \
+  -append 'RUN_SPECS=--run /path/to/run_a \"Run A\" --run /path/to/run_b \"Run B\"' \
+  condor/orbit_mass_candidate_modes_multirun.sub
+```
+
+The backslashes are required by HTCondor when labels contain spaces. Labels
+such as `FSQ`, `VQ_STE`, and `VQ_rotation` can be passed without quotes.
 
 The checkpoint configuration selects 128-particle or 500-particle export and
 Higgs evaluation automatically. For full-event canonical scans and the
