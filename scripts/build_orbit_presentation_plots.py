@@ -39,6 +39,7 @@ PRESENTATION_LEGEND_FONTSIZE = 12
 PRESENTATION_LEGEND_MARKERSCALE = 1.35
 HIGGS_MASS_PLOT_BINS = np.arange(40.0, 205.0, 5.0)
 HIGGS_MASS_EXTENDED_PLOT_BINS = np.arange(40.0, 505.0, 5.0)
+HIGGS_MASS_LOG_PLOT_BINS = np.arange(40.0, 1005.0, 5.0)
 from gabbro.plotting.utils import set_mpl_style
 from scripts.collect_orbit_multirun import _load_histograms, _save_figures
 
@@ -419,6 +420,7 @@ def plot_near_histogram(
     replicas: int,
     output_path: Path,
     bins: np.ndarray = HIGGS_MASS_PLOT_BINS,
+    log_y: bool = False,
 ) -> None:
     set_mpl_style()
     figure, axis = plt.subplots(figsize=(8, 6))
@@ -468,6 +470,8 @@ def plot_near_histogram(
         )
     axis.set_xlabel("Higgs candidate mass [GeV]")
     axis.set_ylabel("Normalized events")
+    if log_y:
+        axis.set_yscale("log")
     axis.legend(
         fontsize=PRESENTATION_LEGEND_FONTSIZE,
         markerscale=PRESENTATION_LEGEND_MARKERSCALE,
@@ -482,6 +486,7 @@ def plot_single_mass_histogram(
     replicas: int,
     output_path: Path,
     bins: np.ndarray = HIGGS_MASS_PLOT_BINS,
+    log_y: bool = False,
 ) -> None:
     """Plot one cached Higgs candidate distribution in presentation style."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -521,6 +526,8 @@ def plot_single_mass_histogram(
     )
     axis.set_xlabel("Higgs candidate mass [GeV]")
     axis.set_ylabel("Normalized events")
+    if log_y:
+        axis.set_yscale("log")
     axis.legend(
         fontsize=PRESENTATION_LEGEND_FONTSIZE,
         markerscale=PRESENTATION_LEGEND_MARKERSCALE,
@@ -772,6 +779,16 @@ def main() -> None:
         higgs_dir / "higgs_mass_near_4096_extended_500.png",
         bins=HIGGS_MASS_EXTENDED_PLOT_BINS,
     )
+    plot_near_histogram(
+        near_manifest,
+        full_manifest,
+        args.higgs_cache_dir,
+        reference_values,
+        args.bootstrap_replicas,
+        higgs_dir / "higgs_mass_near_4096_log_1000.png",
+        bins=HIGGS_MASS_LOG_PLOT_BINS,
+        log_y=True,
+    )
     plot_near_observable_histogram(
         near_manifest,
         full_manifest,
@@ -818,6 +835,13 @@ def main() -> None:
         args.bootstrap_replicas,
         single_model_dir / "higgs_mass_resolved_extended_500.png",
         bins=HIGGS_MASS_EXTENDED_PLOT_BINS,
+    )
+    plot_single_mass_histogram(
+        vq_ste_mass_cache,
+        args.bootstrap_replicas,
+        single_model_dir / "higgs_mass_resolved_log_1000.png",
+        bins=HIGGS_MASS_LOG_PLOT_BINS,
+        log_y=True,
     )
     plot_single_observable_histogram(
         vq_ste_cache,
