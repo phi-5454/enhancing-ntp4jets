@@ -264,6 +264,42 @@ def multirun_marker(series_name: str) -> str:
         return CODEBOOK_FAMILY_MARKERS[family]
     digest = hashlib.sha256(name.encode("utf-8")).digest()
     return SCATTER_MARKERS[int.from_bytes(digest[8:16], "big") % len(SCATTER_MARKERS)]
+
+
+def _phaedra_architecture_rank(series_name: str) -> int | None:
+    """Return the desired vertical order for PHAEDRA split architectures."""
+    normalized = (
+        str(series_name)
+        .strip()
+        .lower()
+        .replace("μ", "mu")
+        .replace("α", "alpha")
+        .replace("-", "_")
+        .replace(" ", "_")
+        .replace("+", "plus")
+    )
+    normalized = "_".join(part for part in normalized.split("_") if part)
+    if normalized.startswith("vq_mu_plus_fsq_alpha"):
+        return 0
+    if normalized.startswith("fsq_mu_plus_alpha"):
+        return 1
+    return None
+
+
+def multirun_display_label(series_name: str) -> str:
+    """Return the presentation label for a multirun model family."""
+    label = str(series_name)
+    if _phaedra_architecture_rank(label) is not None and not label.startswith("(PHAEDRA)"):
+        return f"(PHAEDRA) {label}"
+    return label
+
+
+def multirun_legend_sort_key(series_name: str) -> tuple[int, int, str]:
+    """Put the two PHAEDRA architectures first and directly above one another."""
+    rank = _phaedra_architecture_rank(series_name)
+    return (0, rank, str(series_name)) if rank is not None else (1, 0, str(series_name))
+
+
 HISTOGRAM_LINEWIDTH = 2
 HISTOGRAM_FILL_ALPHA = 0.35
 TRUTH_REFERENCE_FILL_ALPHA = 0.35
@@ -1913,7 +1949,7 @@ def plot_multirun_feature_histograms(
                 histograms[f"{clean_name}_reco_counts"],
                 histograms[f"{clean_name}_bins"],
                 ax=ax,
-                label=run["label"],
+                label=multirun_display_label(run["label"]),
                 color=run.get("plot_color", multirun_color(run["label"])),
                 histtype="step",
                 linewidth=HISTOGRAM_LINEWIDTH,
@@ -1972,7 +2008,7 @@ def plot_multirun_residual_histograms(
                 histograms[f"{clean_name}_diff_counts"],
                 histograms[f"{clean_name}_diff_bins"],
                 ax=ax,
-                label=run["label"],
+                label=multirun_display_label(run["label"]),
                 color=run.get("plot_color", multirun_color(run["label"])),
                 histtype="step",
                 linewidth=HISTOGRAM_LINEWIDTH,
@@ -2063,7 +2099,7 @@ def plot_multirun_metric(
             )
 
     for family, family_records in sorted(
-        grouped_records.items(), key=lambda item: item[0]
+        grouped_records.items(), key=lambda item: multirun_legend_sort_key(item[0])
     ):
         color = multirun_color(family)
         marker = multirun_marker(family)
@@ -2082,11 +2118,11 @@ def plot_multirun_metric(
                 alpha=0.75,
                 marker=None if variable_marker_areas else marker,
                 markersize=7,
-                label=None if variable_marker_areas else family,
+                label=None if variable_marker_areas else multirun_display_label(family),
             )
-            scatter_label = family if variable_marker_areas else None
+            scatter_label = multirun_display_label(family) if variable_marker_areas else None
         else:
-            scatter_label = family
+            scatter_label = multirun_display_label(family)
         ax.scatter(
             x_values,
             y_values,

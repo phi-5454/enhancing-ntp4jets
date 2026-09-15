@@ -29,6 +29,8 @@ from gabbro.plotting.orbit import (
     RECONSTRUCTED_COLOR,
     codebook_marker_areas,
     multirun_color,
+    multirun_display_label,
+    multirun_legend_sort_key,
     multirun_marker,
 )
 
@@ -272,7 +274,9 @@ def plot_mu_sigma(records: list[dict], reference: dict, output_path: Path) -> No
         np.isfinite(all_codebook_sizes) & (all_codebook_sizes > 0)
     ]
     codebook_size_range = (float(finite_sizes.min()), float(finite_sizes.max()))
-    for family, family_records in sorted(grouped.items()):
+    for family, family_records in sorted(
+        grouped.items(), key=lambda item: multirun_legend_sort_key(item[0])
+    ):
         ordered = sorted(
             family_records,
             key=lambda record: (record.get("total_codebook_size") or 0, record["label"]),
@@ -291,7 +295,7 @@ def plot_mu_sigma(records: list[dict], reference: dict, output_path: Path) -> No
             ),
             color=color,
             marker=multirun_marker(family),
-            label=family,
+            label=multirun_display_label(family),
             zorder=3,
         )
     if reference.get("success"):
@@ -350,7 +354,9 @@ def plot_mass_response(
     codebook_size_range = (float(finite_sizes.min()), float(finite_sizes.max()))
     original_peak = float(reference["mean"])
 
-    for family, family_records in sorted(grouped.items()):
+    for family, family_records in sorted(
+        grouped.items(), key=lambda item: multirun_legend_sort_key(item[0])
+    ):
         ordered = sorted(
             family_records,
             key=lambda record: (record.get("total_codebook_size") or 0, record["label"]),
@@ -383,7 +389,7 @@ def plot_mass_response(
             ),
             color=color,
             marker=multirun_marker(family),
-            label=family,
+            label=multirun_display_label(family),
             zorder=3,
         )
 
@@ -435,7 +441,12 @@ def plot_near_histogram(
         str(record["run_dir"]): (index, record)
         for index, record in enumerate(full_manifest)
     }
-    for near in near_manifest:
+    for near in sorted(
+        near_manifest,
+        key=lambda record: multirun_legend_sort_key(
+            record.get("plot_family") or record["label"]
+        ),
+    ):
         key = str(near["run_dir"])
         if key not in full_by_run:
             raise ValueError(f"Near-4096 run is absent from the full manifest: {key}")
@@ -443,7 +454,7 @@ def plot_near_histogram(
         _, decoded = mass_values(cache_dir / f"{index:03d}" / "higgs_candidates.csv")
         decoded = decoded[np.isfinite(decoded)]
         fit = fit_with_bootstrap(decoded, replicas)
-        label = near.get("plot_family") or near["label"]
+        label = multirun_display_label(near.get("plot_family") or near["label"])
         if fit.get("success"):
             label += f" ($\\mu$={fit['mean']:.1f}, $\\sigma$={fit['sigma']:.1f} GeV)"
         axis.hist(
@@ -570,8 +581,13 @@ def plot_near_observable_histogram(
         linewidth=1.8,
         label="Original",
     )
-    for near, full, decoded in series:
-        label = near.get("plot_family") or near["label"]
+    for near, full, decoded in sorted(
+        series,
+        key=lambda item: multirun_legend_sort_key(
+            item[0].get("plot_family") or item[0]["label"]
+        ),
+    ):
+        label = multirun_display_label(near.get("plot_family") or near["label"])
         axis.hist(
             decoded,
             bins=bins,
