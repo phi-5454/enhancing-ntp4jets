@@ -62,6 +62,20 @@ def test_compression_ratio_uses_40_bit_payload_denominator():
     assert "plot_metrics/compression_ratio" not in records[0]
 
 
+def test_compression_ratio_plot_has_room_for_full_axis_label():
+    figure = _compression_ratio_figure(
+        [
+            {
+                "label": "VQ STE",
+                "metrics/rate/marginal_bits_per_input_particle": 10.0,
+                "plot_metrics/reco_mse_total": 0.1,
+            }
+        ]
+    )
+
+    assert tuple(figure.get_size_inches()) == (9.5, 6.0)
+
+
 def test_compression_ratio_plot_is_linear_without_payload_reference_line():
     figure = _compression_ratio_figure(
         [
