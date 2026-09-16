@@ -289,8 +289,33 @@ def _phaedra_architecture_rank(series_name: str) -> int | None:
 def multirun_display_label(series_name: str) -> str:
     """Return the presentation label for a multirun model family."""
     label = str(series_name)
-    if _phaedra_architecture_rank(label) is not None and not label.startswith("(PHAEDRA)"):
-        return f"(PHAEDRA) {label}"
+    rank = _phaedra_architecture_rank(label)
+    if rank is not None and not label.startswith("(PHAEDRA)"):
+        normalized = label.replace("α", "alpha")
+        gain = next(
+            (value for value in ("128", "64", "32") if f"alpha={value}" in normalized),
+            "?",
+        )
+        total_size_suffix = ""
+        if label.endswith(")") and " (" in label:
+            candidate = label[label.rfind(" (") :]
+            if candidate[2:-1].isdigit():
+                total_size_suffix = candidate
+        if rank == 0:
+            shape_scan = (
+                "VQ (shape): [4] → [8] → [16] → [32]\n"
+                "→ [64] → [128] → [256] → [512]"
+            )
+        else:
+            shape_scan = (
+                "FSQ (shape): [3] → [3,2] → [3,3] → [3,3,2]\n"
+                "→ [5,3,2] → [5,4,3] → [5,4,3,2]\n"
+                "→ [5,4,3,2,2]"
+            )
+        return (
+            f"(PHAEDRA) Split quantizer scan: [{gain}] (gain){total_size_suffix}\n"
+            f"{shape_scan}"
+        )
     return label
 
 

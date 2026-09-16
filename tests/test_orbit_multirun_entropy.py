@@ -302,8 +302,17 @@ def test_phaedra_split_architectures_are_prefixed_and_stacked():
     ordered = sorted(families, key=multirun_legend_sort_key)
 
     assert ordered[:2] == ["VQ μ + FSQ α=32", "FSQ μ + α=64"]
-    assert multirun_display_label(ordered[0]) == "(PHAEDRA) VQ μ + FSQ α=32"
-    assert multirun_display_label(ordered[1]) == "(PHAEDRA) FSQ μ + α=64"
+    assert multirun_display_label(ordered[0]) == (
+        "(PHAEDRA) Split quantizer scan: [32] (gain)\n"
+        "VQ (shape): [4] → [8] → [16] → [32]\n"
+        "→ [64] → [128] → [256] → [512]"
+    )
+    assert multirun_display_label(ordered[1]) == (
+        "(PHAEDRA) Split quantizer scan: [64] (gain)\n"
+        "FSQ (shape): [3] → [3,2] → [3,3] → [3,3,2]\n"
+        "→ [5,3,2] → [5,4,3] → [5,4,3,2]\n"
+        "→ [5,4,3,2,2]"
+    )
 
     figure = plot_multirun_metric(
         [
@@ -317,9 +326,16 @@ def test_phaedra_split_architectures_are_prefixed_and_stacked():
     )
     legend_labels = [text.get_text() for text in figure.axes[0].legend().get_texts()]
     assert legend_labels[:2] == [
-        "(PHAEDRA) VQ μ + FSQ α=32",
-        "(PHAEDRA) FSQ μ + α=64",
+        multirun_display_label("VQ μ + FSQ α=32"),
+        multirun_display_label("FSQ μ + α=64"),
     ]
+
+
+def test_phaedra_near_codebook_label_keeps_representative_size():
+    label = multirun_display_label("FSQ μ + α=64 (3840)")
+
+    assert "[64] (gain) (3840)" in label
+    assert "FSQ (shape): [3] → [3,2]" in label
 
 
 def test_multirun_wandb_upload_uses_detected_credentials(monkeypatch, tmp_path):
