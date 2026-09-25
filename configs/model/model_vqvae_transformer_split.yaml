@@ -54,6 +54,10 @@ model_kwargs:
     fsq_mu_levels: [15, 15, 15]
     #fsq_mu_levels: [5, 4, 4, 3, 3, 3, 2, 2]
     fsq_alpha_levels: [1024]
+    # The reference mapping uses an asymmetric bound for even level counts and
+    # guarantees that token decoding reproduces the forward quantized latent.
+    # Old checkpoint configs without this field retain the legacy mapping.
+    fsq_mapping: reference
     # False: loss compares tanh(z) to rounded/normalized FSQ values.
     # True: loss compares tanh(z) * half_width to rounded scalar bins.
     fsq_loss_use_half_width: false
