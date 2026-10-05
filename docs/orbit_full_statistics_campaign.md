@@ -18,9 +18,9 @@ bundle: select one experiment config and run the standard training entrypoint.
   within each class. `DYJetsToLL` is not included in V+jets.
 - ggHbb contains only 2,098,560 held-out events, so all of those events are
   used rather than oversampling them to the ttbar test exposure.
-- The existing batch settings are retained. Full-500 VQ runs use physical
-  batch 16 with gradient accumulation 16; filtered-128 VQ runs use batch 256;
-  no campaign-specific batch-size increase is applied.
+- Full-500 and filtered-128 VQ runs both process each 256-event batch in one
+  forward/backward pass (`accumulate_grad_batches: 1`). This keeps all
+  batch-clocked model behavior independent of gradient micro-batching.
 - Neural runs see the complete 51,338,575-event training split each epoch, run
   for at most 30 epochs, and stop early after four validation epochs without
   improvement. Validation physics plots are produced every five epochs.

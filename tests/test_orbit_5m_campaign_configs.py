@@ -83,6 +83,8 @@ def test_5m_campaign_preserves_model_and_selection_variants(monkeypatch):
         else:
             assert cfg.data.sequence_type == "particle_full"
             assert cfg.data.max_sequence_length == 500
+            assert cfg.data.batch_size == 256
+            assert cfg.trainer.accumulate_grad_batches == 1
 
     vq8192 = configs["orbit_campaign_full500_sm_vq8192_5m"]
     vq4096 = configs["orbit_campaign_full500_sm_vq4096_5m"]
