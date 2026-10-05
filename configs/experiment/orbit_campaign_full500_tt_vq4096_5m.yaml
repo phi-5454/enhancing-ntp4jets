@@ -6,7 +6,7 @@ defaults:
 
 project_name: orbit-campaign-5m-full500-tt-vq4096
 task_name: orbit_campaign_full500_tt_vq4096_5m
-tags: [orbit, campaign, 5m, tt, particle-full, vq-ste, codes-4096]
+tags: [orbit, campaign, 5m, tt, particle-full, vq-ste, codes-4096, alpha-10, lr-1e-4, constant-lr]
 
 data:
   train_event_budget: 5000000
@@ -20,3 +20,10 @@ data:
     tt_hadronic: 416164
     tt_leptonic: 416943
     tt_semileptonic: 416893
+
+model:
+  model_kwargs:
+    alpha: 10
+  optimizer:
+    lr: 1e-4
+  scheduler: null

@@ -52,6 +52,11 @@ the original 4:1 train/validation ratio. The test-suite definitions and budgets
 are unchanged, so the 5M and full-statistics checkpoints are evaluated on the
 same ttbar, SM-mixture, ggHbb, and minimum-bias samples.
 
+All seven neural variants explicitly use reconstruction-loss weight
+`alpha: 10` and a constant AdamW learning rate of `1e-4` (`scheduler: null`).
+The FAISS variant has no optimizer, learning rate, or reconstruction-loss
+weight.
+
 The variants are:
 
 1. `orbit_campaign_full500_tt_vq4096_5m`

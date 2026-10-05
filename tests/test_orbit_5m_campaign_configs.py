@@ -21,6 +21,7 @@ TT_EXPERIMENTS = {
     "orbit_campaign_full500_tt_vq4096_5m",
     "orbit_campaign_puppi128_tt_vq4096_5m",
 }
+FAISS_EXPERIMENT = "orbit_campaign_full500_sm_faiss4096_5m"
 
 
 def test_all_5m_campaign_configs_compose(monkeypatch):
@@ -50,6 +51,14 @@ def test_all_5m_campaign_configs_compose(monkeypatch):
             assert cfg.data.test_suites.sm_mixture.event_budget == 16_073_004
             assert cfg.data.test_suites.gghbb.event_budget == 2_098_560
             assert cfg.data.test_suites.minbias.event_budget == 16_073_004
+
+            if experiment != FAISS_EXPERIMENT:
+                assert cfg.model.model_kwargs.alpha == 10
+                assert cfg.model.optimizer.lr == 1e-4
+                assert cfg.model.scheduler is None
+                assert "alpha-10" in cfg.tags
+                assert "lr-1e-4" in cfg.tags
+                assert "constant-lr" in cfg.tags
 
             if experiment in TT_EXPERIMENTS:
                 assert sum(cfg.data.train_event_quotas.values()) == 5_000_000
