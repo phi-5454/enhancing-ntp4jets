@@ -44,6 +44,31 @@ The ttbar-only runs use every physically available event. Their explicit
 per-process quotas preserve the tiny natural imbalance among hadronic,
 leptonic, and semileptonic decays rather than dropping or duplicating events.
 
+## Five-million-event variants
+
+A parallel set of eight configs appends `_5m` to each experiment name. These
+configs use 5,000,000 training events and 1,250,000 validation events, retaining
+the original 4:1 train/validation ratio. The test-suite definitions and budgets
+are unchanged, so the 5M and full-statistics checkpoints are evaluated on the
+same ttbar, SM-mixture, ggHbb, and minimum-bias samples.
+
+The variants are:
+
+1. `orbit_campaign_full500_tt_vq4096_5m`
+2. `orbit_campaign_full500_sm_vq4096_5m`
+3. `orbit_campaign_full500_sm_pidweighted_vq4096_5m`
+4. `orbit_campaign_puppi128_sm_vq4096_5m`
+5. `orbit_campaign_puppi128_tt_vq4096_5m`
+6. `orbit_campaign_puppi128_sm_pidweighted_vq4096_5m`
+7. `orbit_campaign_full500_sm_vq8192_5m`
+8. `orbit_campaign_full500_sm_faiss4096_5m`
+
+The two ttbar-trained variants use proportional per-decay-mode quotas that sum
+exactly to the 5M/1.25M budgets. The SM variants retain the same five-way
+top-level balancing. The FAISS variant remains deliberately different: its
+centroids are fitted on the same balanced 10-million-particle reservoir as the
+full-statistics FAISS run, rather than on five million training events.
+
 ## Implemented model matrix
 
 1. `orbit_campaign_full500_tt_vq4096`: VQ-STE, 4096 codes, leading-500
@@ -83,6 +108,9 @@ python gabbro/train.py \
 For model configurations 1--7, this command trains and validates only. It does
 not start the large test pass. Replace the experiment name with any of the
 seven neural configurations above.
+
+Select the corresponding `_5m` experiment name to run the reduced-exposure
+campaign; no preparation step or alternate entrypoint is required.
 
 The FAISS configuration is its fitting job:
 
