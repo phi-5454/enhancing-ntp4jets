@@ -345,6 +345,7 @@ MINBIAS_PHYSICAL_FEATURE_RANGES = {
 ENERGY_RANGE = (0.0, 2_500.0)
 ENERGY_RESIDUAL_RANGE = (-50.0, 50.0)
 MISSING_ET_RANGE = (0.0, 1_000.0)
+MISSING_ET_RESIDUAL_RANGE = (-200.0, 200.0)
 JET_MASS_RANGE = (0.0, 1_800.0)
 JET_MASS_RESIDUAL_RANGE = (-50.0, 50.0)
 TAU32_RESIDUAL_RANGE = (-0.4, 0.4)
@@ -1219,6 +1220,12 @@ def collect_physical_reconstruction_histograms(
             missing_et_bins,
         )
         histograms["missing_et_bins"] = missing_et_bins
+        missing_et_diff_bins = _linear_bins(MISSING_ET_RESIDUAL_RANGE, 50)
+        histograms["missing_et_diff_counts"] = _safe_density_hist(
+            reco_missing_ets - true_missing_ets,
+            missing_et_diff_bins,
+        )
+        histograms["missing_et_diff_bins"] = missing_et_diff_bins
 
     if data_level == "particle" and len(true_jet_masses) > 0:
         true_jet_masses = np.asarray(true_jet_masses)

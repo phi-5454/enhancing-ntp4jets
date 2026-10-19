@@ -1064,6 +1064,13 @@ response plot shows the fitted decoded-to-original peak ratio,
 $\mu_{\mathrm{decoded}}/\mu_{\mathrm{original}}$, against the marginal
 compressed rate normalized to the 40-bit common particle payload.
 
+The newer LaTeX-ready writeup collection extends this workflow with ratio
+panels, PDF output, the eight-run 5M ablation table, downstream Higgs/tau32/jet
+plots, and a generated model-provenance index. It remains CLI- and cache-driven
+rather than introducing a plotting YAML. See
+[`docs/orbit_writeup_plots.md`](docs/orbit_writeup_plots.md) for cache and
+rendering commands.
+
 For PID-enabled tokenizers, evaluate the dimuon response on leptonic ZZ events
 using the leading reconstructed muon and antimuon in each representation. The
 ZZ manifest below is the default and may be omitted:
