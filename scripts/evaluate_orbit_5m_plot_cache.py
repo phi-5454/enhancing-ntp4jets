@@ -79,8 +79,8 @@ def load_exported_config(path: Path):
 def load_registry(path: Path, selection: str):
     rows = yaml.safe_load(path.read_text())["models"]
     selected = [row for row in rows if row["selection"] == selection]
-    if len(rows) != 8 or not selected or len({row["id"] for row in rows}) != 8:
-        raise ValueError("The campaign registry must contain eight unique models")
+    if not selected or len({row["id"] for row in rows}) != len(rows):
+        raise ValueError("The model registry must contain unique IDs and a selected model")
     return selected
 
 
@@ -89,8 +89,15 @@ def load_model(spec, device):
     if not config_path.is_file():
         raise FileNotFoundError(config_path)
     cfg = load_exported_config(config_path)
-    if int(cfg.data.max_sequence_length) != (500 if spec["selection"] == "full500" else 128):
+    configured_length = cfg.data.get("max_sequence_length")
+    resolved_length = (
+        SEQUENCE_SCHEMAS[str(cfg.data.sequence_type)]["max_sequence_length"]
+        if configured_length is None
+        else int(configured_length)
+    )
+    if resolved_length != (500 if spec["selection"] == "full500" else 128):
         raise ValueError(f"Selection/config mismatch for {spec['id']}")
+    cfg.data.max_sequence_length = resolved_length
     model = instantiate(cfg.model)
     if spec["quantizer"] == "FAISS k-means":
         codebook = Path(spec["codebook"])

@@ -7,8 +7,9 @@ import pytest
 
 pytest.importorskip("mplhep")
 
-from scripts.build_orbit_writeup_plots import (
+from gabbro.plotting.writeup.summary import (
     _safe_ratio,
+    add_writeup_header,
     missing_golden_metric_records,
     plot_golden_summary,
     plot_jet_residuals,
@@ -19,6 +20,7 @@ from scripts.build_orbit_writeup_plots import (
     select_vq_ste_size_records,
 )
 from scripts.evaluate_orbit_jet_residuals import split_quota, wrapped_delta_phi
+from scripts.render_orbit_writeup import config_to_argv, run_all
 
 
 def test_safe_ratio_masks_empty_reference_bins():
@@ -35,6 +37,65 @@ def test_wrapped_delta_phi_crosses_branch_cut():
 def test_balanced_quota_preserves_total():
     assert split_quota(10_000, 3) == [3334, 3333, 3333]
     assert sum(split_quota(10_000, 21)) == 10_000
+
+
+def test_unified_config_converts_repeated_and_boolean_options(monkeypatch):
+    monkeypatch.setenv("ORBIT_TEST_ROOT", "/tmp/orbit")
+    assert config_to_argv(
+        {
+            "campaign_summary_root": ["${ORBIT_TEST_ROOT}/one", "/tmp/two"],
+            "allow_incomplete": True,
+            "unused": None,
+        }
+    ) == [
+        "--campaign-summary-root",
+        "/tmp/orbit/one",
+        "--campaign-summary-root",
+        "/tmp/two",
+        "--allow-incomplete",
+    ]
+
+
+def test_unified_all_runs_in_dependency_order(tmp_path, monkeypatch):
+    config = tmp_path / "writeup.yaml"
+    config.write_text(
+        "training_scale:\n"
+        "  - output_dir: /tmp/scale-one\n"
+        "  - output_dir: /tmp/scale-two\n"
+        "summary:\n"
+        "  output_dir: /tmp/summary\n"
+        "model_comparison:\n"
+        "  output_dir: /tmp/comparison\n"
+    )
+    calls = []
+
+    from scripts import render_orbit_writeup as renderer
+
+    monkeypatch.setattr(renderer.training_scale, "parse_args", lambda argv: None)
+    monkeypatch.setattr(renderer.summary, "parse_args", lambda argv: None)
+    monkeypatch.setattr(renderer.model_comparison, "parse_args", lambda argv: None)
+    monkeypatch.setattr(
+        renderer.training_scale,
+        "main",
+        lambda argv: calls.append(("training-scale", argv)),
+    )
+    monkeypatch.setattr(
+        renderer.summary, "main", lambda argv: calls.append(("summary", argv))
+    )
+    monkeypatch.setattr(
+        renderer.model_comparison,
+        "main",
+        lambda argv: calls.append(("model-comparison", argv)),
+    )
+
+    run_all(["--config", str(config)])
+
+    assert [name for name, _ in calls] == [
+        "training-scale",
+        "training-scale",
+        "summary",
+        "model-comparison",
+    ]
 
 
 def test_vq_sweep_requires_all_eight_histogram_caches():
@@ -55,9 +116,9 @@ def test_golden_summary_reports_unplottable_rows():
         "metrics/rate/marginal_bits_per_input_particle": 7.0,
     }
     assert missing_golden_metric_records([complete]) == []
-    assert missing_golden_metric_records([complete, {"label": "missing"}]) == [
-        "missing"
-    ]
+    assert missing_golden_metric_records(
+        [complete, {"plot_family": "VQ STE", "total_codebook_size": 256}]
+    ) == ["VQ STE, 256 codes"]
 
 
 def test_pid_confusion_recomputes_row_normalization(tmp_path):
@@ -67,6 +128,18 @@ def test_pid_confusion_recomputes_row_normalization(tmp_path):
     assert np.array_equal(counts, [[3, 1], [0, 2]])
     assert np.allclose(normalized.sum(axis=1), 1)
     assert figure._suptitle is None
+
+
+def test_pid_confusion_accepts_durable_count_cache(tmp_path):
+    path = tmp_path / "pid.npz"
+    counts = np.eye(8, dtype=np.int64)
+    counts[6, 6] = 3
+    counts[6, 7] = 1
+    np.savez_compressed(path, counts=counts)
+    _, loaded, normalized = plot_pid_confusion(path)
+    assert np.array_equal(loaded, counts)
+    assert normalized[6, 6] == pytest.approx(0.75)
+    assert normalized[6, 7] == pytest.approx(0.25)
 
 
 def test_jet_residual_plot_is_title_free(tmp_path):
@@ -174,7 +247,22 @@ def test_vq_feature_sweep_uses_compact_legend_and_residual_row(tmp_path):
     figure = plot_vq_size_feature_sweep(records)
     legend = figure.axes[0].get_legend()
     assert max(text.get_fontsize() for text in legend.get_texts()) <= 14
-    assert figure.axes[2].get_subplotspec().get_gridspec().get_height_ratios() == [
+    assert figure.axes[2].get_subplotspec().get_gridspec().get_height_ratios() == (
         1.45,
         0.9,
-    ]
+    )
+
+    top_axes = (figure.axes[0], figure.axes[3], figure.axes[6])
+    add_writeup_header(
+        figure,
+        top_axes,
+        training_text=r"$t\bar{t}$ (200k)",
+        test_text=r"$t\bar{t}$ (10k)",
+        selection_text=r"Pileup-subtracted  |  $w_{\mathrm{PUPPI}}>0.05$  |  $N_{\max}=128$",
+    )
+    figure.canvas.draw()
+    panel_tops = [axis.get_position().y1 for axis in top_axes]
+    assert max(panel_tops) - min(panel_tops) < 1e-3
+    assert all("CMS" not in text.get_text() for text in figure.texts)
+    assert all("Simulation" not in text.get_text() for text in figure.texts)
+    assert all("TeV" not in text.get_text() for text in figure.texts)

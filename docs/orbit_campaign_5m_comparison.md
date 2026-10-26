@@ -1,4 +1,4 @@
-# Joint 5M campaign comparison
+# Joint 5M model comparison
 
 The workflow is restartable: each model writes an independent NPZ and JSON
 under `/eos/user/y/yelberke/enhancing_ntp4jets_runs/writeup_cache/campaign_5m_comparison`.
@@ -33,6 +33,6 @@ condor_submit_dag condor/orbit_campaign_5m_comparison.dag.rescue001
 ```
 
 The final renderer writes
-`/eos/user/y/yelberke/enhancing_ntp4jets_runs/writeup_plots/campaign_5m_comparison`.
+`/eos/user/y/yelberke/enhancing_ntp4jets_runs/writeup_plots/model_comparisons_5m`.
 AK4 residual jets use minimum-total-delta-R Hungarian assignment with no
 maximum-delta-R rejection.

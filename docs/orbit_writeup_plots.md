@@ -1,9 +1,16 @@
 # ORBIT writeup plots
 
-`scripts/build_orbit_writeup_plots.py` is a cache-only renderer for the
-LaTeX-ready plot collection. It does not use a plotting YAML and never launches
-inference. Model evaluation and rendering remain separate so labels, bins,
-layouts, and styles can be changed without repeating GPU work.
+`scripts/render_orbit_writeup.py` is the single cache-only entrypoint for the
+LaTeX-ready plot collection. It never launches inference. Model evaluation and
+rendering remain separate so labels, bins, layouts, and styles can be changed
+without repeating GPU work.
+
+Its commands are named for the products they create:
+
+- `summary`: golden, ablation, and single-model downstream products;
+- `model-comparison`: the joint eight-model 5M comparison;
+- `training-scale`: one matched 200k-versus-5M comparison; and
+- `all`: every collection declared in one YAML file.
 
 Every figure is written as PDF and 300-dpi PNG without a main title. The output
 also contains CSV/JSON/LaTeX tables, numerical NPZ caches, a linked README, and
@@ -61,14 +68,36 @@ python scripts/evaluate_orbit_met.py \
   --output-dir "$CACHE_DIR/met" --events 10000 --device cuda
 ```
 
-For the canonical ttbar VQ-STE 4096 PID panels, run the PID evaluator on its
+For the 200k-event ttbar VQ-STE 4096 PID panels, run the PID evaluator on its
 exact golden checkpoint and the established ttbar test manifest. The resulting
 NPZ supplies both residuals and the confusion matrix.
+
+The joint 5M model comparison reads one raw 8-by-8 PID confusion matrix per
+model and test suite. The full-500 matrices are retained from the original full
+test evaluations. The filtered 128-particle matrices can be reproduced without
+running the slower jet and residual evaluations:
+
+```bash
+python scripts/evaluate_orbit_pid_confusion.py \
+  --registry campaigns/orbit_campaign_5m_plot_models.yaml \
+  --manifest-dir "$ORBIT_MANIFEST_DIR" \
+  --output-dir "$LOG_DIR/writeup_cache/campaign_5m_comparison/pid_confusion_sources" \
+  --model-id puppi128_tt_vq4096 \
+  --model-id puppi128_sm_vq4096 \
+  --model-id puppi128_sm_pidweighted_vq4096 \
+  --suite ttbar --suite sm_mixture --suite gghbb --suite minbias \
+  --events 10000 --batch-size 256 --device cuda
+```
+
+The comparison renderer writes row-normalized, paper-style comparisons to
+`$LOG_DIR/writeup_plots/model_comparisons_5m/pid_confusion/{full500,puppi128}`.
+Every PNG/PDF has a matching NPZ containing both the integer counts and plotted
+fractions, plus a JSON sidecar with its exact source files and event count.
 
 ## Rendering
 
 ```bash
-python scripts/build_orbit_writeup_plots.py \
+python scripts/render_orbit_writeup.py summary \
   --golden-manifest "$GOLDEN_MANIFEST" \
   --campaign-summary-root "$CAMPAIGN_WANDB_MIRROR" \
   --campaign-summary-root "$CAMPAIGN_7_8_RUN_ROOT" \
@@ -87,3 +116,42 @@ python scripts/build_orbit_writeup_plots.py \
 By default, missing inputs make the renderer fail after it writes the status
 README. During plot development, `--allow-incomplete` renders every available
 product and records missing inputs under **Pending inputs**.
+
+## Full-500 training-scale comparison
+
+The particle-residual and rate--distortion comparison uses the 5M-event,
+ttbar-trained VQ-STE model at 4096 codes. Its lower-statistics reference is the
+ttbar **full-event** sweep (200k training events, leading 500
+particles, no PUPPIW cut), not the filtered 128-particle golden sweep. The
+renderer rejects non-ttbar training samples as well as mismatched selections,
+exposures, and codebook sizes.
+
+```bash
+python scripts/render_orbit_writeup.py training-scale \
+  --canonical-manifest "$LOG_DIR/comparisons/canonical_tt_full500_vq_ste_training_like_all/manifest.json" \
+  --campaign-residual-cache "$LOG_DIR/plotting_ckpts/full500-tt-vq4096-evaluation/ttbar/saved_histograms/test_ttbar_all_orbit_hists_step_0.npz" \
+  --campaign-4096-metrics "$LOG_DIR/plotting_ckpts/full500-tt-vq4096-evaluation/ttbar/saved_metrics/test_ttbar_all_orbit_metrics_step_0.json" \
+  --campaign-4096-config "$LOG_DIR/orbit_campaign_5m_wandb_test_imports/orbit_campaign_full500_tt_vq4096_5m/ttbar_v0pvksvj/config.yaml" \
+  --output-dir "$LOG_DIR/writeup_plots/comparisons/ttbar_full500_5m_vs_200k"
+```
+
+The 200k-reference 8192-code test artifact is currently missing, so its reference
+curve contains the other seven codebook sizes. No SM-trained point is inserted
+to fill that gap. This omission is recorded in `comparison_values.json` rather
+than being interpolated.
+
+## Render every writeup product
+
+The complete renderer runs training-scale comparisons first because the summary
+and joint comparison collections index or copy those products. Copy the example
+configuration, export or replace the paths it references, and run:
+
+```bash
+cp campaigns/orbit_writeup_render.example.yaml /tmp/orbit_writeup_render.yaml
+python scripts/render_orbit_writeup.py all \
+  --config /tmp/orbit_writeup_render.yaml
+```
+
+The YAML uses the same option names as the focused subcommands, with underscores
+in place of dashes. Undefined environment variables are rejected before any
+rendering starts.

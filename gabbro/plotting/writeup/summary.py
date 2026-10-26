@@ -21,7 +21,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -164,7 +164,7 @@ CAMPAIGN_MODELS = (
 )
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--golden-manifest", type=Path, required=True)
     parser.add_argument("--campaign-summary-root", type=Path, action="append", default=[])
@@ -189,12 +189,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--met-run-dir",
         type=Path,
-        help="Run directory for the SM-mixture VQ-STE 8192 MET model.",
+        help="Run directory for the SM-mixture VQ-STE model used by the MET cache.",
     )
     parser.add_argument("--jet-residual-cache", type=Path)
     parser.add_argument("--sm-pid-residuals", type=Path)
+    parser.add_argument(
+        "--comparison-dir",
+        type=Path,
+        help="Optional directory containing the 5M-versus-200k comparison products.",
+    )
     parser.add_argument("--allow-incomplete", action="store_true")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def load_records(path: Path) -> list[dict[str, Any]]:
@@ -215,6 +220,48 @@ def save_figure(figure, stem: Path) -> list[Path]:
     return outputs
 
 
+def add_writeup_header(
+    figure,
+    top_axes,
+    *,
+    training_text: str,
+    test_text: str,
+    selection_text: str,
+) -> None:
+    """Add writeup metadata without allowing labels to stagger the panels.
+
+    Axis-attached experiment labels participate in constrained layout.  On a
+    multi-column figure this can move only the labelled axes downward.  Reserve
+    one figure-level band instead, then anchor all header text to the already
+    aligned top-row axes.
+    """
+    axes = list(top_axes)
+    if not axes:
+        raise ValueError("top_axes must contain at least one axis")
+    layout_engine = figure.get_layout_engine()
+    if layout_engine is not None and hasattr(layout_engine, "set"):
+        layout_engine.set(rect=(0.0, 0.0, 1.0, 0.91))
+    figure.canvas.draw()
+
+    last = axes[-1].get_position()
+    figure.text(
+        last.x1,
+        0.985,
+        f"Train: {training_text}  |  Test: {test_text}",
+        ha="right",
+        va="top",
+        fontsize=13,
+    )
+    figure.text(
+        last.x1,
+        0.958,
+        selection_text,
+        ha="right",
+        va="top",
+        fontsize=13,
+    )
+
+
 def _finite(value: Any) -> float | None:
     try:
         result = float(value)
@@ -233,18 +280,21 @@ def _family_series(records: list[dict[str, Any]], x_key: str, y_key: str):
 
 
 def missing_golden_metric_records(records: list[dict[str, Any]]) -> list[str]:
-    """Return labels that cannot appear in every panel of the golden summary."""
+    """Return scientific descriptions that cannot appear in every summary panel."""
     required = (
         "total_codebook_size",
         "plot_metrics/reco_mse_total",
         "metrics/utilization_total",
         "metrics/rate/marginal_bits_per_input_particle",
     )
-    return [
-        str(record.get("label", record.get("job", "unknown")))
-        for record in records
-        if any(_finite(record.get(key)) is None for key in required)
-    ]
+    missing = []
+    for record in records:
+        if not any(_finite(record.get(key)) is None for key in required):
+            continue
+        family = str(record.get("plot_family") or "unknown quantizer")
+        size = record.get("total_codebook_size")
+        missing.append(f"{family}, {size} codes" if size is not None else family)
+    return missing
 
 
 def plot_golden_summary(records: list[dict[str, Any]]):
@@ -436,10 +486,15 @@ def plot_vq_size_feature_sweep(
 def plot_pid_confusion(path: Path):
     if path.suffix == ".npz":
         payload = _load_npz(path)
-        original_pid = np.asarray(payload["original_pid"], dtype=int)
-        decoded_pid = np.asarray(payload["decoded_pid"], dtype=int)
-        counts = np.zeros((len(PID_CLASS_NAMES), len(PID_CLASS_NAMES)), dtype=np.int64)
-        np.add.at(counts, (original_pid, decoded_pid), 1)
+        if "counts" in payload:
+            counts = np.asarray(payload["counts"], dtype=np.int64)
+        else:
+            original_pid = np.asarray(payload["original_pid"], dtype=int)
+            decoded_pid = np.asarray(payload["decoded_pid"], dtype=int)
+            counts = np.zeros(
+                (len(PID_CLASS_NAMES), len(PID_CLASS_NAMES)), dtype=np.int64
+            )
+            np.add.at(counts, (original_pid, decoded_pid), 1)
         labels = list(PID_DISPLAY_LABELS)
     else:
         payload = json.loads(path.read_text())
@@ -649,7 +704,7 @@ def plot_higgs(cache: Path):
     saved = {}
     for index, (orig_key, reco_key, bins, label, log_y) in enumerate((
         ("n_jets_original", "n_jets_decoded", np.arange(-0.5, max_jets + 1.5), r"Number of AK4 jets ($p_T\geq30$ GeV)", True),
-        ("resolved_original", "resolved_decoded", np.arange(40.0, 405.0, 5.0), r"Leading-dijet mass [GeV]", False),
+        ("resolved_original", "resolved_decoded", np.arange(40.0, 405.0, 5.0), r"Higgs candidate (dijet) mass [GeV]", False),
     )):
         grid = outer[index].subgridspec(2, 1, height_ratios=(3.2, 1), hspace=0.04)
         axis = figure.add_subplot(grid[0])
@@ -749,7 +804,7 @@ def plot_met(cache: Path):
     axis.legend(fontsize=LEGEND_FONT_SIZE, frameon=False)
     ratio_axis.axhline(1.0, color="black", linestyle="--", linewidth=1)
     ratio_axis.set(
-        xlabel=r"$p_{\mathrm{T}}^{\mathrm{miss}}$ [GeV]",
+        xlabel=r"Missing transverse energy [GeV]",
         ylabel="Dec./orig.",
         xlim=(0.0, 600.0),
         ylim=(0.8, 1.2),
@@ -763,10 +818,7 @@ def plot_met(cache: Path):
     )
     residual_axis.axvline(0.0, color="black", linestyle="--", linewidth=1)
     residual_axis.set(
-        xlabel=(
-            r"$p_{\mathrm{T,dec.}}^{\mathrm{miss}}"
-            r"\,-\,p_{\mathrm{T,orig.}}^{\mathrm{miss}}$ [GeV]"
-        ),
+        xlabel="Decoded − original\nmissing transverse energy [GeV]",
         ylabel="Normalized density",
         xlim=(-200.0, 200.0),
         yscale="log",
@@ -839,7 +891,7 @@ def validate_downstream_run(run_dir: Path) -> dict[str, Any]:
     if max_length != 500 or sequence_type != "particle_full" or registered is None:
         raise ValueError(
             "Downstream model must be a registered unweighted, full-500, "
-            "SM-mixture-trained VQ-STE campaign model"
+            "SM-mixture-trained VQ-STE model"
         )
     return {
         **registered,
@@ -914,8 +966,8 @@ def write_readme(output_dir: Path, products: list[dict[str, Any]], missing: list
     (output_dir / "README.md").write_text("\n".join(lines) + "\n")
 
 
-def main() -> None:
-    args = parse_args()
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     records = load_records(args.golden_manifest.resolve())
     if len(records) != 46:
@@ -924,7 +976,7 @@ def main() -> None:
     provenance: list[dict[str, Any]] = []
     missing: list[str] = []
 
-    golden_dir = args.output_dir / "canonical_tt128"
+    golden_dir = args.output_dir / "ttbar_puppi128"
     paths = save_figure(plot_golden_summary(records), golden_dir / "golden_summary")
     copied_manifest = golden_dir / "manifest.json"
     if args.golden_manifest.resolve() != copied_manifest.resolve():
@@ -936,7 +988,7 @@ def main() -> None:
             "golden summary metrics for: " + ", ".join(absent_golden_metrics)
         )
     for row in records:
-        provenance.append(_provenance_row("canonical_tt128/golden_summary", {"experiment": row.get("label"), "wandb_train_id": row.get("job"), "quantizer": row.get("plot_family"), "codebook_size": row.get("total_codebook_size"), "selection": "PUPPIW > 0.05, leading 128", "training_sample": "ttbar"}, test_sample="ttbar", events=10000))
+        provenance.append(_provenance_row("ttbar_puppi128/golden_summary", {"experiment": row.get("label"), "wandb_train_id": row.get("job"), "quantizer": row.get("plot_family"), "codebook_size": row.get("total_codebook_size"), "selection": "PUPPIW > 0.05, leading 128", "training_sample": "ttbar"}, test_sample="ttbar", events=10000))
 
     try:
         sweep_records = select_vq_ste_size_records(
@@ -958,7 +1010,7 @@ def main() -> None:
         np.savez_compressed(sweep_cache, **sweep_values)
         products.append({"label": "VQ-STE feature and residual size sweep", "paths": paths + [sweep_cache]})
         for row in sweep_records:
-            provenance.append(_provenance_row("canonical_tt128/vq_ste_feature_size_sweep", {"experiment": row["label"], "wandb_train_id": row.get("job"), "quantizer": "VQ-STE", "codebook_size": row["total_codebook_size"], "selection": "PUPPIW > 0.05, leading 128", "training_sample": "ttbar"}, test_sample="ttbar", events=10000))
+            provenance.append(_provenance_row("ttbar_puppi128/vq_ste_feature_size_sweep", {"experiment": row["label"], "wandb_train_id": row.get("job"), "quantizer": "VQ-STE", "codebook_size": row["total_codebook_size"], "selection": "PUPPIW > 0.05, leading 128", "training_sample": "ttbar"}, test_sample="ttbar", events=10000))
         missing_sizes = sorted(
             set(VQ_STE_SIZES)
             - {int(row["total_codebook_size"]) for row in sweep_records}
@@ -977,7 +1029,7 @@ def main() -> None:
     ]
     golden_4096 = golden_4096_records[0] if len(golden_4096_records) == 1 else {}
     golden_4096_model = {
-        "experiment": golden_4096.get("label", "canonical tt VQ-STE 4096"),
+        "experiment": golden_4096.get("label", "ttbar VQ-STE 4096"),
         "wandb_train_id": golden_4096.get("job"),
         "checkpoint": str(Path(golden_4096["run_dir"]) / "checkpoints/best.ckpt")
         if golden_4096.get("run_dir")
@@ -992,7 +1044,7 @@ def main() -> None:
         paths = save_figure(figure, golden_dir / "vq_ste_4096_pid_confusion")
         np.savez_compressed(golden_dir / "vq_ste_4096_pid_confusion.npz", counts=counts, row_normalized=normalized)
         products.append({"label": "VQ-STE 4096 PID confusion", "paths": paths + [golden_dir / "vq_ste_4096_pid_confusion.npz"]})
-        provenance.append(_provenance_row("canonical_tt128/vq_ste_4096_pid_confusion", golden_4096_model, test_sample="ttbar", events=10000))
+        provenance.append(_provenance_row("ttbar_puppi128/vq_ste_4096_pid_confusion", golden_4096_model, test_sample="ttbar", events=10000))
     else:
         missing.append("ttbar VQ-STE 4096 PID confusion JSON (--golden-pid-confusion)")
     if args.golden_pid_residuals and args.golden_pid_residuals.is_file():
@@ -1000,25 +1052,27 @@ def main() -> None:
         copied = golden_dir / "vq_ste_4096_pid_residual_values.npz"
         shutil.copy2(args.golden_pid_residuals, copied)
         products.append({"label": "VQ-STE 4096 PID-conditioned residuals", "paths": paths + [copied]})
-        provenance.append(_provenance_row("canonical_tt128/vq_ste_4096_pid_residuals", golden_4096_model, test_sample="ttbar", events=10000))
+        provenance.append(_provenance_row("ttbar_puppi128/vq_ste_4096_pid_residuals", golden_4096_model, test_sample="ttbar", events=10000))
     else:
         missing.append("ttbar VQ-STE 4096 PID residual NPZ (--golden-pid-residuals)")
 
-    campaign_dir = args.output_dir / "campaign_5m"
+    models_dir = args.output_dir / "models_5m"
     metrics = discover_campaign_metrics(args.campaign_summary_root, _parse_explicit_metrics(args.campaign_metric))
-    ablation_rows = write_ablation_table(metrics, campaign_dir / "ablation")
-    table_paths = sorted((campaign_dir / "ablation").glob("particle_reconstruction_ablation.*"))
+    ablation_rows = write_ablation_table(metrics, models_dir / "ablation")
+    table_paths = sorted((models_dir / "ablation").glob("particle_reconstruction_ablation.*"))
     products.append({"label": "Eight-run particle reconstruction ablation", "paths": table_paths})
-    absent_metrics = [row["experiment"] for row in ablation_rows if row["reconstruction_mse"] is None]
+    absent_metrics = [
+        row["label"] for row in ablation_rows if row["reconstruction_mse"] is None
+    ]
     if absent_metrics:
         missing.append("SM-test MSE for: " + ", ".join(absent_metrics))
     for row in CAMPAIGN_MODELS:
-        provenance.append(_provenance_row("campaign_5m/ablation", row, test_sample="balanced SM mixture", events="complete suite"))
+        provenance.append(_provenance_row("models_5m/ablation", row, test_sample="balanced SM mixture", events="complete suite"))
 
     downstream = dict(CAMPAIGN_MODELS[1])
     if args.downstream_run_dir:
         downstream.update(validate_downstream_run(args.downstream_run_dir.resolve()))
-    downstream_dir = campaign_dir / "downstream" / f"vq_ste_{downstream['codebook_size']}_sm"
+    downstream_dir = models_dir / "downstream" / f"vq_ste_{downstream['codebook_size']}_sm"
     downstream_specs = (
         ("higgs", args.higgs_cache, plot_higgs, "higgs_njets_and_mass", "ggHbb", "anti-kt R=0.4, pT >= 30 GeV", "two leading-pT jets"),
         ("tau32", args.tau32_cache, plot_tau32, "tau32_njets_and_shape", "all-hadronic ttbar", "anti-kt R=0.8, pT >= 450 GeV", "Hungarian delta-R < 0.4"),
@@ -1030,7 +1084,7 @@ def main() -> None:
             copied = downstream_dir / f"{filename}_values.npz"
             np.savez_compressed(copied, **{key: value for key, value in values.items() if isinstance(value, np.ndarray)})
             products.append({"label": label, "paths": paths + [copied]})
-            provenance.append(_provenance_row(f"campaign_5m/downstream/{filename}", downstream, test_sample=test_sample, events=10000, jet_definition=jet_definition, matching=matching))
+            provenance.append(_provenance_row(f"models_5m/downstream/{filename}", downstream, test_sample=test_sample, events=10000, jet_definition=jet_definition, matching=matching))
         else:
             missing.append(
                 f"{label} cache (--{label.lower() if label != 'tau32' else 'tau32'}-cache)"
@@ -1044,22 +1098,20 @@ def main() -> None:
     )
     if args.met_run_dir:
         met_model.update(validate_downstream_run(args.met_run_dir.resolve()))
-        if met_model["codebook_size"] != 8192:
-            raise ValueError("--met-run-dir must use the registered 8192-code model")
-    met_dir = campaign_dir / "downstream" / "vq_ste_8192_sm"
+    met_dir = models_dir / "downstream" / f"vq_ste_{met_model['codebook_size']}_sm"
     if args.met_cache and args.met_cache.is_file():
         figure, values = plot_met(args.met_cache)
-        filename = "missing_transverse_momentum"
+        filename = "missing_transverse_energy"
         paths = save_figure(figure, met_dir / filename)
         copied = met_dir / f"{filename}_values.npz"
         np.savez_compressed(
             copied,
             **{key: value for key, value in values.items() if isinstance(value, np.ndarray)},
         )
-        products.append({"label": "MET", "paths": paths + [copied]})
+        products.append({"label": "Missing transverse energy", "paths": paths + [copied]})
         provenance.append(
             _provenance_row(
-                f"campaign_5m/downstream/{filename}",
+                f"models_5m/downstream/{filename}",
                 met_model,
                 test_sample="balanced SM mixture",
                 events=10000,
@@ -1075,7 +1127,7 @@ def main() -> None:
             figure, _ = plot_jet_residuals(args.jet_residual_cache, prefix)
             paths = save_figure(figure, downstream_dir / filename)
             products.append({"label": label, "paths": paths + [copied]})
-            provenance.append(_provenance_row(f"campaign_5m/downstream/{filename}", downstream, test_sample="balanced SM mixture", events=10000, jet_definition="anti-kt R=0.4, pT >= 30 GeV", matching="Hungarian delta-R < 0.2"))
+            provenance.append(_provenance_row(f"models_5m/downstream/{filename}", downstream, test_sample="balanced SM mixture", events=10000, jet_definition="anti-kt R=0.4, pT >= 30 GeV", matching="Hungarian delta-R < 0.2"))
     else:
         missing.append("SM-mixture jet-residual NPZ (--jet-residual-cache)")
     if args.sm_pid_residuals and args.sm_pid_residuals.is_file():
@@ -1083,9 +1135,24 @@ def main() -> None:
         copied = downstream_dir / "pid_residual_values.npz"
         shutil.copy2(args.sm_pid_residuals, copied)
         products.append({"label": "SM PID-conditioned residuals", "paths": paths + [copied]})
-        provenance.append(_provenance_row("campaign_5m/downstream/pid_residuals", downstream, test_sample="balanced SM mixture", events=10000))
+        provenance.append(_provenance_row("models_5m/downstream/pid_residuals", downstream, test_sample="balanced SM mixture", events=10000))
     else:
         missing.append("SM-mixture PID residual NPZ (--sm-pid-residuals)")
+
+    if args.comparison_dir:
+        # Keep the spelling supplied by the caller: EOS home paths may resolve
+        # through /eos/home-y while the collection is addressed via /eos/user/y.
+        comparison_dir = args.comparison_dir
+        comparison_specs = (
+            ("5M-versus-200k ttbar particle residual comparison", "particle_residuals_vq_ste_4096"),
+            ("5M-versus-200k ttbar MSE, utilization, and rate comparison", "vq_ste_training_scale_summary"),
+        )
+        for label, stem in comparison_specs:
+            paths = [comparison_dir / f"{stem}.{suffix}" for suffix in ("pdf", "png")]
+            if all(path.is_file() for path in paths):
+                products.append({"label": label, "paths": paths})
+            else:
+                missing.append(f"comparison products for {stem} (--comparison-dir)")
 
     write_model_index(provenance, args.output_dir)
     write_readme(args.output_dir, products, missing)
