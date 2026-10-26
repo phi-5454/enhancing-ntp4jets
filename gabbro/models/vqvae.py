@@ -18,7 +18,11 @@ from vqtorch.nn import VectorQuant
 from vqtorch.nn.utils import step_lru_replacement
 
 from gabbro.models.latent_sequence import DirectPrefixLatentMasker, LatentSequenceCompressor
-from gabbro.models.quantizers import SplitQuantizer, build_quantizer
+from gabbro.models.quantizers import (
+    ResidualVectorQuantizer,
+    SplitQuantizer,
+    build_quantizer,
+)
 from gabbro.models.transformer import MLP, NormformerStack, Transformer
 from gabbro.plotting.utils import set_mpl_style
 from gabbro.utils.arrays import (
@@ -1102,6 +1106,7 @@ class VQVAEMLP(torch.nn.Module):
         decoder_layers=None,
         vq_kwargs={},
         split_quantizer_cfg=None,
+        residual_quantizer_cfg=None,
         **kwargs,
     ):
         """Initializes the VQ-VAE model.
@@ -1132,6 +1137,7 @@ class VQVAEMLP(torch.nn.Module):
         super().__init__()
         self.vq_kwargs = vq_kwargs
         self.split_quantizer_cfg = split_quantizer_cfg
+        self.residual_quantizer_cfg = residual_quantizer_cfg
         self.embed_dim = latent_dim
         self.input_features_dict = input_features_dict
         if input_features_dict is not None:
@@ -1164,6 +1170,7 @@ class VQVAEMLP(torch.nn.Module):
             feature_size=self.embed_dim,
             vq_kwargs=vq_kwargs,
             split_quantizer_cfg=split_quantizer_cfg,
+            residual_quantizer_cfg=residual_quantizer_cfg,
         )
 
         # --- Decoder --- #
@@ -1205,6 +1212,32 @@ class VQVAEMLP(torch.nn.Module):
         """Quantize latent embeddings with single VectorQuant or split Phi/Psi quantization."""
         if isinstance(self.vqlayer, SplitQuantizer):
             return self.vqlayer(z_embed, mask=mask)
+        if isinstance(self.vqlayer, ResidualVectorQuantizer) and mask is not None:
+            mask_bool = mask.bool()
+            z_q = torch.zeros_like(z_embed)
+            q = torch.zeros(
+                *mask_bool.shape,
+                self.vqlayer.num_quantizers,
+                device=z_embed.device,
+                dtype=torch.long,
+            )
+            if not mask_bool.any():
+                zero = z_embed.new_zeros(())
+                return z_q, {
+                    "z": z_q,
+                    "z_q": z_q,
+                    "q": q,
+                    "stage_loss": z_embed.new_zeros(
+                        (*mask_bool.shape, self.vqlayer.num_quantizers)
+                    ),
+                    "loss": zero,
+                    "loss_weighted": zero,
+                }
+            z_valid = z_embed[mask_bool]
+            z_q_valid, vq_out = self.vqlayer(z_valid)
+            z_q[mask_bool] = z_q_valid
+            q[mask_bool] = vq_out["q"]
+            return z_q, {**vq_out, "z": z_embed, "z_q": z_q, "q": q}
         return self.vqlayer(z_embed)
 
 
@@ -1221,6 +1254,7 @@ class VQVAETransformer(torch.nn.Module):
         num_blocks: int = 2,
         vq_kwargs: dict = {},
         split_quantizer_cfg: dict = None,
+        residual_quantizer_cfg: dict = None,
         causal_decoder: bool = False,
         max_sequence_len: int = 128,
         input_features_dict: Dict[str, Any] = None,
@@ -1242,6 +1276,7 @@ class VQVAETransformer(torch.nn.Module):
 
         self.vq_kwargs = vq_kwargs
         self.split_quantizer_cfg = split_quantizer_cfg
+        self.residual_quantizer_cfg = residual_quantizer_cfg
         self.input_features_dict = input_features_dict
         if input_features_dict is not None:
             self.input_dim = len(self.input_features_dict)
@@ -1369,6 +1404,7 @@ class VQVAETransformer(torch.nn.Module):
                 feature_size=self.latent_dim,
                 vq_kwargs=vq_kwargs,
                 split_quantizer_cfg=split_quantizer_cfg,
+                residual_quantizer_cfg=residual_quantizer_cfg,
             )
             if self.quantization_enabled
             else None
@@ -1513,8 +1549,18 @@ class VQVAETransformer(torch.nn.Module):
         z_q_vq = torch.zeros_like(z_embed)
 
         if not mask_bool.any():
-            q = torch.zeros(mask_bool.shape, device=z_embed.device, dtype=torch.long)
-            return z_q, {"z": z_vq, "z_q": z_q_vq, "q": q}
+            q_shape = mask_bool.shape
+            if isinstance(self.vqlayer, ResidualVectorQuantizer):
+                q_shape = (*q_shape, self.vqlayer.num_quantizers)
+            q = torch.zeros(q_shape, device=z_embed.device, dtype=torch.long)
+            zero = z_embed.new_zeros(())
+            return z_q, {
+                "z": z_vq,
+                "z_q": z_q_vq,
+                "q": q,
+                "loss": zero,
+                "loss_weighted": zero,
+            }
 
         z_valid = z_embed[mask_bool]
         z_q_valid, vq_out_valid = self.vqlayer(z_valid)
@@ -1853,11 +1899,16 @@ class VQVAELightning(L.LightningModule):
         jet_reco_loss_weighted = jet_reco_loss_weight * jet_reco_loss
         quantization_bypassed = bool(vq_out.get("quantization_bypassed", False))
         is_split_quantizer = "branch_loss" in vq_out
+        is_residual_quantizer = isinstance(
+            self.model.vqlayer, ResidualVectorQuantizer
+        )
         quantizer_mask = vq_out.get(
             "latent_mask", vq_out.get("combined_mask", mask_particle)
         ).to(device=x_particle.device)
         if quantization_bypassed:
             quantizer_loss = reco_loss.new_zeros(())
+        elif is_residual_quantizer:
+            quantizer_loss = vq_out["loss"].mean()
         elif is_split_quantizer:
             quantizer_loss = vq_out["loss"].mean()
         else:
@@ -1873,11 +1924,12 @@ class VQVAELightning(L.LightningModule):
             quantizer_loss = (
                 quantizer_loss_per_token * quantizer_loss_mask
             ).sum() / quantizer_loss_mask.sum().clamp_min(1)
-        quantizer_loss_weighted = (
-            quantizer_loss
-            if is_split_quantizer or quantization_bypassed
-            else alpha * quantizer_loss
-        )
+        if is_residual_quantizer:
+            quantizer_loss_weighted = vq_out["loss_weighted"].mean()
+        elif is_split_quantizer or quantization_bypassed:
+            quantizer_loss_weighted = quantizer_loss
+        else:
+            quantizer_loss_weighted = alpha * quantizer_loss
         code_idx = vq_out["q"]
         pid_loss = reco_loss.new_zeros(())
         pid_accuracy = reco_loss.new_zeros(())
@@ -2006,6 +2058,12 @@ class VQVAELightning(L.LightningModule):
             metrics[f"loss_quantizer_{branch}"] = branch_loss.detach()
         for branch, branch_loss in vq_out.get("branch_loss_weighted", {}).items():
             metrics[f"loss_quantizer_{branch}_weighted"] = branch_loss.detach()
+        stage_loss = vq_out.get("stage_loss")
+        if stage_loss is not None:
+            for stage in range(stage_loss.shape[-1]):
+                metrics[f"loss_quantizer_stage_{stage}"] = (
+                    stage_loss[..., stage].mean().detach()
+                )
         metrics.update(self._vq_codebook_norm_metrics())
 
         if return_x:
@@ -2036,6 +2094,14 @@ class VQVAELightning(L.LightningModule):
 
         if isinstance(vqlayer, VectorQuant):
             metrics["vq_codebook_mean_norm"] = mean_codebook_norm(vqlayer)
+            return metrics
+
+        if isinstance(vqlayer, ResidualVectorQuantizer):
+            codebooks = vqlayer.get_codebook()
+            for stage in range(vqlayer.num_quantizers):
+                metrics[f"vq_codebook_mean_norm_stage_{stage}"] = (
+                    codebooks[stage].norm(dim=-1).mean().detach()
+                )
             return metrics
 
         if isinstance(vqlayer, SplitQuantizer):
@@ -2285,7 +2351,9 @@ class VQVAELightning(L.LightningModule):
         -------
         ak.Array
             Awkward array with token IDs and the jet features if used. Split
-            quantizers also include one "part_token_<branch>" field per branch.
+            quantizers also include one ``part_token_<branch>`` field per branch.
+            Residual quantizers store one ``part_token_stage_<i>`` field per
+            codebook inside ``part_token_id``.
         """
 
         # preprocess the ak_arrary
@@ -2348,7 +2416,12 @@ class VQVAELightning(L.LightningModule):
         z_qs = torch.cat(z_qs, dim=0).squeeze(-2).detach().cpu().numpy()
         mask = mask.detach().cpu().numpy()
 
-        if isinstance(self.model.vqlayer, (VectorQuant, SplitQuantizer)):
+        if isinstance(self.model.vqlayer, ResidualVectorQuantizer):
+            feature_names = [
+                f"part_token_stage_{stage}"
+                for stage in range(self.model.vqlayer.num_quantizers)
+            ]
+        elif isinstance(self.model.vqlayer, (VectorQuant, SplitQuantizer)):
             feature_names = ["part_token_id"]
         else:
             raise ValueError("Unknown quantizer type.")
@@ -2533,6 +2606,24 @@ class VQVAELightning(L.LightningModule):
                 hide_pbar=hide_pbar,
             )
 
+        is_residual_quantizer = isinstance(
+            self.model.vqlayer, ResidualVectorQuantizer
+        )
+        if is_residual_quantizer:
+            expected_fields = [
+                f"part_token_stage_{stage}"
+                for stage in range(self.model.vqlayer.num_quantizers)
+            ]
+            actual_fields = list(getattr(tokens_ak, "fields", []))
+            if set(actual_fields) != set(expected_fields):
+                raise ValueError(
+                    "Residual-VQ reconstruction expected token fields "
+                    f"{expected_fields}, got {actual_fields}."
+                )
+            tokens_ak = ak.Array(
+                {field: tokens_ak[field] for field in expected_fields}
+            )
+
         tokens, mask = ak_pad(tokens_ak, maxlen=pad_length, return_mask=True)
         if len(tokens.fields) == 0:
             tokens = torch.from_numpy(tokens.to_numpy()).long()
@@ -2555,12 +2646,12 @@ class VQVAELightning(L.LightningModule):
             dataset = TensorDataset(tokens, mask, x_conditional)
             dataloader = DataLoader(dataset, batch_size=batch_size)
 
-        codebook = self.model.vqlayer.codebook.weight
+        codebook = None if is_residual_quantizer else self.model.vqlayer.codebook.weight
 
         # if the codebook has an affine transform, apply it
         # before using it to reconstruct the data
         # see https://github.com/minyoungg/vqtorch/blob/main/vqtorch/nn/vq.py#L102-L104
-        if hasattr(self.model.vqlayer, "affine_transform"):
+        if codebook is not None and hasattr(self.model.vqlayer, "affine_transform"):
             codebook = self.model.vqlayer.affine_transform(codebook)
 
         with torch.no_grad():
@@ -2576,8 +2667,11 @@ class VQVAELightning(L.LightningModule):
                 tokens_batch = tokens_batch.to(self.device)
                 mask_batch = mask_batch.to(self.device)
                 try:
-                    z_q = F.embedding(tokens_batch, codebook)
-                    z_q = z_q.squeeze(-2)
+                    if is_residual_quantizer:
+                        z_q = self.model.vqlayer.decode_tokens(tokens_batch)
+                    else:
+                        z_q = F.embedding(tokens_batch, codebook)
+                        z_q = z_q.squeeze(-2)
                 except Exception as e:  # noqa: E722
                     logger.info(f"Error in embedding: {e}")
                     logger.info("batch shape", tokens_batch.shape)

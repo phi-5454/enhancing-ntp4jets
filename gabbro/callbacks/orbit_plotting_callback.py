@@ -1272,6 +1272,9 @@ class OrbitPlottingCallback(L.Callback):
                     mask,
                     num_codes=num_codes,
                     branch_specs=self._entropy_branch_specs(pl_module),
+                    num_quantizers=int(
+                        getattr(pl_module.model.vqlayer, "num_quantizers", 1)
+                    ),
                 )
             )
         else:
